@@ -40,4 +40,4 @@ MCP サーバーは入力を検証し、Mod の独自コマンドに構造化デ
 - MCP サーバーと RCON の切断時、Mod の進行中操作は停止できる状態に保つ。再接続後は操作 ID で実状態を照合する。
 - MCP ツールは自由形式の Lua、RCON コマンド、任意のファイル操作を受け付けない。
 
-参照: [MCP のツール](https://ts.sdk.modelcontextprotocol.io/v2/)、[Factorio の独自コマンド](https://lua-api.factorio.com/latest/classes/LuaCommandProcessor.html)、[RCON 応答](https://lua-api.factorio.com/latest/classes/LuaRCON.html)。
+参照: [Python MCP SDK のツール](https://py.sdk.modelcontextprotocol.io/servers/tools/)、[Factorio の独自コマンド](https://lua-api.factorio.com/latest/classes/LuaCommandProcessor.html)、[RCON 応答](https://lua-api.factorio.com/latest/classes/LuaRCON.html)。

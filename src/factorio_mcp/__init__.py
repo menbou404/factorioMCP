@@ -1,0 +1,1 @@
+"""Factorio AI MCP bridge."""
