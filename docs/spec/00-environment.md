@@ -10,7 +10,7 @@
 | 有効な組み込み Mod | `base`、`space-age`、`quality`、`elevated-rails` |
 | 同梱の API 資料 | `doc-html` |
 | 設定ファイル | `config\config.ini` |
-| ローカル RCON | 起動スクリプトが `127.0.0.1:27015` と専用パスワードを起動引数で指定。ゲーム本体の `config.ini` は未変更 |
+| ローカル RCON | 起動スクリプトが画面付き主催用の `local-rcon-socket` と `local-rcon-password` を作業用設定ファイルに指定。ゲーム本体の `config.ini` は未変更 |
 | 検証用セーブ | `saves\NewGameForMCP.zip` の存在を確認 |
 
 利用者が書いたパスは `Factorio\_2.0.77` と区切られていたが、実際に存在するフォルダ名は `Factorio_2.0.77` である。ポータブル版の `config-path.cfg` は設定フォルダをこのゲームフォルダ内の `config` に向けている。Windows 共通の `%APPDATA%\Factorio` をこの環境の設定先として使わない。
