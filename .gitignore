@@ -2,5 +2,6 @@ node_modules/
 .npm-cache/
 .env
 .rcon-password
+.factorio-mcp-config.ini
 *.log
 .factorio-test/
