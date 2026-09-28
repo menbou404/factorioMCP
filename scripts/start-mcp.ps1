@@ -8,4 +8,8 @@ if (-not (Test-Path -LiteralPath $secretFile)) {
 
 $env:FACTORIO_RCON_PASSWORD = [System.IO.File]::ReadAllText($secretFile).Trim()
 $env:FACTORIO_RCON_PORT = '27015'
-& node (Join-Path $projectRoot 'src\index.js')
+$python = Join-Path $projectRoot '.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $python)) {
+    throw 'Python environment is missing. Run uv sync in the project folder first.'
+}
+& $python -m factorio_mcp.server

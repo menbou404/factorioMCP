@@ -1,5 +1,9 @@
-node_modules/
 .npm-cache/
+node_modules/
+.venv/
+.uv-cache/
+__pycache__/
+.pytest_cache/
 .env
 .rcon-password
 .factorio-mcp-config.ini
