@@ -59,3 +59,23 @@ Python 版で、隔離した検証セーブを使って次を確認しました�
 2. 検証用セーブのコピーを `--start-server` で読み込み、`--mod-directory E:\factorioMCP\mod --rcon-bind 127.0.0.1:27277 --rcon-password <上記パスワード>` を付けて Factorio を起動します。`--config` には、書き込み先を `.factorio-test` に向けた設定ファイルを指定します。
 3. `uv run python test/manual/production_line.py` を実行し、`PRODUCTION_LINE_SUCCEEDED` が出ることを確認します。
 4. 同じサーバーで続けて `uv run python test/manual/negative_checks.py` を実行し、`NEGATIVE_CHECKS_SUCCEEDED` が出ることを確認します。
+
+### CI
+
+CI は PR と main への push、および手動実行で動きます。各ジョブで次を確認します。
+
+- `lint`: Python ファイルの Ruff による静的解析とフォーマットを確認します。手動の統合試験スクリプトも対象です。
+- `test (ubuntu-latest)` / `test (windows-latest)`: 単体テストと Mod パッケージの構成・メタデータの検証を実行します。
+- `mod`: `mod/` 内のすべての Lua ファイルを Lua 5.2 で構文チェックします。
+- `powershell`: `scripts/*.ps1` を Windows PowerShell のパーサーで構文チェックします。スクリプト自体は実行しません。
+
+Python の検証は、ローカルでも次のコマンドで再現できます。
+
+```sh
+uv sync
+uv run ruff check .
+uv run ruff format --check .
+uv run python -m unittest discover -s test -p "test_*.py" -v
+```
+
+Factorio サーバーが必要な統合試験は、まだ CI では実行しません。

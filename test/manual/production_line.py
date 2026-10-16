@@ -12,7 +12,6 @@ from rcon.source import Client
 
 from factorio_mcp.bridge import FactorioBridge
 
-
 PASSWORD_FILE = Path(__file__).resolve().parents[2] / ".factorio-test" / "rcon-secret.txt"
 password = PASSWORD_FILE.read_text(encoding="utf-8").strip()
 bridge = FactorioBridge(port=27277, password=password)
@@ -50,10 +49,16 @@ def mine(name, count):
 
 
 def transfer(name, role, item, count):
-    return call("transfer_item", {
-        "target_ref": reference(name), "direction": "to_entity",
-        "inventory_role": role, "item": item, "count": count,
-    })
+    return call(
+        "transfer_item",
+        {
+            "target_ref": reference(name),
+            "direction": "to_entity",
+            "inventory_role": role,
+            "item": item,
+            "count": count,
+        },
+    )
 
 
 def inventory(name):
@@ -68,12 +73,14 @@ def amount(items, name):
 
 def main():
     if "--resume" not in sys.argv:
-        fixture = ('/c local s=game.surfaces.nauvis;local n=0;for _,v in '
-                   'ipairs({{"stone",2,3},{"coal",3,5},{"iron-ore",5,5},'
-                   '{"iron-ore",6,5},{"iron-ore",5,6},{"iron-ore",6,6}}) do '
-                   'if s.create_entity{name=v[1],position={v[2],v[3]},amount=100} '
-                   'then n=n+1 end end;if s.create_entity{name="tree-01",position={3,1}} '
-                   'then n=n+1 end;rcon.print("fixture:"..n)')
+        fixture = (
+            "/c local s=game.surfaces.nauvis;local n=0;for _,v in "
+            'ipairs({{"stone",2,3},{"coal",3,5},{"iron-ore",5,5},'
+            '{"iron-ore",6,5},{"iron-ore",5,6},{"iron-ore",6,6}}) do '
+            "if s.create_entity{name=v[1],position={v[2],v[3]},amount=100} "
+            'then n=n+1 end end;if s.create_entity{name="tree-01",position={3,1}} '
+            'then n=n+1 end;rcon.print("fixture:"..n)'
+        )
         with Client("127.0.0.1", 27277, passwd=password, timeout=5) as client:
             result = client.run(fixture)
             if "fixture:" not in result:
@@ -90,7 +97,10 @@ def main():
         action("craft", {"recipe": "stone-furnace", "count": 2})
 
     call("observe_nearby")
-    call("place_entity", {"item": "stone-furnace", "surface": "nauvis", "x": 6, "y": 4, "direction": 0})
+    call(
+        "place_entity",
+        {"item": "stone-furnace", "surface": "nauvis", "x": 6, "y": 4, "direction": 0},
+    )
     transfer("stone-furnace", "fuel", "wood", 2)
     transfer("stone-furnace", "source", "iron-ore", 9)
     for i in range(70):
@@ -102,14 +112,23 @@ def main():
             break
     else:
         raise RuntimeError(f"Only {plates} bootstrap plates")
-    call("transfer_item", {
-        "target_ref": reference("stone-furnace"), "direction": "from_entity",
-        "inventory_role": "result", "item": "iron-plate", "count": 9,
-    })
+    call(
+        "transfer_item",
+        {
+            "target_ref": reference("stone-furnace"),
+            "direction": "from_entity",
+            "inventory_role": "result",
+            "item": "iron-plate",
+            "count": 9,
+        },
+    )
     action("craft", {"recipe": "iron-gear-wheel", "count": 3})
     action("craft", {"recipe": "burner-mining-drill", "count": 1})
     call("get_inventory")
-    call("place_entity", {"item": "burner-mining-drill", "surface": "nauvis", "x": 6, "y": 6, "direction": 0})
+    call(
+        "place_entity",
+        {"item": "burner-mining-drill", "surface": "nauvis", "x": 6, "y": 6, "direction": 0},
+    )
     print("drill", json.dumps(inventory("burner-mining-drill")), flush=True)
     transfer("burner-mining-drill", "fuel", "coal", 2)
     transfer("stone-furnace", "fuel", "coal", 1)

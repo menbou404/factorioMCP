@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run python -m unittest discover -s test -p "test_*.py" -v
+
+  mod:
+    name: mod
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y lua5.2
+      - name: Check Lua 5.2 syntax
+        run: |
+          if [ -z "$(find mod -type f -name '*.lua' -print -quit)" ]; then
+            echo "No Lua files found under mod/" >&2
+            exit 1
+          fi
+          find mod -type f -name '*.lua' -print0 | xargs -0 luac5.2 -p
+
+  powershell:
+    name: powershell
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check PowerShell syntax
+        run: |
+          $scripts = @(Get-ChildItem -Path scripts/*.ps1 -File)
+          $hasErrors = $false
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $script.FullName, [ref]$tokens, [ref]$parseErrors
+            ) | Out-Null
+            foreach ($parseError in $parseErrors) {
+              Write-Output ("{0}:{1}: {2}" -f $script.FullName,
+                $parseError.Extent.StartLineNumber, $parseError.Message)
+              $hasErrors = $true
+            }
+          }
+          if ($hasErrors) { exit 1 }
+          Write-Output "Parsed $($scripts.Count) PowerShell scripts with 0 errors."
