@@ -7,18 +7,24 @@ from factorio_mcp.server import create_server
 
 class BridgeTests(unittest.TestCase):
     def test_matching_response_only(self):
-        raw = "\n".join([
-            "unrelated log line",
-            json.dumps({"protocol_version": 1, "request_id": "other", "ok": True}),
-            json.dumps({"protocol_version": 1, "request_id": "wanted", "ok": True, "result": {"x": 2}}),
-        ])
+        raw = "\n".join(
+            [
+                "unrelated log line",
+                json.dumps({"protocol_version": 1, "request_id": "other", "ok": True}),
+                json.dumps(
+                    {"protocol_version": 1, "request_id": "wanted", "ok": True, "result": {"x": 2}}
+                ),
+            ]
+        )
         self.assertEqual(parse_bridge_response(raw, "wanted")["result"], {"x": 2})
         with self.assertRaises(BridgeError) as caught:
             parse_bridge_response(raw, "missing")
         self.assertEqual(caught.exception.code, "mod_unavailable")
 
     def test_game_error_and_remote_host(self):
-        raw = json.dumps({"protocol_version": 1, "request_id": "x", "ok": False, "error": "missing_materials"})
+        raw = json.dumps(
+            {"protocol_version": 1, "request_id": "x", "ok": False, "error": "missing_materials"}
+        )
         with self.assertRaises(BridgeError) as caught:
             parse_bridge_response(raw, "x")
         self.assertEqual(caught.exception.code, "missing_materials")
@@ -34,8 +40,14 @@ class BridgeTests(unittest.TestCase):
             request_ids.append(request["request_id"])
             if len(request_ids) == 1:
                 raise OSError("lost response")
-            return json.dumps({"protocol_version": 1, "request_id": request["request_id"],
-                               "ok": True, "result": {"action_id": "1"}})
+            return json.dumps(
+                {
+                    "protocol_version": 1,
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "result": {"action_id": "1"},
+                }
+            )
 
         bridge = FactorioBridge(password="test", send=send)
         self.assertEqual(bridge.call("move_to", {"x": 1})["result"]["action_id"], "1")
@@ -57,8 +69,15 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         def send(host, port, password, command):
             request = json.loads(command.removeprefix("/ai_mcp "))
             self.assertEqual(request["agent_id"], "agent-1")
-            return json.dumps({"protocol_version": 1, "request_id": request["request_id"],
-                               "ok": True, "tick": 42, "result": {"items": {}}})
+            return json.dumps(
+                {
+                    "protocol_version": 1,
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "tick": 42,
+                    "result": {"items": {}},
+                }
+            )
 
         server = create_server(FactorioBridge(password="test", send=send))
         self.assertEqual(len(await server.list_tools()), 15)

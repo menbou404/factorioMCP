@@ -86,7 +86,8 @@ class FactorioBridge:
                 except Exception as error:
                     if attempt == 1:
                         raise BridgeError(
-                            "not_connected", "Could not reach Factorio RCON",
+                            "not_connected",
+                            "Could not reach Factorio RCON",
                             {"request_id": request_id},
                         ) from error
         raise AssertionError("Unreachable")
