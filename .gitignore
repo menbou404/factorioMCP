@@ -9,3 +9,4 @@ __pycache__/
 .factorio-mcp-config.ini
 *.log
 .factorio-test/
+.factorio-ci/

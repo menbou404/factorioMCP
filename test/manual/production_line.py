@@ -1,6 +1,7 @@
 """Manual integration test for a disposable save on RCON port 27277 only.
 
-Creates raw-resource fixtures with /c. Never run against a real save.
+Clears a 60x60 area around the origin and creates raw-resource fixtures with /c.
+Never run against a real save.
 """
 
 import json
@@ -73,6 +74,15 @@ def amount(items, name):
 
 def main():
     if "--resume" not in sys.argv:
+        clearing = (
+            "/c local s=game.surfaces.nauvis;local n=0;"
+            "for _,e in pairs(s.find_entities_filtered{area={{-30,-30},{30,30}}}) do "
+            'if e.valid and e.type~="character" then e.destroy();n=n+1 end end;'
+            "local t={};for x=-30,29 do for y=-30,29 do "
+            't[#t+1]={name="grass-1",position={x,y}} end end;'
+            "s.set_tiles(t);s.peaceful_mode=true;game.forces.enemy.kill_all_units();"
+            'rcon.print("cleared:"..n)'
+        )
         fixture = (
             "/c local s=game.surfaces.nauvis;local n=0;for _,v in "
             'ipairs({{"stone",2,3},{"coal",3,5},{"iron-ore",5,5},'
@@ -82,6 +92,10 @@ def main():
             'then n=n+1 end;rcon.print("fixture:"..n)'
         )
         with Client("127.0.0.1", 27277, passwd=password, timeout=5) as client:
+            result = client.run(clearing)
+            if "cleared:" not in result:
+                result = client.run(clearing)
+            print(result.strip(), flush=True)
             result = client.run(fixture)
             if "fixture:" not in result:
                 result = client.run(fixture)

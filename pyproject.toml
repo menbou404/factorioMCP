@@ -21,7 +21,7 @@ packages = ["src/factorio_mcp"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = [".factorio-test", ".uv-cache", ".npm-cache", "node_modules"]
+extend-exclude = [".factorio-test", ".factorio-ci", ".uv-cache", ".npm-cache", "node_modules"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
