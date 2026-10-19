@@ -78,4 +78,4 @@ uv run ruff format --check .
 uv run python -m unittest discover -s test -p "test_*.py" -v
 ```
 
-Factorio サーバーが必要な統合試験は、まだ CI では実行しません。
+Factorio サーバーが必要な統合試験は、まだ CI では実行しません。ヘッドレス Factorio を使って CI で実行する設計は [CI での統合試験](docs/spec/12-ci-integration.md) にまとめています。

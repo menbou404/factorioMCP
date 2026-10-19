@@ -22,6 +22,7 @@
 | [08-mcp-interface.md](08-mcp-interface.md) | MCP ツール、RCON 通信、操作の状態 |
 | [09-validation.md](09-validation.md) | 検証順序と受け入れ条件 |
 | [10-multi-agent.md](10-multi-agent.md) | 複数 AI への拡張境界 |
+| [12-ci-integration.md](12-ci-integration.md) | CI でのヘッドレス Factorio を使った統合試験 |
 
 ## 共通の不変条件
 
