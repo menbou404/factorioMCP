@@ -4,6 +4,8 @@
 
 `place_entity(item, surface, x, y, direction)` は AI キャラクターが持つ建設用アイテムを 1 個使い、指定位置に対応する設備を 1 個設置する。初期版は基本ゲームの単純な設備を許可リストに載せる。複数タイル、線路、地下接続、流体設定、青写真による一括建設は段階的に追加する。
 
+`check_placement(item, surface, x, y, direction)` は `place_entity` と同じ検証だけを行い、設置の可否・理由・設置範囲・持ち物の有無を返す。`rotate_entity(target, reverse)` は、手の届く自分の勢力の設備をプレイヤーの回転操作と同じく 90 度回す。設置済みの自分の勢力の設備は `mine_entity` で回収でき、設備のアイテムと中身が持ち物に戻る。詳細は [13-factory-roadmap.md](13-factory-roadmap.md) に記載する。
+
 ## 実行規則
 
 1. キャラクターが生存し、同じ面の位置が作業距離内にあり、対象位置を観察できることを確認する。

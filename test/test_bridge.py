@@ -2,7 +2,7 @@ import json
 import unittest
 
 from factorio_mcp.bridge import BridgeError, FactorioBridge, parse_bridge_response
-from factorio_mcp.server import create_server
+from factorio_mcp.server import _normalize_result, create_server
 
 
 class BridgeTests(unittest.TestCase):
@@ -80,7 +80,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             )
 
         server = create_server(FactorioBridge(password="test", send=send))
-        self.assertEqual(len(await server.list_tools()), 15)
+        self.assertEqual(len(await server.list_tools()), 17)
         result = await server.call_tool("get_inventory", {})
         self.assertFalse(result.is_error)
         self.assertEqual(json.loads(result.content[0].text), {"ok": True, "tick": 42, "items": []})
@@ -94,6 +94,100 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(move.input_schema["required"]), {"surface", "x", "y"})
         place = next(tool for tool in await server.list_tools() if tool.name == "place_entity")
         self.assertEqual(place.input_schema["properties"]["direction"]["default"], 0)
+
+    async def test_logistics_tool_schemas(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        check = tools["check_placement"].input_schema
+        self.assertEqual(set(check["required"]), {"item", "surface", "x", "y"})
+        self.assertEqual(check["properties"]["direction"]["enum"], [0, 4, 8, 12])
+        self.assertEqual(check["properties"]["direction"]["default"], 0)
+        rotate = tools["rotate_entity"].input_schema
+        self.assertEqual(rotate["required"], ["target_ref"])
+        self.assertEqual(rotate["properties"]["reverse"]["type"], "boolean")
+        self.assertIs(rotate["properties"]["reverse"]["default"], False)
+
+    def test_observation_array_normalization(self):
+        ore = {"name": "iron-ore", "tiles": 4, "total_amount": 1200}
+        belt_item = {"name": "iron-ore", "quality": "normal", "count": 2}
+        result = _normalize_result(
+            "observe_nearby",
+            {
+                "resources": {},
+                "entities": [
+                    {"name": "transport-belt", "belt_items": {}},
+                    {"name": "stone-furnace"},
+                    {"name": "transport-belt", "belt_items": [belt_item]},
+                ],
+            },
+        )
+        self.assertEqual(result["resources"], [])
+        self.assertEqual(result["entities"][0]["belt_items"], [])
+        self.assertNotIn("belt_items", result["entities"][1])
+        self.assertEqual(result["entities"][2]["belt_items"], [belt_item])
+        self.assertEqual(
+            _normalize_result("observe_nearby", {"resources": [ore]})["resources"], [ore]
+        )
+
+    async def test_logistics_tools_forward_params_and_results(self):
+        cases = [
+            (
+                "check_placement",
+                {"item": "transport-belt", "surface": "nauvis", "x": 1.5, "y": 2.5},
+                {"direction": 0},
+                {"placeable": False, "reason": "blocked", "has_item": True},
+            ),
+            (
+                "check_placement",
+                {
+                    "item": "burner-mining-drill",
+                    "surface": "nauvis",
+                    "x": -12,
+                    "y": 11,
+                    "direction": 4,
+                },
+                {},
+                {"placeable": True, "entity": "burner-mining-drill", "has_item": False},
+            ),
+            ("rotate_entity", {"target_ref": "42"}, {"reverse": False}, {"direction": 4}),
+            (
+                "rotate_entity",
+                {"target_ref": "43", "reverse": True},
+                {},
+                {"direction": 12},
+            ),
+        ]
+        for operation, arguments, defaults, measured in cases:
+            with self.subTest(operation=operation, arguments=arguments):
+
+                def send(
+                    host,
+                    port,
+                    password,
+                    command,
+                    operation=operation,
+                    defaults=defaults,
+                    arguments=arguments,
+                    measured=measured,
+                ):
+                    request = json.loads(command.removeprefix("/ai_mcp "))
+                    self.assertEqual(request["operation"], operation)
+                    self.assertEqual(request["params"], {**defaults, **arguments})
+                    return json.dumps(
+                        {
+                            "protocol_version": 1,
+                            "request_id": request["request_id"],
+                            "ok": True,
+                            "tick": 42,
+                            "result": measured,
+                        }
+                    )
+
+                server = create_server(FactorioBridge(password="test", send=send))
+                result = await server.call_tool(operation, arguments)
+                self.assertFalse(result.is_error)
+                self.assertEqual(
+                    json.loads(result.content[0].text), {"ok": True, "tick": 42, **measured}
+                )
 
 
 if __name__ == "__main__":
