@@ -1,6 +1,26 @@
-"""Pure geometry helpers shared by the manual integration scripts."""
+"""Pure helpers shared by the manual integration scripts."""
 
 import math
+
+
+def select_automation_technology(available):
+    """Choose the cheapest non-trigger research that consumes only red science."""
+    candidates = [
+        technology
+        for technology in available
+        if "trigger" not in technology
+        and len(technology.get("ingredients", [])) == 1
+        and technology["ingredients"][0]["name"] == "automation-science-pack"
+    ]
+    if not candidates:
+        raise ValueError(f"No available non-trigger red-science-only technology: {available}")
+    return min(
+        candidates,
+        key=lambda technology: (
+            technology["unit_count"] * technology["unit_time"],
+            technology["name"],
+        ),
+    )
 
 
 def position_in_tile_footprint(position, bounding_box):
