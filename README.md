@@ -55,6 +55,8 @@ Python 版で、隔離した検証セーブを使って次を確認しました�
 
 統合試験はゲームを変更し、`/c` で素材を生成します。実際のセーブには使わず、使い捨てのセーブを読み込んだヘッドレスサーバーで実行してください。
 
+`production_line.py` は、素材を配置する前に原点を中心とした 60 × 60 マスを整地します。キャラクター以外のエンティティを取り除き、地面を草地にして、地表を平和モードにし、既存の敵ユニットを消します。
+
 1. `.factorio-test/rcon-secret.txt` に試験用の RCON パスワードを置きます。
 2. 検証用セーブのコピーを `--start-server` で読み込み、`--mod-directory E:\factorioMCP\mod --rcon-bind 127.0.0.1:27277 --rcon-password <上記パスワード>` を付けて Factorio を起動します。`--config` には、書き込み先を `.factorio-test` に向けた設定ファイルを指定します。
 3. `uv run python test/manual/production_line.py` を実行し、`PRODUCTION_LINE_SUCCEEDED` が出ることを確認します。
@@ -68,6 +70,7 @@ CI は PR と main への push、および手動実行で動きます。各ジ�
 - `test (ubuntu-latest)` / `test (windows-latest)`: 単体テストと Mod パッケージの構成・メタデータの検証を実行します。
 - `mod`: `mod/` 内のすべての Lua ファイルを Lua 5.2 で構文チェックします。
 - `powershell`: `scripts/*.ps1` を Windows PowerShell のパーサーで構文チェックします。スクリプト自体は実行しません。
+- `integration`: Linux のヘッドレス Factorio で、整地から生産ラインの構築までの正常系と異常系の統合試験を実行します。所要時間は約 3 分です。現在は必須チェックに含めていません。
 
 Python の検証は、ローカルでも次のコマンドで再現できます。
 
@@ -78,4 +81,4 @@ uv run ruff format --check .
 uv run python -m unittest discover -s test -p "test_*.py" -v
 ```
 
-Factorio サーバーが必要な統合試験は、まだ CI では実行しません。ヘッドレス Factorio を使って CI で実行する設計は [CI での統合試験](docs/spec/12-ci-integration.md) にまとめています。
+統合試験の構成と、main と PR で 10 回連続して成功した後に必須チェックへ追加する方針は、[CI での統合試験](docs/spec/12-ci-integration.md) にまとめています。

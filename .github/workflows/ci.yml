@@ -87,3 +87,33 @@ jobs:
           }
           if ($hasErrors) { exit 1 }
           Write-Output "Parsed $($scripts.Count) PowerShell scripts with 0 errors."
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FACTORIO_VERSION: "2.0.77"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/factorio-headless
+          key: factorio-headless-linux-${{ env.FACTORIO_VERSION }}
+      - run: bash scripts/ci/start-headless.sh
+      - run: timeout 600 uv run python -u test/manual/production_line.py
+      - run: timeout 300 uv run python -u test/manual/negative_checks.py
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          path: .factorio-ci/factorio-server.log
+          name: factorio-server-log
+          retention-days: 7
+          if-no-files-found: ignore
+      - run: bash scripts/ci/stop-headless.sh
+        if: always()
