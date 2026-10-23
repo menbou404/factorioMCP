@@ -1,6 +1,60 @@
 import unittest
 
-from manual.helpers import position_in_tile_footprint
+from manual.helpers import position_in_tile_footprint, select_automation_technology
+
+
+class TechnologySelectionTests(unittest.TestCase):
+    @staticmethod
+    def technology(name, count=10, seconds=15, ingredients=None, **extra):
+        return {
+            "name": name,
+            "unit_count": count,
+            "unit_time": seconds,
+            "ingredients": (
+                [{"name": "automation-science-pack", "amount": 1}]
+                if ingredients is None
+                else ingredients
+            ),
+            **extra,
+        }
+
+    def test_minimizes_total_unit_time_then_name(self):
+        slower = self.technology("a-slower", count=1, seconds=151)
+        tied_z = self.technology("z-tied", count=5, seconds=30)
+        tied_a = self.technology("a-tied", count=10, seconds=15)
+        for available in ([slower, tied_z, tied_a], [tied_a, tied_z, slower]):
+            self.assertIs(select_automation_technology(available), tied_a)
+
+    def test_excludes_triggers_empty_and_other_science_ingredients(self):
+        valid = self.technology("valid")
+        invalid = [
+            self.technology(
+                "trigger", count=0, trigger={"type": "craft-item", "item": "lab", "count": 1}
+            ),
+            self.technology("no-ingredients", count=0, ingredients=[]),
+            self.technology(
+                "green-only", count=1, ingredients=[{"name": "logistic-science-pack", "amount": 1}]
+            ),
+            self.technology(
+                "mixed",
+                count=1,
+                ingredients=[
+                    {"name": "automation-science-pack", "amount": 1},
+                    {"name": "logistic-science-pack", "amount": 1},
+                ],
+            ),
+        ]
+        self.assertIs(select_automation_technology([*invalid, valid]), valid)
+        for available in ([], invalid):
+            with self.assertRaisesRegex(ValueError, "No available non-trigger red-science-only"):
+                select_automation_technology(available)
+
+    def test_preserves_pack_amount_for_required_pack_calculation(self):
+        technology = self.technology(
+            "two-packs", count=7, ingredients=[{"name": "automation-science-pack", "amount": 2}]
+        )
+        chosen = select_automation_technology([technology])
+        self.assertEqual(chosen["unit_count"] * chosen["ingredients"][0]["amount"], 14)
 
 
 class TileFootprintTests(unittest.TestCase):

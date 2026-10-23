@@ -91,7 +91,7 @@ jobs:
   integration:
     name: integration
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       FACTORIO_VERSION: "2.0.77"
     steps:
@@ -110,6 +110,7 @@ jobs:
       - run: timeout 300 uv run python -u test/manual/negative_checks.py
       - run: timeout 300 uv run python -u test/manual/logistics_line.py
       - run: timeout 1200 uv run python -u test/manual/power_research.py
+      - run: timeout 900 uv run python -u test/manual/automation_line.py
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
