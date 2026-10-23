@@ -13,7 +13,8 @@ local PLACEABLE_ITEMS = {
   ["burner-mining-drill"] = true, ["transport-belt"] = true,
   ["inserter"] = true, ["burner-inserter"] = true, ["small-electric-pole"] = true,
   ["assembling-machine-1"] = true, ["electric-mining-drill"] = true,
-  ["pipe"] = true
+  ["pipe"] = true, ["offshore-pump"] = true, ["boiler"] = true,
+  ["steam-engine"] = true, ["lab"] = true
 }
 local INVENTORY_ROLES = {
   ["wooden-chest"] = {main = defines.inventory.chest},
@@ -23,6 +24,8 @@ local INVENTORY_ROLES = {
                        fuel = defines.inventory.fuel},
   ["burner-mining-drill"] = {fuel = defines.inventory.fuel},
   ["burner-inserter"] = {fuel = defines.inventory.fuel},
+  ["boiler"] = {fuel = defines.inventory.fuel},
+  ["lab"] = {input = defines.inventory.lab_input},
   ["assembling-machine-1"] = {source = defines.inventory.crafter_input,
                               result = defines.inventory.crafter_output}
 }
@@ -35,6 +38,7 @@ local function ensure_storage()
     last_action = nil,
     completed_actions = {},
     completed_order = {},
+    hand_crafted = {},
     path_request_id = nil,
     next_action_id = 1,
     processed = {},
@@ -49,6 +53,7 @@ local function ensure_storage()
   storage.ai_mcp.targets = storage.ai_mcp.targets or {}
   storage.ai_mcp.completed_actions = storage.ai_mcp.completed_actions or {}
   storage.ai_mcp.completed_order = storage.ai_mcp.completed_order or {}
+  storage.ai_mcp.hand_crafted = storage.ai_mcp.hand_crafted or {}
   return storage.ai_mcp
 end
 
@@ -347,6 +352,18 @@ local function do_observe(state, params)
     if entity.type == "inserter" or entity.type == "mining-drill" then
       observed.drop_position = entity.drop_position
     end
+    local fluids = {}
+    local fluidbox = entity.fluidbox
+    for fluid_index = 1, #fluidbox do
+      local fluid = fluidbox[fluid_index]
+      if fluid then fluids[#fluids + 1] = {name = fluid.name, amount = fluid.amount} end
+    end
+    if #fluids > 0 then observed.fluids = fluids end
+    if entity.type == "electric-pole" or entity.prototype.electric_energy_source_prototype then
+      -- Some entity types cannot expose a network ID even with an electric source.
+      local ok, network_id = pcall(function() return entity.electric_network_id end)
+      if ok and network_id ~= nil then observed.electric_network_id = network_id end
+    end
     if entity.type == "transport-belt" then
       local merged = {}
       local items = {}
@@ -397,6 +414,25 @@ local function do_observe(state, params)
                              tile_offset + #blocked_output or nil}
 end
 
+local function hand_craftable(character, recipe)
+  return recipe.enabled and not recipe.hidden and recipe.name ~= "recipe-unknown" and
+    not recipe.prototype.hidden_from_player_crafting and
+    not recipe.prototype.hide_from_player_crafting and
+    character.prototype.crafting_categories[recipe.category] and
+    not character.force.get_hand_crafting_disabled_for_recipe(recipe.name) or false
+end
+
+local function do_recipe_info(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if type(params.recipe) ~= "string" then return nil, "invalid_input" end
+  local recipe = character.force.recipes[params.recipe]
+  if not recipe then return nil, "invalid_target" end
+  return {name = recipe.name, enabled = recipe.enabled, category = recipe.category,
+          energy = recipe.energy, ingredients = recipe.ingredients, products = recipe.products,
+          hand_craftable = hand_craftable(character, recipe)}
+end
+
 local function do_list_craftable(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -408,11 +444,7 @@ local function do_list_craftable(state, params)
   end
   local output = {}
   for name, recipe in pairs(character.force.recipes) do
-    if recipe.enabled and not recipe.hidden and name ~= "recipe-unknown" and
-       not recipe.prototype.hidden_from_player_crafting and
-       not recipe.prototype.hide_from_player_crafting and
-       character.prototype.crafting_categories[recipe.category] and
-       not character.force.get_hand_crafting_disabled_for_recipe(name) then
+    if hand_craftable(character, recipe) then
       local count = character.get_craftable_count(name)
       output[#output + 1] = {
         name = name, craftable_count = count, category = recipe.category,
@@ -431,17 +463,94 @@ local function do_list_craftable(state, params)
           next_offset = offset + #page < total and offset + #page or nil}
 end
 
+local function research_available(technology)
+  if not technology.enabled or technology.researched then return false end
+  for _, prerequisite in pairs(technology.prerequisites) do
+    if not prerequisite.researched then return false end
+  end
+  return true
+end
+
+local function research_trigger_data(technology)
+  local trigger = technology.prototype.research_trigger
+  if not trigger then return nil end
+  local item = trigger.item
+  -- ItemIDFilter uses a name; ItemIDAndQualityIDPair can return a LuaItemPrototype.
+  if item and type(item) ~= "string" then
+    item = item.name
+    if item and type(item) ~= "string" then item = item.name end
+  end
+  return {type = trigger.type, item = item,
+          count = trigger.count or (trigger.type == "craft-item" and 1 or nil)}
+end
+
+local function record_hand_crafted(state, character, action)
+  local recipe = prototypes.recipe[action.recipe]
+  if not recipe then return end
+  for _, product in pairs(recipe.products) do
+    if product.type == "item" and product.amount and (product.probability or 1) == 1 then
+      state.hand_crafted[product.name] = (state.hand_crafted[product.name] or 0) +
+                                         product.amount * action.count
+    end
+  end
+  for _, technology in pairs(character.force.technologies) do
+    local trigger = research_trigger_data(technology)
+    if trigger and trigger.type == "craft-item" and trigger.item and
+       research_available(technology) and
+       (state.hand_crafted[trigger.item] or 0) >= trigger.count then
+      -- Player-less characters do not advance the engine's hand crafting triggers.
+      -- Only successful craft completion calls this; lab research is never completed here.
+      technology.researched = true
+    end
+  end
+end
+
+local function research_queue(force)
+  local queue = {}
+  for _, technology in ipairs(force.research_queue or {}) do
+    queue[#queue + 1] = technology.name
+  end
+  return queue
+end
+
+local function do_start_research(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if type(params.technology) ~= "string" then return nil, "invalid_input" end
+  local force = character.force
+  local technology = force.technologies[params.technology]
+  if not technology or not research_available(technology) then return nil, "invalid_target" end
+  if not force.add_research(params.technology) then return nil, "blocked" end
+  return {technology = technology.name,
+          current = force.current_research and force.current_research.name or nil,
+          queue = research_queue(force)}
+end
+
 local function do_research(state)
   local character, err = require_character(state)
   if not character then return nil, err end
   local force = character.force
   local researched = {}
+  local available = {}
   for name, technology in pairs(force.technologies) do
     if technology.researched then researched[#researched + 1] = name end
+    if research_available(technology) then
+      local ingredients = {}
+      for _, ingredient in pairs(technology.research_unit_ingredients) do
+        ingredients[#ingredients + 1] = {name = ingredient.name, amount = ingredient.amount}
+      end
+      available[#available + 1] = {name = name, unit_count = technology.research_unit_count,
+                                  unit_time = technology.research_unit_energy / 60,
+                                  ingredients = ingredients,
+                                  trigger = research_trigger_data(technology)}
+    end
   end
   table.sort(researched)
+  table.sort(available, function(a, b) return a.name < b.name end)
+  while #available > 100 do table.remove(available) end
   return {
     researched = researched,
+    queue = research_queue(force), available = available,
     current = force.current_research and force.current_research.name or nil,
     progress = force.current_research and force.research_progress or nil
   }
@@ -584,6 +693,45 @@ local function do_rotate(state, params)
   return {name = target.name, direction = target.direction, position = position_data(target)}
 end
 
+local function do_set_recipe(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if type(params.recipe) ~= "string" then return nil, "invalid_input" end
+  local target, target_error = target_entity(character, params, character.reach_distance)
+  if not target then return nil, target_error end
+  if target.type ~= "assembling-machine" or target.force ~= character.force then
+    return nil, "invalid_target"
+  end
+  if not character.can_reach_entity(target) then return nil, "out_of_range" end
+  local recipe = character.force.recipes[params.recipe]
+  local categories = target.prototype.crafting_categories
+  if not recipe or not recipe.enabled or not categories or not categories[recipe.category] then
+    return nil, "recipe_unavailable"
+  end
+  for _, inventory_id in ipairs({defines.inventory.crafter_input, defines.inventory.crafter_output}) do
+    local inventory = target.get_inventory(inventory_id)
+    if inventory and not inventory.is_empty() then return nil, "not_empty" end
+  end
+  local modules = target.get_module_inventory()
+  if modules and not modules.is_empty() then return nil, "not_empty" end
+  -- An in-flight craft also holds ingredients outside the input inventory.
+  if target.is_crafting() then return nil, "not_empty" end
+  local returned = target.set_recipe(params.recipe)
+  local inventory = character.get_main_inventory()
+  for _, item in ipairs(returned) do
+    local inserted = inventory and inventory.insert(item) or 0
+    if inserted < item.count then
+      character.surface.spill_item_stack{
+        position = character.position,
+        stack = {name = item.name, quality = item.quality, count = item.count - inserted},
+        enable_looted = true, allow_belts = false, use_start_position_on_failure = true
+      }
+    end
+  end
+  return {name = target.name, recipe = params.recipe, position = position_data(target),
+          returned_items = #returned > 0 and returned or nil}
+end
+
 local function get_entity_inventory(character, params)
   local target, err = target_entity(character, params, character.reach_distance)
   if not target then return nil, nil, err end
@@ -687,7 +835,10 @@ local handlers = {
   end,
   get_entity_inventory = do_entity_inventory,
   list_craftable_recipes = do_list_craftable,
+  get_recipe_info = do_recipe_info,
   get_research_status = do_research,
+  start_research = do_start_research,
+  set_recipe = do_set_recipe,
   get_request_result = function(state, params)
     if type(params.request_id) ~= "string" or #params.request_id > 80 then
       return nil, "invalid_input"
@@ -750,7 +901,8 @@ commands.add_command("ai_mcp", "AI MCP bridge (RCON only)", function(command)
   if request.operation == "move_to" or request.operation == "mine_entity" or
      request.operation == "cancel_action" or request.operation == "craft" or
      request.operation == "place_entity" or request.operation == "transfer_item" or
-     request.operation == "rotate_entity" then
+     request.operation == "rotate_entity" or request.operation == "set_recipe" or
+     request.operation == "start_research" then
     state.processed[request_id] = response
     state.processed_order[#state.processed_order + 1] = request_id
     if #state.processed_order > 256 then
@@ -905,6 +1057,7 @@ script.on_event(defines.events.on_tick, function()
       finish_action(state, "succeeded", nil,
         {recipe = action.recipe, count = action.count,
          inventory = inventory_contents(character)})
+      record_hand_crafted(state, character, action)
     end
   end
 end)

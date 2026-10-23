@@ -11,7 +11,7 @@ from pathlib import Path
 
 from rcon.source import Client
 
-from factorio_mcp.bridge import FactorioBridge
+from factorio_mcp.bridge import RCON_FRAG_THRESHOLD, FactorioBridge
 
 PASSWORD_FILE = Path(__file__).resolve().parents[2] / ".factorio-test" / "rcon-secret.txt"
 password = PASSWORD_FILE.read_text(encoding="utf-8").strip()
@@ -91,7 +91,9 @@ def main():
             'then n=n+1 end end;if s.create_entity{name="tree-01",position={3,1}} '
             'then n=n+1 end;rcon.print("fixture:"..n)'
         )
-        with Client("127.0.0.1", 27277, passwd=password, timeout=5) as client:
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
             result = client.run(clearing)
             if "cleared:" not in result:
                 result = client.run(clearing)

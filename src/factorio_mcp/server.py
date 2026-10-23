@@ -26,15 +26,22 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         "get_inventory": ("items",),
         "get_agent_status": ("inventory",),
         "list_craftable_recipes": ("recipes",),
-        "get_research_status": ("researched",),
+        "get_research_status": ("researched", "queue", "available"),
+        "start_research": ("queue",),
+        "get_recipe_info": ("ingredients", "products"),
     }
     for field in array_fields.get(operation, ()):
         if not isinstance(result.get(field), list):
             result[field] = []
     if operation == "observe_nearby":
         for entity in result["entities"]:
-            if "belt_items" in entity and not isinstance(entity["belt_items"], list):
-                entity["belt_items"] = []
+            for field in ("belt_items", "fluids"):
+                if field in entity and not isinstance(entity[field], list):
+                    entity[field] = []
+    if operation == "get_research_status":
+        for technology in result["available"]:
+            if not isinstance(technology.get("ingredients"), list):
+                technology["ingredients"] = []
     if operation == "get_entity_inventory" and isinstance(result.get("inventories"), dict):
         for role, items in result["inventories"].items():
             if not isinstance(items, list):
@@ -123,6 +130,24 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     )
     async def get_research_status() -> CallToolResult:
         return await invoke("get_research_status")
+
+    @server.tool(
+        description="Read a force recipe, its materials, products, and hand crafting availability."
+    )
+    async def get_recipe_info(recipe: RequiredText) -> CallToolResult:
+        return await invoke("get_recipe_info", {"recipe": recipe})
+
+    @server.tool(
+        description="Set an enabled recipe on an empty owned assembling machine within reach."
+    )
+    async def set_recipe(target_ref: RequiredText, recipe: RequiredText) -> CallToolResult:
+        return await invoke("set_recipe", {"target_ref": target_ref, "recipe": recipe})
+
+    @server.tool(
+        description="Queue an available technology for lab research consuming science packs."
+    )
+    async def start_research(technology: RequiredText) -> CallToolResult:
+        return await invoke("start_research", {"technology": technology})
 
     @server.tool(
         description="Walk to a position on the current surface. Returns an action ID for polling."

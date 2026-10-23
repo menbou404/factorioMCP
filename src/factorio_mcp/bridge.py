@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from rcon.source import Client
 
+RCON_FRAG_THRESHOLD = 1 << 30
+
 
 class BridgeError(Exception):
     def __init__(self, code: str, message: str | None = None, detail: Any = None):
@@ -39,7 +41,10 @@ def parse_bridge_response(raw: str, request_id: str) -> dict[str, Any]:
 
 
 def _send_rcon(host: str, port: int, password: str, command: str) -> str:
-    with Client(host, port, passwd=password, timeout=5) as client:
+    # Factorio sends large responses in one packet and rejects rcon's type-0 fragment probe.
+    with Client(
+        host, port, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+    ) as client:
         return client.run(command)
 
 
