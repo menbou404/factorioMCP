@@ -8,8 +8,10 @@ import json
 import math
 import time
 
+from helpers import position_in_tile_footprint
 from rcon.source import Client
 
+from factorio_mcp.bridge import RCON_FRAG_THRESHOLD
 from production_line import action, amount, bridge, call, password, reference
 
 
@@ -38,14 +40,26 @@ def tile_center(position):
 
 
 def place(item, position, direction=0):
-    observe()
-    x, y = position
-    params = {"item": item, "surface": "nauvis", "x": x, "y": y, "direction": direction}
-    checked = call("check_placement", params)
-    assert checked["placeable"], f"Cannot place {item} at {position}: {checked}"
-    assert checked["has_item"], f"Missing {item}: {checked}"
-    call("place_entity", params)
-    return entity_at(observe(), item, position)
+    step = "observe"
+    try:
+        observe()
+        x, y = position
+        params = {"item": item, "surface": "nauvis", "x": x, "y": y, "direction": direction}
+        step = "check_placement"
+        checked = call("check_placement", params)
+        assert checked["placeable"], f"Cannot place {item} at {position}: {checked}"
+        assert checked["has_item"], f"Missing {item} at {position}: {checked}"
+        step = "place_entity"
+        call("place_entity", params)
+        step = "verify_placement"
+        return entity_at(observe(), item, position)
+    except Exception as error:
+        print(
+            f"placement failed: step={step}, item={item}, position={position}, "
+            f"direction={direction}: {error}",
+            flush=True,
+        )
+        raise
 
 
 def main():
@@ -70,7 +84,9 @@ def main():
         'e=s.create_entity{name="iron-ore",position=p,amount=300} end;'
         'if e then n=n+1 end end;rcon.print("fixture:"..n)'
     )
-    with Client("127.0.0.1", 27277, passwd=password, timeout=5) as client:
+    with Client(
+        "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+    ) as client:
         result = client.run(fixture)
         if "fixture:" not in result:
             result = client.run(fixture)
@@ -111,9 +127,10 @@ def main():
     assert tile_center(drop) == (inserter_position[0] + 1, inserter_position[1]), inserter
     furnace_position = (math.floor(drop["x"]) + 1, math.floor(drop["y"]) + 1)
     furnace = place("stone-furnace", furnace_position)
-    box = furnace["bounding_box"]
-    assert box["left_top"]["x"] <= drop["x"] <= box["right_bottom"]["x"], furnace
-    assert box["left_top"]["y"] <= drop["y"] <= box["right_bottom"]["y"], furnace
+    assert position_in_tile_footprint(drop, furnace["bounding_box"]), (
+        f"logistics verify_drop_tile failed: inserter={inserter_position}, "
+        f"drop={drop}, furnace={furnace_position}, bounding_box={furnace['bounding_box']}"
+    )
 
     for name, position, count in [
         ("burner-mining-drill", drill_position, 2),

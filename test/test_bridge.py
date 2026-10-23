@@ -1,11 +1,25 @@
 import json
 import unittest
+from unittest.mock import patch
 
-from factorio_mcp.bridge import BridgeError, FactorioBridge, parse_bridge_response
+from mcp.server.mcpserver.exceptions import ToolError
+
+from factorio_mcp.bridge import BridgeError, FactorioBridge, _send_rcon, parse_bridge_response
 from factorio_mcp.server import _normalize_result, create_server
 
 
 class BridgeTests(unittest.TestCase):
+    def test_send_rcon_disables_fragment_probe_for_large_factorio_responses(self):
+        response = "x" * 4505
+        with patch("factorio_mcp.bridge.Client") as client_type:
+            client = client_type.return_value.__enter__.return_value
+            client.run.return_value = response
+            self.assertEqual(_send_rcon("127.0.0.1", 27277, "test", "/ai_mcp {}"), response)
+            client_type.assert_called_once_with(
+                "127.0.0.1", 27277, passwd="test", timeout=5, frag_threshold=1 << 30
+            )
+            client.run.assert_called_once_with("/ai_mcp {}")
+
     def test_matching_response_only(self):
         raw = "\n".join(
             [
@@ -80,7 +94,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             )
 
         server = create_server(FactorioBridge(password="test", send=send))
-        self.assertEqual(len(await server.list_tools()), 17)
+        self.assertEqual(len(await server.list_tools()), 20)
         result = await server.call_tool("get_inventory", {})
         self.assertFalse(result.is_error)
         self.assertEqual(json.loads(result.content[0].text), {"ok": True, "tick": 42, "items": []})
@@ -106,6 +120,23 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rotate["properties"]["reverse"]["type"], "boolean")
         self.assertIs(rotate["properties"]["reverse"]["default"], False)
 
+    async def test_power_research_tool_schemas(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name, fields in [
+            ("set_recipe", {"target_ref", "recipe"}),
+            ("start_research", {"technology"}),
+            ("get_recipe_info", {"recipe"}),
+        ]:
+            with self.subTest(tool=name):
+                schema = tools[name].input_schema
+                self.assertEqual(set(schema["required"]), fields)
+                self.assertEqual(set(schema["properties"]), fields)
+                for field in fields:
+                    self.assertEqual(schema["properties"][field]["type"], "string")
+                    self.assertEqual(schema["properties"][field]["minLength"], 1)
+                with self.assertRaises(ToolError):
+                    await create_server(None).call_tool(name, dict.fromkeys(fields, ""))
+
     def test_observation_array_normalization(self):
         ore = {"name": "iron-ore", "tiles": 4, "total_amount": 1200}
         belt_item = {"name": "iron-ore", "quality": "normal", "count": 2}
@@ -128,7 +159,83 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             _normalize_result("observe_nearby", {"resources": [ore]})["resources"], [ore]
         )
 
-    async def test_logistics_tools_forward_params_and_results(self):
+    def test_power_research_array_normalization(self):
+        fluid = {"name": "steam", "amount": 100}
+        observed = _normalize_result(
+            "observe_nearby",
+            {"entities": [{"fluids": {}}, {"fluids": [fluid]}, {"name": "iron-ore"}]},
+        )
+        self.assertEqual(observed["entities"][0]["fluids"], [])
+        self.assertEqual(observed["entities"][1]["fluids"], [fluid])
+        self.assertNotIn("fluids", observed["entities"][2])
+        available = _normalize_result(
+            "get_research_status", {"available": [{"name": "steam-power", "ingredients": {}}]}
+        )["available"]
+        self.assertEqual(available, [{"name": "steam-power", "ingredients": []}])
+        for operation, fields in [
+            ("get_research_status", ("researched", "queue", "available")),
+            ("get_recipe_info", ("ingredients", "products")),
+            ("start_research", ("queue",)),
+        ]:
+            with self.subTest(operation=operation):
+                self.assertEqual(_normalize_result(operation, {}), dict.fromkeys(fields, []))
+                self.assertEqual(
+                    _normalize_result(operation, dict.fromkeys(fields, {})),
+                    dict.fromkeys(fields, []),
+                )
+                values = {
+                    "researched": ["steam-power"],
+                    "queue": ["automation"],
+                    "available": [
+                        {
+                            "name": "automation",
+                            "unit_count": 10,
+                            "ingredients": [{"name": "automation-science-pack", "amount": 1}],
+                        }
+                    ],
+                    "ingredients": [{"name": "iron-plate", "amount": 2}],
+                    "products": [{"name": "iron-gear-wheel", "amount": 1}],
+                }
+                populated = {field: values[field] for field in fields}
+                self.assertEqual(_normalize_result(operation, populated.copy()), populated)
+
+    def test_research_trigger_metadata_preserved_during_normalization(self):
+        trigger = {"type": "craft-item", "item": "lab", "count": 1}
+        result = _normalize_result(
+            "get_research_status",
+            {
+                "available": [
+                    {
+                        "name": "automation-science-pack",
+                        "unit_count": 0,
+                        "unit_time": 0,
+                        "ingredients": {},
+                        "trigger": trigger,
+                    },
+                    {
+                        "name": "automation",
+                        "unit_count": 10,
+                        "unit_time": 10,
+                        "ingredients": [{"name": "automation-science-pack", "amount": 1}],
+                    },
+                ]
+            },
+        )
+        triggered, normal = result["available"]
+        self.assertEqual(
+            triggered,
+            {
+                "name": "automation-science-pack",
+                "unit_count": 0,
+                "unit_time": 0,
+                "ingredients": [],
+                "trigger": trigger,
+            },
+        )
+        self.assertNotIn("trigger", normal)
+        self.assertEqual(normal["ingredients"], [{"name": "automation-science-pack", "amount": 1}])
+
+    async def test_tools_forward_params_and_results(self):
         cases = [
             (
                 "check_placement",
@@ -154,6 +261,37 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 {"target_ref": "43", "reverse": True},
                 {},
                 {"direction": 12},
+            ),
+            (
+                "set_recipe",
+                {"target_ref": "44", "recipe": "iron-gear-wheel"},
+                {},
+                {
+                    "name": "assembling-machine-1",
+                    "recipe": "iron-gear-wheel",
+                    "position": {"surface": "nauvis", "x": 1.5, "y": 2.5},
+                    "returned_items": [{"name": "iron-plate", "quality": "normal", "count": 2}],
+                },
+            ),
+            (
+                "start_research",
+                {"technology": "automation"},
+                {},
+                {"technology": "automation", "current": "automation", "queue": ["automation"]},
+            ),
+            (
+                "get_recipe_info",
+                {"recipe": "iron-gear-wheel"},
+                {},
+                {
+                    "name": "iron-gear-wheel",
+                    "enabled": True,
+                    "category": "crafting",
+                    "energy": 0.5,
+                    "ingredients": [{"name": "iron-plate", "amount": 2}],
+                    "products": [{"name": "iron-gear-wheel", "amount": 1}],
+                    "hand_craftable": True,
+                },
             ),
         ]
         for operation, arguments, defaults, measured in cases:
