@@ -3,11 +3,15 @@ local AGENT_ID = "agent-1"
 local MAX_OBSERVATIONS = 100
 local OBSERVATION_RADIUS = 16
 local ACTION_TIMEOUT_TICKS = 60 * 120
+local ENTITY_STATUS_NAMES = {}
+for name, value in pairs(defines.entity_status) do
+  ENTITY_STATUS_NAMES[value] = name
+end
 local PLACEABLE_ITEMS = {
   ["wooden-chest"] = true, ["iron-chest"] = true,
   ["stone-furnace"] = true,
   ["burner-mining-drill"] = true, ["transport-belt"] = true,
-  ["inserter"] = true, ["small-electric-pole"] = true,
+  ["inserter"] = true, ["burner-inserter"] = true, ["small-electric-pole"] = true,
   ["assembling-machine-1"] = true, ["electric-mining-drill"] = true,
   ["pipe"] = true
 }
@@ -18,6 +22,7 @@ local INVENTORY_ROLES = {
                        result = defines.inventory.crafter_output,
                        fuel = defines.inventory.fuel},
   ["burner-mining-drill"] = {fuel = defines.inventory.fuel},
+  ["burner-inserter"] = {fuel = defines.inventory.fuel},
   ["assembling-machine-1"] = {source = defines.inventory.crafter_input,
                               result = defines.inventory.crafter_output}
 }
@@ -240,14 +245,23 @@ local function do_mine(state, params)
   if type(count) ~= "number" or count < 1 or count > 100 or count % 1 ~= 0 then
     return nil, "invalid_input"
   end
-  local target, target_error = target_entity(character, params, character.resource_reach_distance)
+  local target, target_error = target_entity(character, params,
+    math.max(character.resource_reach_distance, character.reach_distance))
   if not target then return nil, target_error end
+  local reach = target.type == "resource" and character.resource_reach_distance or
+                character.reach_distance
+  if distance_squared(character.position, target.position) > reach * reach then
+    return nil, "out_of_range"
+  end
+  if target.force ~= character.force and target.force.name ~= "neutral" then
+    return nil, "invalid_target"
+  end
   if not target.minable then return nil, "invalid_target" end
   local inventory = character.get_main_inventory()
   if not inventory or inventory.is_full() then return nil, "inventory_full" end
   local before = inventory.get_item_count()
   local result = begin_action(state, {
-    type = "mine", target = target, goal_count = count, gained = 0,
+    type = "mine", target = target, reach = reach, goal_count = count, gained = 0,
     last_inventory_count = before,
     last_progress_tick = game.tick
   })
@@ -269,9 +283,31 @@ local function do_observe(state, params)
     position = character.position, radius = OBSERVATION_RADIUS
   }
   local visible = {}
+  local resources_by_name = {}
   for _, entity in pairs(entities) do
     if entity.valid and entity ~= character then visible[#visible + 1] = entity end
+    if entity.valid and entity.type == "resource" and
+       distance_squared(character.position, entity.position) <=
+         OBSERVATION_RADIUS * OBSERVATION_RADIUS then
+      local resource = resources_by_name[entity.name]
+      local position = entity.position
+      if not resource then
+        resource = {name = entity.name, tiles = 0, total_amount = 0,
+                    left_top = {x = position.x, y = position.y},
+                    right_bottom = {x = position.x, y = position.y}}
+        resources_by_name[entity.name] = resource
+      end
+      resource.tiles = resource.tiles + 1
+      resource.total_amount = resource.total_amount + entity.amount
+      resource.left_top.x = math.min(resource.left_top.x, position.x)
+      resource.left_top.y = math.min(resource.left_top.y, position.y)
+      resource.right_bottom.x = math.max(resource.right_bottom.x, position.x)
+      resource.right_bottom.y = math.max(resource.right_bottom.y, position.y)
+    end
   end
+  local resources = {}
+  for _, resource in pairs(resources_by_name) do resources[#resources + 1] = resource end
+  table.sort(resources, function(a, b) return a.name < b.name end)
   table.sort(visible, function(a, b)
     if a.position.x ~= b.position.x then return a.position.x < b.position.x end
     if a.position.y ~= b.position.y then return a.position.y < b.position.y end
@@ -285,13 +321,54 @@ local function do_observe(state, params)
     local target_ref = tostring(state.next_target_id)
     state.next_target_id = state.next_target_id + 1
     state.targets[target_ref] = {entity = entity, tick = game.tick}
-    output[#output + 1] = {
+    local observed = {
       target_ref = target_ref,
       name = entity.name, type = entity.type,
       x = entity.position.x, y = entity.position.y,
       surface = entity.surface.name, unit_number = entity.unit_number,
-      amount = entity.type == "resource" and entity.amount or nil
+      amount = entity.type == "resource" and entity.amount or nil,
+      owned = entity.force == character.force
     }
+    if entity.supports_direction then observed.direction = entity.direction end
+    local entity_status = entity.status
+    if entity_status ~= nil then observed.status = ENTITY_STATUS_NAMES[entity_status] end
+    if entity.type ~= "resource" then
+      local box = entity.bounding_box
+      observed.bounding_box = {
+        left_top = {x = box.left_top.x, y = box.left_top.y},
+        right_bottom = {x = box.right_bottom.x, y = box.right_bottom.y}
+      }
+    end
+    if entity.type == "assembling-machine" or entity.type == "furnace" then
+      local recipe = entity.get_recipe()
+      if recipe then observed.recipe = recipe.name end
+    end
+    if entity.type == "inserter" then observed.pickup_position = entity.pickup_position end
+    if entity.type == "inserter" or entity.type == "mining-drill" then
+      observed.drop_position = entity.drop_position
+    end
+    if entity.type == "transport-belt" then
+      local merged = {}
+      local items = {}
+      for line = 1, 2 do
+        for _, item in pairs(entity.get_transport_line(line).get_contents()) do
+          merged[item.name] = merged[item.name] or {}
+          local entry = merged[item.name][item.quality]
+          if not entry then
+            entry = {name = item.name, quality = item.quality, count = 0}
+            merged[item.name][item.quality] = entry
+            items[#items + 1] = entry
+          end
+          entry.count = entry.count + item.count
+        end
+      end
+      table.sort(items, function(a, b)
+        if a.name ~= b.name then return a.name < b.name end
+        return a.quality < b.quality
+      end)
+      if #items > 0 then observed.belt_items = items end
+    end
+    output[#output + 1] = observed
   end
   local blocked = character.surface.find_tiles_filtered{
     position = character.position, radius = OBSERVATION_RADIUS,
@@ -312,7 +389,7 @@ local function do_observe(state, params)
     if game.tick - reference.tick > 60 * 10 then state.targets[key] = nil end
   end
   return {position = position_data(character), radius = OBSERVATION_RADIUS,
-          entities = output, entity_total = #visible,
+          entities = output, entity_total = #visible, resources = resources,
           next_entity_offset = entity_offset + #output < #visible and
                                entity_offset + #output or nil,
           blocked_tiles = blocked_output, blocked_tile_total = #blocked,
@@ -392,10 +469,7 @@ local function do_craft(state, params)
   return action
 end
 
-local function do_place(state, params)
-  local character, err = require_character(state)
-  if not character then return nil, err end
-  if state.action then return nil, "action_conflict" end
+local function validate_placement(state, character, params, require_item)
   if type(params.item) ~= "string" or not PLACEABLE_ITEMS[params.item] then
     return nil, "invalid_target"
   end
@@ -424,8 +498,8 @@ local function do_place(state, params)
   if not item_proto or not item_proto.place_result then return nil, "invalid_target" end
   local entity_name = item_proto.place_result.name
   local inventory = character.get_main_inventory()
-  local item = {name = params.item, quality = "normal", count = 1}
-  if inventory.get_item_count({name = params.item, quality = "normal"}) < 1 then
+  local has_item = inventory.get_item_count({name = params.item, quality = "normal"}) >= 1
+  if require_item and not has_item then
     return nil, "missing_materials"
   end
   if not character.can_place_entity{name = entity_name, position = position,
@@ -436,10 +510,56 @@ local function do_place(state, params)
                                              direction = direction, force = character.force} then
     return nil, "blocked"
   end
+  return {name = entity_name, position = position, direction = direction,
+          inventory = inventory}
+end
+
+local function placement_bounding_box(prototype, position, direction)
+  local box = prototype.collision_box
+  local left, top = box.left_top.x, box.left_top.y
+  local right, bottom = box.right_bottom.x, box.right_bottom.y
+  if direction == 4 or direction == 12 then
+    left, top, right, bottom = -bottom, left, -top, right
+  end
+  return {left_top = {x = position.x + left, y = position.y + top},
+          right_bottom = {x = position.x + right, y = position.y + bottom}}
+end
+
+local function do_check_placement(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  local placement, reason = validate_placement(state, character, params, false)
+  -- Metadata is useful even when distance, visibility, or collision checks fail.
+  local item_proto = type(params.item) == "string" and prototypes.item[params.item] or nil
+  local prototype = item_proto and item_proto.place_result
+  local inventory = character.get_main_inventory()
+  local has_item = item_proto ~= nil and inventory ~= nil and
+    inventory.get_item_count({name = params.item, quality = "normal"}) >= 1
+  local direction = params.direction or defines.direction.north
+  local box
+  if prototype and (direction == 0 or direction == 4 or direction == 8 or direction == 12) and
+     type(params.x) == "number" and type(params.y) == "number" and
+     params.x == params.x and params.y == params.y and
+     math.abs(params.x) <= 1000000 and math.abs(params.y) <= 1000000 then
+    box = placement_bounding_box(prototype, {x = params.x, y = params.y}, direction)
+  end
+  return {placeable = placement ~= nil, reason = reason,
+          entity = prototype and prototype.name or nil, has_item = has_item,
+          bounding_box = box}
+end
+
+local function do_place(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if state.action then return nil, "action_conflict" end
+  local placement, reason = validate_placement(state, character, params, true)
+  if not placement then return nil, reason end
+  local inventory = placement.inventory
+  local item = {name = params.item, quality = "normal", count = 1}
   local removed = inventory.remove(item)
   if removed ~= 1 then return nil, "missing_materials" end
   local created = character.surface.create_entity{
-    name = entity_name, position = position, direction = direction,
+    name = placement.name, position = placement.position, direction = placement.direction,
     force = character.force, quality = "normal", raise_built = true
   }
   if not created or not created.valid then
@@ -448,6 +568,20 @@ local function do_place(state, params)
   end
   return {name = created.name, position = position_data(created),
           direction = created.direction, consumed_item = params.item}
+end
+
+local function do_rotate(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if params.reverse ~= nil and type(params.reverse) ~= "boolean" then
+    return nil, "invalid_input"
+  end
+  local target, target_error = target_entity(character, params, character.reach_distance)
+  if not target then return nil, target_error end
+  if target.force ~= character.force then return nil, "invalid_target" end
+  if not character.can_reach_entity(target) then return nil, "out_of_range" end
+  if not target.rotate{reverse = params.reverse or false} then return nil, "invalid_target" end
+  return {name = target.name, direction = target.direction, position = position_data(target)}
 end
 
 local function get_entity_inventory(character, params)
@@ -566,6 +700,8 @@ local handlers = {
   mine_entity = do_mine,
   craft = do_craft,
   place_entity = do_place,
+  check_placement = do_check_placement,
+  rotate_entity = do_rotate,
   transfer_item = do_transfer,
   get_action_status = do_action_status,
   cancel_action = do_cancel
@@ -613,7 +749,8 @@ commands.add_command("ai_mcp", "AI MCP bridge (RCON only)", function(command)
   })
   if request.operation == "move_to" or request.operation == "mine_entity" or
      request.operation == "cancel_action" or request.operation == "craft" or
-     request.operation == "place_entity" or request.operation == "transfer_item" then
+     request.operation == "place_entity" or request.operation == "transfer_item" or
+     request.operation == "rotate_entity" then
     state.processed[request_id] = response
     state.processed_order[#state.processed_order + 1] = request_id
     if #state.processed_order > 256 then
@@ -748,8 +885,11 @@ script.on_event(defines.events.on_tick, function()
       finish_action(state, "failed", "target_gone")
       return
     end
+    -- Actions saved before reach was recorded still use the target's reach rule.
+    local reach = action.reach or (target.type == "resource" and
+                  character.resource_reach_distance or character.reach_distance)
     if distance_squared(character.position, target.position) >
-       character.resource_reach_distance * character.resource_reach_distance then
+       reach * reach then
       finish_action(state, "failed", "out_of_range")
       return
     end

@@ -22,7 +22,7 @@ Coordinate = Annotated[float, Field(allow_inf_nan=False)]
 
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     array_fields = {
-        "observe_nearby": ("entities", "blocked_tiles"),
+        "observe_nearby": ("entities", "blocked_tiles", "resources"),
         "get_inventory": ("items",),
         "get_agent_status": ("inventory",),
         "list_craftable_recipes": ("recipes",),
@@ -31,6 +31,10 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     for field in array_fields.get(operation, ()):
         if not isinstance(result.get(field), list):
             result[field] = []
+    if operation == "observe_nearby":
+        for entity in result["entities"]:
+            if "belt_items" in entity and not isinstance(entity["belt_items"], list):
+                entity["belt_items"] = []
     if operation == "get_entity_inventory" and isinstance(result.get("inventories"), dict):
         for role, items in result["inventories"].items():
             if not isinstance(items, list):
@@ -159,6 +163,25 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "place_entity",
             {"item": item, "surface": surface, "x": x, "y": y, "direction": direction},
         )
+
+    @server.tool(
+        description="Check placement within build reach without consuming items or building."
+    )
+    async def check_placement(
+        item: RequiredText,
+        surface: RequiredText,
+        x: Coordinate,
+        y: Coordinate,
+        direction: Literal[0, 4, 8, 12] = 0,
+    ) -> CallToolResult:
+        return await invoke(
+            "check_placement",
+            {"item": item, "surface": surface, "x": x, "y": y, "direction": direction},
+        )
+
+    @server.tool(description="Rotate an owned observed entity within reach by 90 degrees.")
+    async def rotate_entity(target_ref: RequiredText, reverse: bool = False) -> CallToolResult:
+        return await invoke("rotate_entity", {"target_ref": target_ref, "reverse": reverse})
 
     @server.tool(description="Read accessible inventory sections of a nearby observed structure.")
     async def get_entity_inventory(target_ref: RequiredText) -> CallToolResult:

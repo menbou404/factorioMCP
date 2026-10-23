@@ -108,6 +108,7 @@ jobs:
       - run: bash scripts/ci/start-headless.sh
       - run: timeout 600 uv run python -u test/manual/production_line.py
       - run: timeout 300 uv run python -u test/manual/negative_checks.py
+      - run: timeout 300 uv run python -u test/manual/logistics_line.py
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
