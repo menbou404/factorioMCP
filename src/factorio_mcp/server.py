@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
@@ -18,6 +19,21 @@ NonNegative = Annotated[int, Field(ge=0, strict=True)]
 Count = Annotated[int, Field(ge=1, le=100, strict=True)]
 RequiredText = Annotated[str, Field(min_length=1)]
 Coordinate = Annotated[float, Field(allow_inf_nan=False)]
+ObservationRadius = Annotated[float, Field(ge=1, le=16, allow_inf_nan=False, strict=True)]
+FilterNames = Annotated[
+    list[Annotated[str, Field(min_length=1, max_length=200, strict=True)]],
+    Field(max_length=32, strict=True),
+]
+
+HINTS = {
+    "target_gone": "target_ref expires after 10 seconds. Refresh it with observe_nearby.",
+    "not_visible": "Observe the placement area within 10 seconds before placing.",
+    "action_conflict": "Wait with wait_for_action, or stop the running action with cancel_action.",
+    "blocked": "Mine or recover blocking entities, or find another position with check_placement.",
+    "invalid_target": "Check the entity and valid_roles in detail, then choose a supported target.",
+    "out_of_range": "Move closer to the target, then observe_nearby again.",
+    "missing_materials": "Gather the missing items before retrying.",
+}
 
 
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -34,10 +50,19 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(result.get(field), list):
             result[field] = []
     if operation == "observe_nearby":
+        filters = result.get("filters")
+        if isinstance(filters, dict):
+            for field in ("types", "names"):
+                if field in filters and not isinstance(filters[field], list):
+                    filters[field] = []
         for entity in result["entities"]:
             for field in ("belt_items", "fluids"):
                 if field in entity and not isinstance(entity[field], list):
                     entity[field] = []
+    if operation == "check_placement":
+        for field in ("blocking", "tiles"):
+            if field in result and not isinstance(result[field], list):
+                result[field] = []
     if operation == "get_research_status":
         for technology in result["available"]:
             if not isinstance(technology.get("ingredients"), list):
@@ -55,37 +80,48 @@ def _response(value: dict[str, Any], *, error: bool = False) -> CallToolResult:
     )
 
 
+def _error_response(exc: Exception) -> CallToolResult:
+    code = exc.code if isinstance(exc, BridgeError) else "internal_error"
+    detail = exc.detail if isinstance(exc, BridgeError) else None
+    value: dict[str, Any] = {"ok": False, "error": code, "message": str(exc)}
+    if isinstance(detail, dict):
+        if detail.get("request_id") is not None:
+            value["request_id"] = detail["request_id"]
+        public_detail = {key: item for key, item in detail.items() if key != "request_id"}
+        # Factorio serializes empty Lua arrays as objects.
+        for field in ("blocking", "tiles", "missing", "valid_roles", "supported_entities"):
+            if field in public_detail and not isinstance(public_detail[field], list):
+                public_detail[field] = []
+        if public_detail:
+            value["detail"] = public_detail
+    if code in HINTS:
+        value["hint"] = HINTS[code]
+    return _response(value, error=True)
+
+
+def _success_value(operation: str, response: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tick": response.get("tick"),
+        **_normalize_result(operation, response.get("result") or {}),
+    }
+
+
 def create_server(bridge: FactorioBridge | None) -> MCPServer:
     server = MCPServer("factorio-ai", version="0.1.0")
 
-    async def invoke(operation: str, params: dict[str, Any] | None = None) -> CallToolResult:
+    async def call(operation: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         if bridge is None:
-            return _response(
-                {
-                    "ok": False,
-                    "error": "not_configured",
-                    "message": "Set FACTORIO_RCON_PASSWORD before starting the MCP server.",
-                },
-                error=True,
+            raise BridgeError(
+                "not_configured", "Set FACTORIO_RCON_PASSWORD before starting the MCP server."
             )
+        return await asyncio.to_thread(bridge.call, operation, params)
+
+    async def invoke(operation: str, params: dict[str, Any] | None = None) -> CallToolResult:
         try:
-            response = await asyncio.to_thread(bridge.call, operation, params)
-            result = response.get("result") or {}
-            return _response(
-                {
-                    "ok": True,
-                    "tick": response.get("tick"),
-                    **_normalize_result(operation, result),
-                }
-            )
+            return _response(_success_value(operation, await call(operation, params)))
         except Exception as exc:
-            code = exc.code if isinstance(exc, BridgeError) else "internal_error"
-            detail = exc.detail if isinstance(exc, BridgeError) else None
-            request_id = detail.get("request_id") if isinstance(detail, dict) else None
-            value: dict[str, Any] = {"ok": False, "error": code, "message": str(exc)}
-            if request_id is not None:
-                value["request_id"] = request_id
-            return _response(value, error=True)
+            return _error_response(exc)
 
     @server.tool(description="Check the connection to the Factorio AI Mod.")
     async def factorio_ping() -> CallToolResult:
@@ -104,11 +140,29 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         )
     )
     async def observe_nearby(
-        entity_offset: NonNegative = 0, tile_offset: NonNegative = 0
+        entity_offset: NonNegative = 0,
+        tile_offset: NonNegative = 0,
+        radius: ObservationRadius = 16,
+        types: FilterNames | None = None,
+        names: FilterNames | None = None,
+        owned_only: Annotated[bool, Field(strict=True)] = False,
+        include_resources: Annotated[bool, Field(strict=True)] = True,
+        include_tiles: Annotated[bool, Field(strict=True)] = True,
     ) -> CallToolResult:
-        return await invoke(
-            "observe_nearby", {"entity_offset": entity_offset, "tile_offset": tile_offset}
-        )
+        params: dict[str, Any] = {"entity_offset": entity_offset, "tile_offset": tile_offset}
+        if radius != 16:
+            params["radius"] = radius
+        if types is not None:
+            params["types"] = types
+        if names is not None:
+            params["names"] = names
+        if owned_only:
+            params["owned_only"] = owned_only
+        if not include_resources:
+            params["include_resources"] = include_resources
+        if not include_tiles:
+            params["include_tiles"] = include_tiles
+        return await invoke("observe_nearby", params)
 
     @server.tool(description="Read the AI character’s actual in-game inventory.")
     async def get_inventory() -> CallToolResult:
@@ -236,6 +290,30 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(description="Get the status of a walking, mining, or crafting action.")
     async def get_action_status(action_id: RequiredText) -> CallToolResult:
         return await invoke("get_action_status", {"action_id": action_id})
+
+    @server.tool(
+        description=(
+            "Wait for a walking, mining, or crafting action to finish. Prefer this over polling "
+            "get_action_status. A timeout returns the last running status "
+            "and leaves the action running."
+        )
+    )
+    async def wait_for_action(
+        action_id: RequiredText,
+        timeout_seconds: Annotated[float, Field(ge=1, le=30, allow_inf_nan=False)] = 20,
+    ) -> CallToolResult:
+        started = time.monotonic()
+        try:
+            while True:
+                response = await call("get_action_status", {"action_id": action_id})
+                value = _success_value("get_action_status", response)
+                waited = time.monotonic() - started
+                running = value.get("status") == "running"
+                if not running or waited >= timeout_seconds:
+                    return _response({**value, "timed_out": running, "waited_seconds": waited})
+                await asyncio.sleep(min(0.25, timeout_seconds - waited))
+        except Exception as exc:
+            return _error_response(exc)
 
     @server.tool(description="Stop an ongoing walking, mining, or crafting action.")
     async def cancel_action(action_id: RequiredText) -> CallToolResult:

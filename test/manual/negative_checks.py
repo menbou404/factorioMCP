@@ -4,13 +4,16 @@ Run right after production_line.py on the same server: it relies on the
 fixture's stone patch and the running stone furnace at (6, 4).
 """
 
+import asyncio
 import json
 import time
 
 from factorio_mcp.bridge import BridgeError, parse_bridge_response
+from factorio_mcp.server import create_server
 from production_line import action, bridge, reference
 
 results = []
+errors = {}
 
 
 def record(label, passed, info=""):
@@ -22,6 +25,7 @@ def expect_error(label, operation, params, codes):
     try:
         result = bridge.call(operation, params)["result"]
     except BridgeError as error:
+        errors[label] = error
         record(label, error.code in codes, error.code)
         return
     record(label, False, "unexpected success: " + json.dumps(result, ensure_ascii=False)[:200])
@@ -132,6 +136,107 @@ def main():
     time.sleep(11)
     expect_error(
         "expired target_ref", "get_entity_inventory", {"target_ref": furnace}, {"target_gone"}
+    )
+
+    # M6 checks are appended so the original checks and their output order stay intact.
+    action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+    furnace = reference("stone-furnace")
+    try:
+        bridge.call(
+            "transfer_item",
+            {
+                "target_ref": furnace,
+                "direction": "to_entity",
+                "inventory_role": "input",
+                "item": "iron-ore",
+                "count": 1,
+            },
+        )
+    except BridgeError as error:
+        detail = error.detail or {}
+        record(
+            "wrong furnace role reports valid_roles",
+            error.code == "invalid_target"
+            and detail.get("entity") == "stone-furnace"
+            and detail.get("valid_roles") == ["fuel", "result", "source"],
+        )
+    else:
+        record("wrong furnace role reports valid_roles", False, "unexpected success")
+
+    blocking = (getattr(errors.get("place on an occupied tile"), "detail", None) or {}).get(
+        "blocking", []
+    )
+    checked = bridge.call(
+        "check_placement", {"item": "stone-furnace", "surface": "nauvis", "x": 6, "y": 4}
+    )["result"]
+    record(
+        "occupied placement reports blocking furnace",
+        any(entity["name"] == "stone-furnace" for entity in blocking)
+        and checked["placeable"] is False
+        and checked["reason"] == "blocked"
+        and any(entity["name"] == "stone-furnace" for entity in checked.get("blocking", [])),
+    )
+    distance = getattr(errors.get("mine out of reach"), "detail", None) or {}
+    record(
+        "out-of-reach mine reports distance and reach",
+        isinstance(distance.get("distance"), (int, float))
+        and isinstance(distance.get("reach"), (int, float))
+        and distance["distance"] > distance["reach"],
+    )
+    expired = getattr(errors.get("expired target_ref"), "detail", None) or {}
+    record("expired target_ref reports reason", expired.get("reason") == "expired")
+
+    all_nearby = bridge.call("observe_nearby", {"radius": 8})["result"]
+    filtered = bridge.call(
+        "observe_nearby",
+        {
+            "types": ["furnace"],
+            "owned_only": True,
+            "include_resources": False,
+            "include_tiles": False,
+            "radius": 8,
+        },
+    )["result"]
+    entities = filtered["entities"]
+    filters = filtered.get("filters", {})
+    # The running drill can change total_amount between the two observations.
+    resource_names = {resource["name"] for resource in all_nearby["resources"]}
+    record(
+        "observation filters preserve resource summary",
+        bool(entities)
+        and all(entity["type"] == "furnace" and entity["owned"] for entity in entities)
+        and all(
+            (entity["x"] - filtered["position"]["x"]) ** 2
+            + (entity["y"] - filtered["position"]["y"]) ** 2
+            <= 8**2
+            for entity in entities
+        )
+        and filtered["entity_total"] == len(entities)
+        and filtered["radius"] == 8
+        and filters.get("types") == ["furnace"]
+        and filters.get("owned_only") is True
+        and filters.get("include_resources") is False
+        and filters.get("include_tiles") is False
+        and "resources" in filtered
+        and bool(filtered["resources"])
+        and {resource["name"] for resource in filtered["resources"]} == resource_names
+        and all(resource["total_amount"] > 0 for resource in filtered["resources"])
+        and not filtered["blocked_tiles"]
+        and filtered["blocked_tile_total"] == 0
+        and "next_tile_offset" not in filtered,
+    )
+
+    started = bridge.call("move_to", {"surface": "nauvis", "x": 4, "y": 3})["result"]
+    waited = asyncio.run(
+        create_server(bridge).call_tool("wait_for_action", {"action_id": started["action_id"]})
+    )
+    value = json.loads(waited.content[0].text)
+    record(
+        "MCP wait_for_action completes a short move",
+        not waited.is_error
+        and value.get("status") == "succeeded"
+        and value.get("timed_out") is False
+        and value.get("action_id") == started["action_id"],
     )
 
     failed = [label for label, passed, _ in results if not passed]
