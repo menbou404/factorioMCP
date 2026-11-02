@@ -34,7 +34,7 @@ def parse_bridge_response(raw: str, request_id: str) -> dict[str, Any]:
             raise BridgeError(
                 response.get("error") or "game_error",
                 response.get("error"),
-                response.get("result"),
+                response.get("detail"),
             )
         return response
     raise BridgeError("mod_unavailable", "Factorio Mod did not return a matching response")

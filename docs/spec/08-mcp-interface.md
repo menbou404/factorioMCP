@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | `factorio_ping` | 読み取り | Mod と RCON の接続確認 |
 | `get_agent_status` | 読み取り | 生死、位置、体力、現在の操作 |
-| `observe_nearby` | 読み取り | 半径 16 タイルの周囲 |
+| `observe_nearby` | 読み取り | 半径 16 タイル以内の周囲。種類・名前・自分の設備・資源・地形で絞り込める |
 | `get_inventory` | 読み取り | AI キャラクターの主インベントリ |
 | `get_entity_inventory` | 読み取り | 手の届く設備の入出力・燃料の中身 |
 | `list_craftable_recipes` | 読み取り | 現在の手作業製作候補と製作可能数 |
@@ -22,6 +22,7 @@
 | `get_recipe_info` | 読み取り | レシピの有効・無効、材料、生成物、手作業で作れるか |
 | `transfer_item` | 変更 | キャラクターと設備の間でアイテムを移す |
 | `get_action_status` | 読み取り | 長時間操作の進捗と結果 |
+| `wait_for_action` | 読み取り | 長時間操作の完了を最大 30 秒待って結果を返す（[14-agent-ergonomics.md](14-agent-ergonomics.md)） |
 | `cancel_action` | 変更 | 自分の進行中の操作を中断 |
 | `get_request_result` | 読み取り | 通信切断後に元の変更要求が実行されたか照会 |
 

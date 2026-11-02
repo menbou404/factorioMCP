@@ -24,6 +24,7 @@
 | [10-multi-agent.md](10-multi-agent.md) | 複数 AI への拡張境界 |
 | [12-ci-integration.md](12-ci-integration.md) | CI でのヘッドレス Factorio を使った統合試験 |
 | [13-factory-roadmap.md](13-factory-roadmap.md) | 工場づくりへの拡張計画（M1〜M5）と各段階の設計 |
+| [14-agent-ergonomics.md](14-agent-ergonomics.md) | AI エージェント向けの使いやすさ改善（M6） |
 
 ## 共通の不変条件
 
