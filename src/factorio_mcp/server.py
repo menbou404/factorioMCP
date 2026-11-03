@@ -195,6 +195,43 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await invoke("get_research_status")
 
     @server.tool(
+        description=(
+            "Wait for a technology to finish research. Returns early if it is not queued. "
+            "Prefer this over polling get_research_status. The maximum wait is 50 seconds "
+            "to keep it under common 60-second client tool timeouts."
+        )
+    )
+    async def wait_for_research(
+        technology: RequiredText,
+        timeout_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] = 20,
+    ) -> CallToolResult:
+        started = time.monotonic()
+        try:
+            while True:
+                response = await call("get_research_status")
+                value = _success_value("get_research_status", response)
+                researched = technology in value["researched"]
+                current = value.get("current") == technology
+                researching = current or technology in value["queue"]
+                waited = time.monotonic() - started
+                if researched or not researching or waited >= timeout_seconds:
+                    return _response(
+                        {
+                            "technology": technology,
+                            "researched": researched,
+                            "researching": researching,
+                            "progress": value.get("progress") if current else None,
+                            "timed_out": not researched
+                            and researching
+                            and waited >= timeout_seconds,
+                            "waited_seconds": waited,
+                        }
+                    )
+                await asyncio.sleep(min(0.25, timeout_seconds - waited))
+        except Exception as exc:
+            return _error_response(exc)
+
+    @server.tool(
         description="Read a force recipe, its materials, products, and hand crafting availability."
     )
     async def get_recipe_info(recipe: RequiredText) -> CallToolResult:
@@ -321,7 +358,13 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             },
         )
 
-    @server.tool(description="Get the status of a walking, mining, or crafting action.")
+    @server.tool(
+        description=(
+            "Get the status of a walking, mining, or crafting action. "
+            "Running mining reports detail.gained and detail.count; "
+            "running crafting reports detail.count and detail.remaining."
+        )
+    )
     async def get_action_status(action_id: RequiredText) -> CallToolResult:
         return await invoke("get_action_status", {"action_id": action_id})
 
@@ -329,7 +372,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         description=(
             "Wait for a walking, mining, or crafting action to finish. Prefer this over polling "
             "get_action_status. A timeout returns the last running status "
-            "and leaves the action running. The maximum wait is 50 seconds to keep it under "
+            "and leaves the action running. Running mining reports detail.gained and detail.count; "
+            "running crafting reports detail.count and detail.remaining. "
+            "The maximum wait is 50 seconds to keep it under "
             "common 60-second client tool timeouts."
         )
     )

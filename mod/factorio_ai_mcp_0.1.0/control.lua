@@ -1080,9 +1080,25 @@ local function do_action_status(state, params)
     action = state.completed_actions[params.action_id] or state.last_action
   end
   if not action or action.id ~= params.action_id then return nil, "action_not_found" end
+  local detail = action.detail
+  if action.status == "running" then
+    if action.type == "mine" then
+      detail = {gained = action.gained, count = action.goal_count}
+    elseif action.type == "craft" then
+      local remaining = 0
+      if valid_character(state) then
+        for _, item in ipairs(state.character.crafting_queue or {}) do
+          if item.recipe == action.recipe and not item.prerequisite then
+            remaining = remaining + item.count
+          end
+        end
+      end
+      detail = {recipe = action.recipe, count = action.count, remaining = remaining}
+    end
+  end
   return {
     action_id = action.id, type = action.type, status = action.status,
-    error = action.error, detail = action.detail,
+    error = action.error, detail = detail,
     position = action.status == "running" and
                (valid_character(state) and position_data(state.character) or nil) or
                action.position

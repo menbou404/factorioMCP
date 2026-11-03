@@ -389,6 +389,40 @@ def main():
         json.dumps(checked),
     )
 
+    # M8-F: coal starts at 100, with only 3 hand-mined earlier and no drill on this tile.
+    action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+    observed = bridge.call("observe_nearby", {"names": ["coal"]})["result"]
+    coal = next(
+        entity
+        for entity in observed["entities"]
+        if entity["name"] == "coal" and entity["x"] == 3.5 and entity["y"] == 5.5
+    )
+    started = bridge.call("mine_entity", {"target_ref": coal["target_ref"], "count": 10})["result"]
+    waited = asyncio.run(
+        create_server(bridge).call_tool(
+            "wait_for_action", {"action_id": started["action_id"], "timeout_seconds": 1}
+        )
+    )
+    value = json.loads(waited.content[0].text)
+    detail = value.get("detail") or {}
+    record(
+        "running mining reports progress",
+        not waited.is_error
+        and value.get("status") == "running"
+        and value.get("timed_out") is True
+        and detail.get("count") == 10
+        and isinstance(detail.get("gained"), (int, float))
+        and 0 <= detail["gained"] < 10,
+        json.dumps(value),
+    )
+    finished = asyncio.run(
+        create_server(bridge).call_tool("wait_for_action", {"action_id": started["action_id"]})
+    )
+    value = json.loads(finished.content[0].text)
+    record("progress mining finishes", not finished.is_error and value.get("status") == "succeeded")
+    if value.get("status") == "running":
+        bridge.call("cancel_action", {"action_id": started["action_id"]})
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
