@@ -33,7 +33,9 @@ HINTS = {
     ),
     "action_conflict": (
         "Wait for detail.running_action with wait_for_action, or stop it with cancel_action. "
-        "Only one craft at a time and one walk/mine at a time; crafting can run alongside either."
+        "Only one craft at a time and one walk/mine at a time; crafting can run alongside either. "
+        "place_entity, transfer_item, rotate_entity, and set_recipe also return action_conflict "
+        "while a walk or mine is running; they are allowed while crafting."
     ),
     "path_not_found": (
         "Check detail.goal_tiles and detail.goal_entities for obstacles explaining the failure. "
@@ -170,6 +172,14 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Observe nearby entities and blocked terrain tiles within 16 tiles. "
+            "Each entity includes distance from the character centre to the entity centre. "
+            "reach gives build (placing), interact (transferring, rotating, and setting recipes), "
+            "and mine_resource (resource/tree/rock mining) reach in tiles. "
+            "Resources, trees, and rocks are judged to their collision edge, so they may be "
+            "reachable at a slightly larger distance than mine_resource. "
+            "With include_resources = false, individual resource entities are omitted but the "
+            "resources summary still returns per-resource tile count, total amount, "
+            "and bounding area. "
             "Target refs and placement observations expire after 60 seconds. "
             "Supported structures in your force include sorted inventory_roles. "
             "Owned fluid structures include fluid_connections with port position, target_position, "
@@ -296,6 +306,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Mine an observed entity within reach over normal game time. Returns an action ID. "
+            "count is 1-100. "
             "Crafting runs alongside mining. Only one walk/mine at a time."
         )
     )
@@ -305,6 +316,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Start normal hand crafting using the AI character’s own materials. "
+            "count is 1-100. "
             "Crafting runs alongside walking and mining. Only one craft at a time. "
             "Poll the returned action ID. On missing_materials, detail.missing_raw lists "
             "raw items such as plates that are short after expanding hand-craftable "
@@ -386,6 +398,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Move a real item between the AI character and a nearby observed structure. "
+            "count is 1-100. "
             "Choose inventory_role from the structure's inventory_roles in observe_nearby. "
             "missing_materials detail includes item, requested, available (0), and contents "
             "of the source inventory (up to 10 items sorted by name, omitted when empty). "

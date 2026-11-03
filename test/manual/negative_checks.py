@@ -751,6 +751,43 @@ def main():
         json.dumps(checked),
     )
 
+    # M11-N: the character remains near the owned furnace/drill and the ore fixture.
+    observed = bridge.call("observe_nearby", {"owned_only": True, "include_tiles": False})["result"]
+    entities = observed["entities"]
+    position = observed["position"]
+    reach = observed.get("reach")
+    record(
+        "observation reports distance and reach",
+        bool(entities)
+        and all(
+            type(entity.get("distance")) in (int, float)
+            and math.isclose(
+                entity["distance"],
+                math.hypot(entity["x"] - position["x"], entity["y"] - position["y"]),
+                rel_tol=0,
+                abs_tol=1e-6,
+            )
+            for entity in entities
+        )
+        and isinstance(reach, dict)
+        and all(
+            type(reach.get(key)) in (int, float) and reach[key] > 0
+            for key in ("build", "interact", "mine_resource")
+        )
+        and reach["mine_resource"] < reach["interact"],
+        json.dumps(observed),
+    )
+    observed = bridge.call("observe_nearby", {"include_resources": False, "include_tiles": False})[
+        "result"
+    ]
+    record(
+        "summary without resource entities",
+        all(entity["type"] != "resource" for entity in observed["entities"])
+        and isinstance(observed.get("resources"), list)
+        and bool(observed["resources"]),
+        json.dumps(observed),
+    )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
