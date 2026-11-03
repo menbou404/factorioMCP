@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import unittest
 from unittest.mock import Mock, patch
@@ -36,6 +37,269 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_batch_schemas_match_single_tools_and_describe_execution(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for batch, single in (
+            ("transfer_items", "transfer_item"),
+            ("place_entities", "place_entity"),
+        ):
+            with self.subTest(tool=batch):
+                tool = tools[batch]
+                schema = tool.input_schema
+                self.assertEqual(schema["required"], ["items"])
+                items = schema["properties"]["items"]
+                self.assertEqual(items["type"], "array")
+                self.assertEqual(items["minItems"], 1)
+                self.assertEqual(items["maxItems"], 10)
+                entry = items["items"]
+                if "$ref" in entry:
+                    entry = schema["$defs"][entry["$ref"].rsplit("/", 1)[1]]
+                self.assertEqual(entry["properties"], tools[single].input_schema["properties"])
+                self.assertEqual(entry["required"], tools[single].input_schema["required"])
+                self.assertIn(tools[single].description, tool.description)
+                for text in (
+                    "1-10",
+                    "in order in one tick",
+                    "without walking",
+                    "Failures do not stop later entries",
+                    "1-based index",
+                    "same error codes",
+                    "action_conflict",
+                    "crafting is allowed",
+                    "ok: true",
+                ):
+                    self.assertIn(text, tool.description)
+
+    async def test_batch_forwards_one_request_preserving_order_and_defaults(self):
+        transfer = {
+            "target_ref": "42",
+            "direction": "to_entity",
+            "inventory_role": "fuel",
+            "item": "coal",
+            "count": 100,
+        }
+        places = [
+            {"item": "transport-belt", "surface": "nauvis", "x": 1, "y": 2},
+            {
+                "item": "underground-belt",
+                "surface": "nauvis",
+                "x": 2,
+                "y": 2,
+                "direction": 4,
+                "underground_type": "output",
+            },
+            {
+                "item": "splitter",
+                "surface": "nauvis",
+                "x": 3,
+                "y": 2,
+                "underground_type": None,
+            },
+        ]
+        bridge = Mock()
+        bridge.call.return_value = {
+            "tick": 42,
+            "result": {"results": [], "succeeded": 0, "failed": 0},
+        }
+        server = create_server(bridge)
+        for count in (1, 10):
+            entries = [{**transfer, "target_ref": str(index)} for index in range(count)]
+            await server.call_tool("transfer_items", {"items": entries})
+            bridge.call.assert_called_once_with("transfer_items", {"items": entries})
+            bridge.reset_mock()
+        await server.call_tool("place_entities", {"items": places})
+        expected = [{**entry, "direction": entry.get("direction", 0)} for entry in places]
+        expected[2].pop("underground_type")
+        bridge.call.assert_called_once_with("place_entities", {"items": expected})
+
+    async def test_batch_entry_errors_get_single_op_hints_and_normalization(self):
+        successes = {"moved": 2, "item": "coal", "inventory_role": "fuel"}
+        raw = {
+            "results": [
+                {"index": 1, "ok": True, "result": successes},
+                {
+                    "index": 2,
+                    "ok": False,
+                    "error": "invalid_target",
+                    "detail": {"valid_roles": {}, "role_aliases": []},
+                },
+                {
+                    "index": 3,
+                    "ok": False,
+                    "error": "blocked",
+                    "detail": {"blocking": {}, "tiles": {}, "valid_directions": [4, 12]},
+                },
+                {"index": 4, "ok": False, "error": "missing_materials", "detail": {"contents": {}}},
+                {"index": 5, "ok": False, "error": "missing_materials"},
+                {"index": 6, "ok": False, "error": "inventory_full"},
+                {
+                    "index": 7,
+                    "ok": False,
+                    "error": "action_conflict",
+                    "detail": {"running_action": {"id": "walk-1", "type": "move"}},
+                },
+            ],
+            "succeeded": 1,
+            "failed": 6,
+        }
+        for operation, params in (
+            (
+                "transfer_items",
+                {
+                    "target_ref": "42",
+                    "direction": "from_entity",
+                    "inventory_role": "fuel",
+                    "item": "coal",
+                    "count": 1,
+                },
+            ),
+            ("place_entities", {"item": "transport-belt", "surface": "nauvis", "x": 1, "y": 2}),
+        ):
+            with self.subTest(tool=operation):
+                bridge = Mock()
+                bridge.call.return_value = {"tick": 42, "result": copy.deepcopy(raw)}
+                async with Client(create_server(bridge)) as client:
+                    response = await client.call_tool(operation, {"items": [params]})
+                self.assertFalse(response.is_error)
+                value = payload(response)
+                self.assertIs(value["ok"], True)
+                self.assertEqual((value["tick"], value["succeeded"], value["failed"]), (42, 1, 6))
+                entries = value["results"]
+                self.assertEqual(entries[0], raw["results"][0])
+                self.assertEqual(entries[1]["detail"], {"valid_roles": [], "role_aliases": {}})
+                self.assertEqual(
+                    entries[2]["detail"], {"blocking": [], "tiles": [], "valid_directions": [4, 12]}
+                )
+                self.assertEqual(entries[3]["detail"], {"contents": []})
+                self.assertNotIn("detail", entries[4])
+                self.assertNotIn("hint", entries[5])
+                self.assertEqual(entries[6]["detail"], raw["results"][6]["detail"])
+                for entry in entries[1:]:
+                    if entry["error"] in HINTS:
+                        self.assertEqual(entry["hint"], HINTS[entry["error"]])
+
+    async def test_batch_all_failed_is_success_and_cached_results_are_normalized(self):
+        failed = {"index": 1, "ok": False, "error": "action_conflict"}
+        batch = {"results": [failed], "succeeded": 0, "failed": 1}
+        bridge = Mock()
+        bridge.call.return_value = {"tick": 42, "result": copy.deepcopy(batch)}
+        server = create_server(bridge)
+        params = {"item": "transport-belt", "surface": "nauvis", "x": 1, "y": 2}
+        result = await server.call_tool("place_entities", {"items": [params]})
+        self.assertFalse(result.is_error)
+        self.assertIs(payload(result)["ok"], True)
+        self.assertEqual(payload(result)["succeeded"], 0)
+        self.assertEqual(payload(result)["failed"], 1)
+        original = {"request_id": "batch-1", "ok": True, "tick": 42, "result": batch}
+        bridge.call.return_value = {"result": {"original_response": original}}
+        cached = payload(await server.call_tool("get_request_result", {"request_id": "batch-1"}))
+        self.assertEqual(
+            cached["original_response"]["result"], {key: payload(result)[key] for key in batch}
+        )
+        self.assertEqual(cached["original_response"]["request_id"], "batch-1")
+
+    async def test_batch_input_validation_through_mcp_client(self):
+        transfer = {
+            "target_ref": "42",
+            "direction": "to_entity",
+            "inventory_role": "fuel",
+            "item": "coal",
+            "count": 1,
+        }
+        place = {"item": "transport-belt", "surface": "nauvis", "x": 1, "y": 2}
+        cases = []
+        for operation, entry in (("transfer_items", transfer), ("place_entities", place)):
+            for invalid, expected in (
+                (None, {"items": "list_type"}),
+                ({}, {"items": "list_type"}),
+                ([], {"items": "too_short"}),
+                ([entry] * 11, {"items": "too_long"}),
+                ([entry, False], {"items.1": "model_type"}),
+                ([{**entry, "item": ""}], {"items.0.item": "string_too_short"}),
+            ):
+                cases.append((operation, {"items": invalid}, expected))
+        for count, error_type in (
+            (0, "greater_than_equal"),
+            (101, "less_than_equal"),
+            ("2", "int_type"),
+            (True, "int_type"),
+            (1.5, "int_type"),
+        ):
+            cases.append(
+                (
+                    "transfer_items",
+                    {"items": [transfer, transfer, {**transfer, "count": count}]},
+                    {"items.2.count": error_type},
+                )
+            )
+        cases.extend(
+            [
+                (
+                    "transfer_items",
+                    {"items": [{**transfer, "direction": "invalid"}]},
+                    {"items.0.direction": "literal_error"},
+                ),
+                (
+                    "transfer_items",
+                    {"items": [{**transfer, "inventory_role": ""}]},
+                    {"items.0.inventory_role": "string_too_short"},
+                ),
+                (
+                    "transfer_items",
+                    {"items": [{**transfer, "target_ref": ""}]},
+                    {"items.0.target_ref": "string_too_short"},
+                ),
+                (
+                    "place_entities",
+                    {"items": [{**place, "direction": 1}]},
+                    {"items.0.direction": "literal_error"},
+                ),
+                (
+                    "place_entities",
+                    {"items": [{**place, "underground_type": "invalid"}]},
+                    {"items.0.underground_type": "literal_error"},
+                ),
+                (
+                    "place_entities",
+                    {"items": [{**place, "surface": ""}]},
+                    {"items.0.surface": "string_too_short"},
+                ),
+                (
+                    "place_entities",
+                    {"items": [{**place, "x": "inf"}]},
+                    {"items.0.x": "finite_number"},
+                ),
+                (
+                    "place_entities",
+                    {"items": [{**place, "y": "invalid"}]},
+                    {"items.0.y": "float_parsing"},
+                ),
+                (
+                    "place_entities",
+                    {"items": [{}]},
+                    {
+                        key: "missing"
+                        for key in ("items.0.item", "items.0.surface", "items.0.x", "items.0.y")
+                    },
+                ),
+            ]
+        )
+        for mode in ("auto", "legacy"):
+            bridge = Mock()
+            async with Client(create_server(bridge), mode=mode) as client:
+                for operation, arguments, expected in cases:
+                    with self.subTest(mode=mode, tool=operation, arguments=arguments):
+                        result = await client.call_tool(operation, arguments)
+                        self.assertTrue(result.is_error)
+                        value = payload(result)
+                        self.assertIs(value["ok"], False)
+                        self.assertEqual(value["error"], "invalid_input")
+                        self.assertEqual(value["hint"], HINTS["invalid_input"])
+                        self.assertEqual(
+                            {e["field"]: e["type"] for e in value["detail"]["errors"]}, expected
+                        )
+            bridge.call.assert_not_called()
+
     async def test_m14u_descriptions_and_schema(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         for name in ("place_entity", "check_placement"):
