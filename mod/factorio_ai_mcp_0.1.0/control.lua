@@ -210,6 +210,13 @@ local function require_character(state)
   return state.character
 end
 
+local function register_target(state, entity)
+  local target_ref = tostring(state.next_target_id)
+  state.next_target_id = state.next_target_id + 1
+  state.targets[target_ref] = {entity = entity, tick = game.tick}
+  return target_ref
+end
+
 local function target_entity(character, params, max_distance, mining)
   local state = ensure_storage()
   if type(params.target_ref) == "string" then
@@ -537,11 +544,8 @@ local function do_observe(state, params)
                             surface = character.surface.name, tick = game.tick, radius = radius}
   for index = entity_offset + 1, math.min(entity_offset + MAX_OBSERVATIONS, #visible) do
     local entity = visible[index]
-    local target_ref = tostring(state.next_target_id)
-    state.next_target_id = state.next_target_id + 1
-    state.targets[target_ref] = {entity = entity, tick = game.tick}
     local observed = {
-      target_ref = target_ref,
+      target_ref = register_target(state, entity),
       name = entity.name, type = entity.type,
       x = entity.position.x, y = entity.position.y,
       surface = entity.surface.name, unit_number = entity.unit_number,
@@ -831,7 +835,7 @@ local function placement_bounding_box(prototype, position, direction)
           right_bottom = {x = position.x + right, y = position.y + bottom}}
 end
 
-local function placement_blocking(character, prototype, position, direction)
+local function placement_blocking(state, character, prototype, position, direction)
   -- Keep the requested position so every alternative direction snaps independently.
   local area = placement_bounding_box(prototype, snapped_position(prototype, position, direction),
                                       direction)
@@ -853,7 +857,8 @@ local function placement_blocking(character, prototype, position, direction)
   local blocking = {}
   for _, entity in pairs(character.surface.find_entities_filtered{area = area}) do
     if entity ~= character and overlaps_and_collides(entity) then
-      blocking[#blocking + 1] = {name = entity.name, type = entity.type,
+      blocking[#blocking + 1] = {target_ref = register_target(state, entity),
+                                name = entity.name, type = entity.type,
                                 x = entity.position.x, y = entity.position.y}
       if #blocking == 10 then break end
     end
@@ -924,11 +929,11 @@ local function validate_placement(state, character, params, require_item)
   end
   if not character.can_place_entity{name = entity_name, position = position,
                                      direction = direction} then
-    return nil, "blocked", placement_blocking(character, prototype, requested_position, direction)
+    return nil, "blocked", placement_blocking(state, character, prototype, requested_position, direction)
   end
   if not character.surface.can_place_entity{name = entity_name, position = position,
                                              direction = direction, force = character.force} then
-    return nil, "blocked", placement_blocking(character, prototype, requested_position, direction)
+    return nil, "blocked", placement_blocking(state, character, prototype, requested_position, direction)
   end
   return {name = entity_name, position = position, direction = direction,
           inventory = inventory}
@@ -979,7 +984,7 @@ local function do_place(state, params)
   }
   if not created or not created.valid then
     inventory.insert(item)
-    return nil, "blocked", placement_blocking(character, prototypes.entity[placement.name],
+    return nil, "blocked", placement_blocking(state, character, prototypes.entity[placement.name],
                                               {x = params.x, y = params.y}, placement.direction)
   end
   return {name = created.name, position = position_data(created),
@@ -1081,6 +1086,22 @@ local function do_entity_inventory(state, params)
                           target.drop_position or nil}
 end
 
+local function transfer_shortage_detail(source, params)
+  local contents = source.get_contents()
+  table.sort(contents, function(a, b)
+    if a.name ~= b.name then return a.name < b.name end
+    return a.quality < b.quality
+  end)
+  local preview = {}
+  for index = 1, math.min(10, #contents) do
+    local item = contents[index]
+    preview[#preview + 1] = {name = item.name, count = item.count, quality = item.quality}
+  end
+  return {item = params.item, requested = params.count, available = 0,
+          inventory_role = params.direction == "from_entity" and params.inventory_role or nil,
+          contents = #preview > 0 and preview or nil}
+end
+
 local function do_transfer(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -1098,7 +1119,8 @@ local function do_transfer(state, params)
   end
   local entity_inventory = target.get_inventory(inventory_id)
   local player_inventory = character.get_main_inventory()
-  if not entity_inventory or not entity_inventory.valid or not player_inventory then
+  if not entity_inventory or not entity_inventory.valid or
+     not player_inventory or not player_inventory.valid then
     return nil, "invalid_target", {entity = target.name, valid_roles = sorted_keys(roles)}
   end
   local source = params.direction == "to_entity" and player_inventory or entity_inventory
@@ -1107,10 +1129,17 @@ local function do_transfer(state, params)
   local count = math.min(params.count, source.get_item_count(item_id),
                          destination.get_insertable_count(item_id))
   if count == 0 then
-    return nil, source.get_item_count(item_id) == 0 and "missing_materials" or "inventory_full"
+    if source.get_item_count(item_id) == 0 then
+      return nil, "missing_materials", transfer_shortage_detail(source, params)
+    end
+    return nil, "inventory_full"
   end
   local removed = source.remove{name = params.item, quality = "normal", count = count}
-  if removed == 0 then return nil, "missing_materials" end
+  if removed == 0 then
+    local shortage = source.get_item_count(item_id) == 0 and
+                     transfer_shortage_detail(source, params) or nil
+    return nil, "missing_materials", shortage
+  end
   local inserted = destination.insert{name = params.item, quality = "normal", count = removed}
   if inserted < removed then
     source.insert{name = params.item, quality = "normal", count = removed - inserted}

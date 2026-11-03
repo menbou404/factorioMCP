@@ -480,6 +480,89 @@ def main():
         set_goal_tiles("grass-1")
         action("move_to", return_position)
 
+    # M9-H: use the spare furnace without fuel so production cannot race the empty-result check.
+    # logistics_line.py needs the original furnace and drill at (6, 4) and (6, 6) for pickup.
+    action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+    before = items()
+    bridge.call("observe_nearby")
+    spare_position = {"surface": "nauvis", "x": 1, "y": 6}
+    bridge.call("place_entity", {"item": "stone-furnace", **spare_position})
+    observed = bridge.call("observe_nearby", {"names": ["stone-furnace"], "owned_only": True})[
+        "result"
+    ]
+    spare = next(
+        entity
+        for entity in observed["entities"]
+        if entity["x"] == spare_position["x"] and entity["y"] == spare_position["y"]
+    )
+    inventories = bridge.call("get_entity_inventory", {"target_ref": spare["target_ref"]})[
+        "result"
+    ]["inventories"]
+    if any(item["name"] == "iron-plate" for item in inventories["result"]):
+        raise RuntimeError("M9-H spare furnace unexpectedly has iron plates")
+    try:
+        bridge.call(
+            "transfer_item",
+            {
+                "target_ref": spare["target_ref"],
+                "direction": "from_entity",
+                "inventory_role": "result",
+                "item": "iron-plate",
+                "count": 5,
+            },
+        )
+    except BridgeError as error:
+        detail = error.detail or {}
+        record(
+            "transfer from an empty result explains shortage",
+            error.code == "missing_materials"
+            and detail.get("item") == "iron-plate"
+            and detail.get("requested") == 5
+            and detail.get("available") == 0
+            and detail.get("inventory_role") == "result"
+            and ("contents" not in detail or isinstance(detail["contents"], list)),
+            json.dumps(detail),
+        )
+    else:
+        record("transfer from an empty result explains shortage", False, "unexpected success")
+
+    checked = bridge.call("check_placement", {"item": "stone-furnace", **spare_position})["result"]
+    blocking = checked.get("blocking", [])
+    refs_present = bool(blocking) and all(
+        isinstance(entity.get("target_ref"), str) and bool(entity["target_ref"])
+        for entity in blocking
+    )
+    target = next(
+        (
+            entity
+            for entity in blocking
+            if entity["name"] == "stone-furnace"
+            and entity["x"] == spare_position["x"]
+            and entity["y"] == spare_position["y"]
+        ),
+        None,
+    )
+    # Recover only the temporary furnace; a missing blocking ref still fails the check.
+    mining_ref = target["target_ref"] if refs_present and target else spare["target_ref"]
+    action("mine_entity", {"target_ref": mining_ref, "count": 1})
+    remaining = bridge.call("observe_nearby", {"names": ["stone-furnace"], "owned_only": True})[
+        "result"
+    ]["entities"]
+    record(
+        "blocking target_ref can be mined",
+        checked.get("placeable") is False
+        and checked.get("reason") == "blocked"
+        and len(blocking) <= 10
+        and refs_present
+        and target is not None
+        and not any(
+            entity["x"] == spare_position["x"] and entity["y"] == spare_position["y"]
+            for entity in remaining
+        )
+        and items() == before,
+        json.dumps(checked),
+    )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

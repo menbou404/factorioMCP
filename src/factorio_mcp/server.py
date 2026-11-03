@@ -41,7 +41,10 @@ HINTS = {
     ),
     "invalid_target": "Check the entity and valid_roles in detail, then choose a supported target.",
     "out_of_range": "Move closer to the target, then observe_nearby again.",
-    "missing_materials": "Gather the missing items before retrying.",
+    "missing_materials": (
+        "Gather the missing items before retrying. "
+        "For transfers, check detail.contents for items in the source inventory."
+    ),
 }
 
 
@@ -98,7 +101,14 @@ def _error_response(exc: Exception) -> CallToolResult:
             value["request_id"] = detail["request_id"]
         public_detail = {key: item for key, item in detail.items() if key != "request_id"}
         # Factorio serializes empty Lua arrays as objects.
-        for field in ("blocking", "tiles", "missing", "valid_roles", "supported_entities"):
+        for field in (
+            "blocking",
+            "tiles",
+            "missing",
+            "valid_roles",
+            "supported_entities",
+            "contents",
+        ):
             if field in public_detail and not isinstance(public_detail[field], list):
                 public_detail[field] = []
         if public_detail:
@@ -291,6 +301,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " Returns the snapped position and actual fluid_connections with port position,"
             " target_position, direction, flow, fluidbox_index, and connected when present."
             " Blocked errors may include valid_directions for another orientation."
+            " Each detail.blocking entry includes a target_ref usable with mine_entity"
+            " for 60 seconds, subject to reach and force checks."
             " detail.reason is character_in_the_way when the character blocks placement"
             " (move the character away first), or placement_rules when no blocking entities,"
             " tiles, or character explain the failure."
@@ -316,6 +328,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "target_position, direction, flow, and fluidbox_index when present. "
             "Blocked results may include blocking, tiles, blocked_reason, "
             "and valid_directions for another orientation. "
+            "Each blocking entry includes a target_ref usable with mine_entity for 60 seconds, "
+            "subject to reach and force checks. "
             "blocked_reason is character_in_the_way when the character blocks placement "
             "(move the character away first), or placement_rules when no blocking entities, "
             "tiles, or character explain the failure."
@@ -344,7 +358,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Move a real item between the AI character and a nearby observed structure. "
-            "Choose inventory_role from the structure's inventory_roles in observe_nearby."
+            "Choose inventory_role from the structure's inventory_roles in observe_nearby. "
+            "missing_materials detail includes item, requested, available (0), and contents "
+            "of the source inventory (up to 10 items sorted by name, omitted when empty). "
+            "inventory_role is included when taking items from the structure."
         )
     )
     async def transfer_item(

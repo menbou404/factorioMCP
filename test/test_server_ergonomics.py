@@ -293,6 +293,61 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     self.assertIn(text, description)
 
+    async def test_blocking_descriptions_explain_mining_refs(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name in ("check_placement", "place_entity"):
+            with self.subTest(name=name):
+                for text in ("blocking", "target_ref", "mine_entity", "60 seconds"):
+                    self.assertIn(text, tools[name].description)
+
+    async def test_transfer_shortage_description_hint_and_detail(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        for text in ("missing_materials", "requested", "available", "contents", "source inventory"):
+            self.assertIn(text, tools["transfer_item"].description)
+        for direction in ("from_entity", "to_entity"):
+            for contents in (None, {}, [{"name": "copper-plate", "count": 3, "quality": "normal"}]):
+                with self.subTest(direction=direction, contents=contents):
+                    detail = {"item": "iron-plate", "requested": 5, "available": 0}
+                    if direction == "from_entity":
+                        detail["inventory_role"] = "result"
+                    if contents is not None:
+                        detail["contents"] = contents
+                    bridge.call.side_effect = BridgeError("missing_materials", detail=detail)
+                    result = await server.call_tool(
+                        "transfer_item",
+                        {
+                            "target_ref": "42",
+                            "direction": direction,
+                            "inventory_role": "result",
+                            "item": "iron-plate",
+                            "count": 5,
+                        },
+                    )
+                    self.assertTrue(result.is_error)
+                    value = payload(result)
+                    expected = dict(detail)
+                    if contents == {}:
+                        expected["contents"] = []
+                    self.assertEqual(value["detail"], expected)
+                    self.assertEqual(value["hint"], HINTS["missing_materials"])
+                    self.assertIn("detail.contents", value["hint"])
+                    self.assertIn("transfers", value["hint"])
+                    self.assertEqual(detail.get("contents"), contents)
+
+    async def test_blocking_refs_survive_success_and_error_normalization(self):
+        blocking = [{"name": "item-on-ground", "type": "item-entity", "target_ref": "42"}]
+        bridge = Mock()
+        server = create_server(bridge)
+        params = {"item": "stone-furnace", "surface": "nauvis", "x": 1, "y": 2}
+        bridge.call.return_value = {"result": {"placeable": False, "blocking": blocking}}
+        checked = payload(await server.call_tool("check_placement", params))
+        self.assertEqual(checked["blocking"], blocking)
+        bridge.call.side_effect = BridgeError("blocked", detail={"blocking": blocking})
+        placed = payload(await server.call_tool("place_entity", params))
+        self.assertEqual(placed["detail"]["blocking"], blocking)
+
     async def test_blocked_character_hint_explains_moving_away(self):
         bridge = Mock()
         detail = {"reason": "character_in_the_way", "blocking": {}, "tiles": {}}
