@@ -9,9 +9,11 @@ import json
 import math
 import time
 
-from factorio_mcp.bridge import BridgeError, parse_bridge_response
+from rcon.source import Client
+
+from factorio_mcp.bridge import RCON_FRAG_THRESHOLD, BridgeError, parse_bridge_response
 from factorio_mcp.server import create_server
-from production_line import action, bridge, reference
+from production_line import action, bridge, password, reference
 
 results = []
 errors = {}
@@ -274,6 +276,54 @@ def main():
         checked.get("position") == expected,
         json.dumps({"requested": requested, "position": checked.get("position")}),
     )
+
+    # M8-D: a tree trunk allows a path but blocks arrival at its exact center.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    goal = {"x": 0, "y": -4}
+    fixture = (
+        "/c local s=game.surfaces.nauvis;"
+        f"local p={{x={goal['x']},y={goal['y']}}};local e;"
+        'if s.can_place_entity{name="tree-01",position=p} then '
+        'e=s.create_entity{name="tree-01",position=p} end;'
+        'rcon.print("m8d_tree_fixture:"..(e and "created" or "blocked"))'
+    )
+    with Client(
+        "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+    ) as client:
+        result = client.run(fixture)
+        if "m8d_tree_fixture:" not in result:
+            result = client.run(fixture)
+        print(result.strip(), flush=True)
+        if "m8d_tree_fixture:created" not in result:
+            raise RuntimeError("Could not create M8-D tree fixture: " + result)
+
+    action("move_to", {"surface": return_position["surface"], "x": 0, "y": 2})
+    started = bridge.call(
+        "move_to",
+        {"surface": return_position["surface"], **goal},
+    )["result"]
+    wait_started = time.monotonic()
+    waited = asyncio.run(
+        create_server(bridge).call_tool(
+            "wait_for_action", {"action_id": started["action_id"], "timeout_seconds": 15}
+        )
+    )
+    elapsed = time.monotonic() - wait_started
+    value = json.loads(waited.content[0].text)
+    detail = value.get("detail") or {}
+    record(
+        "move to a blocked goal finishes nearby",
+        not waited.is_error
+        and value.get("status") == "succeeded"
+        and detail.get("goal_blocked") is True
+        and isinstance(detail.get("distance"), (int, float))
+        and detail["distance"] <= 1.5
+        and elapsed < 10,
+        json.dumps({"goal": goal, "result": value, "elapsed": elapsed}),
+    )
+    if value.get("status") == "running":
+        bridge.call("cancel_action", {"action_id": started["action_id"]})
+    action("move_to", return_position)
 
     failed = [label for label, passed, _ in results if not passed]
     if failed:
