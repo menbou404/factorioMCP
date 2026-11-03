@@ -683,6 +683,70 @@ local function hand_craftable(character, recipe)
     not character.force.get_hand_crafting_disabled_for_recipe(recipe.name) or false
 end
 
+local function missing_raw_materials(character, recipe, count)
+  -- Work on a snapshot only: reporting a shortage must not consume any items.
+  local held = {}
+  local inventory = character.get_main_inventory()
+  if inventory and inventory.valid then
+    for _, item in pairs(inventory.get_contents()) do
+      if item.quality == "normal" then
+        held[item.name] = (held[item.name] or 0) + item.count
+      end
+    end
+  end
+
+  local recipes = {}
+  for name, candidate in pairs(character.force.recipes) do
+    if hand_craftable(character, candidate) then
+      local main_product = candidate.prototype.main_product
+      for _, product in pairs(candidate.products) do
+        local amount = product.amount or product.amount_min
+        if product.type == "item" and amount and amount > 0 and
+           (name == product.name or
+            (main_product and main_product.type == "item" and
+             main_product.name == product.name)) then
+          local previous = recipes[product.name]
+          if not previous or
+             (previous.recipe.name ~= product.name and
+              (name == product.name or name < previous.recipe.name)) then
+            recipes[product.name] = {recipe = candidate, amount = amount}
+          end
+        end
+      end
+    end
+  end
+
+  local missing = {}
+  local function need(item, amount, depth)
+    local taken = math.min(held[item] or 0, amount)
+    held[item] = (held[item] or 0) - taken
+    local remainder = amount - taken
+    if remainder <= 0 then return end
+    local producer = recipes[item]
+    if depth < 5 and producer then
+      local runs = math.ceil(remainder / producer.amount)
+      for _, ingredient in pairs(producer.recipe.ingredients) do
+        if ingredient.type == "item" then
+          need(ingredient.name, ingredient.amount * runs, depth + 1)
+        end
+      end
+    else
+      missing[item] = (missing[item] or 0) + remainder
+    end
+  end
+
+  for _, ingredient in pairs(recipe.ingredients) do
+    if ingredient.type == "item" then
+      need(ingredient.name, ingredient.amount * count, 0)
+    end
+  end
+  local output = {}
+  for _, name in ipairs(sorted_keys(missing)) do
+    output[#output + 1] = {name = name, count = missing[name]}
+  end
+  return #output > 0 and output or nil
+end
+
 local function do_recipe_info(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -842,7 +906,9 @@ local function do_craft(state, params)
     end
     table.sort(missing, function(a, b) return a.name < b.name end)
     return nil, "missing_materials", {recipe = params.recipe, count = params.count,
-                                      missing = missing, best_effort = true}
+                                      missing = missing, best_effort = true,
+                                      missing_raw = missing_raw_materials(character, recipe,
+                                                                         params.count)}
   end
   local before = state.action and state.action.type == "mine" and
                  mining_inventory_count(character) or nil

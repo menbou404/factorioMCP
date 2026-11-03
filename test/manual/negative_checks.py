@@ -676,6 +676,50 @@ def main():
         set_goal_tiles("grass-1")
         action("move_to", return_position)
 
+    # M10-K: the drill is unlocked from the start; use held intermediates before raw items.
+    ingredients = {}
+    for recipe_name in ("burner-mining-drill", "iron-gear-wheel", "stone-furnace"):
+        recipe = bridge.call("get_recipe_info", {"recipe": recipe_name})["result"]
+        ingredients[recipe_name] = {item["name"]: item["amount"] for item in recipe["ingredients"]}
+    drill = ingredients["burner-mining-drill"]
+    gear_iron = ingredients["iron-gear-wheel"]["iron-plate"]
+    furnace_stone = ingredients["stone-furnace"]["stone"]
+    before = items()
+    iron = before.get("iron-plate", 0)
+    stone = before.get("stone", 0)
+    gears = before.get("iron-gear-wheel", 0)
+    furnaces = before.get("stone-furnace", 0)
+    for craft_count in range(1, 101):
+        needed_gears = max(0, drill["iron-gear-wheel"] * craft_count - gears)
+        needed_furnaces = max(0, drill["stone-furnace"] * craft_count - furnaces)
+        shortfalls = {
+            "iron-plate": max(
+                0, drill["iron-plate"] * craft_count + gear_iron * needed_gears - iron
+            ),
+            "stone": max(0, furnace_stone * needed_furnaces - stone),
+        }
+        expected_raw = [
+            {"name": name, "count": count}
+            for name, count in sorted(shortfalls.items())
+            if count > 0
+        ]
+        if expected_raw and (needed_gears > 0 or needed_furnaces > 0):
+            break
+    else:
+        raise RuntimeError("M10-K needs a shortage within the 100-craft request limit")
+    try:
+        bridge.call("craft", {"recipe": "burner-mining-drill", "count": craft_count})
+    except BridgeError as error:
+        detail = error.detail or {}
+        record(
+            "craft shortage lists raw materials",
+            error.code == "missing_materials" and detail.get("missing_raw") == expected_raw,
+            json.dumps({"error": error.code, "expected": expected_raw, "detail": detail}),
+        )
+    else:
+        record("craft shortage lists raw materials", False, "unexpected success")
+    record("raw shortage check keeps inventory", items() == before)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
