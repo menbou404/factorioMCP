@@ -28,7 +28,10 @@ FilterNames = Annotated[
 HINTS = {
     "target_gone": "target_ref expires after 60 seconds. Refresh it with observe_nearby.",
     "not_visible": "Observe the placement area within 60 seconds before placing.",
-    "action_conflict": "Wait with wait_for_action, or stop the running action with cancel_action.",
+    "action_conflict": (
+        "Wait for detail.running_action with wait_for_action, or stop it with cancel_action. "
+        "Only one craft at a time and one walk/mine at a time; crafting can run alongside either."
+    ),
     "path_not_found": (
         "Check detail.goal_tiles and detail.goal_entities for obstacles explaining the failure. "
         "If present, detail.nearby_free_position is a standable spot to try with move_to; "
@@ -147,7 +150,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await invoke("ping")
 
     @server.tool(
-        description="Get the AI character position, health, inventory, and current action."
+        description=(
+            "Get the AI character position, health, inventory, and current actions. "
+            "action is the walk/mine slot; craft_action is the crafting slot."
+        )
     )
     async def get_agent_status() -> CallToolResult:
         return await invoke("get_agent_status")
@@ -271,6 +277,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and detail.distance. Blocked or timeout failures include detail.distance and "
             "detail.goal. path_not_found includes goal details and may include goal_tiles, "
             "goal_entities, and nearby_free_position (a standable spot with no path guarantee). "
+            "Crafting runs alongside walking. Only one walk/mine at a time. "
             "Returns an action ID for polling."
         )
     )
@@ -279,7 +286,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
 
     @server.tool(
         description=(
-            "Mine an observed entity within reach over normal game time. Returns an action ID."
+            "Mine an observed entity within reach over normal game time. Returns an action ID. "
+            "Crafting runs alongside mining. Only one walk/mine at a time."
         )
     )
     async def mine_entity(target_ref: RequiredText, count: Count = 1) -> CallToolResult:
@@ -288,6 +296,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Start normal hand crafting using the AI character’s own materials. "
+            "Crafting runs alongside walking and mining. Only one craft at a time. "
             "Poll the returned action ID."
         )
     )

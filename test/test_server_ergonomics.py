@@ -33,6 +33,54 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_action_descriptions_explain_concurrency(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name, alongside in (
+            ("craft", "Crafting runs alongside walking and mining"),
+            ("move_to", "Crafting runs alongside walking"),
+            ("mine_entity", "Crafting runs alongside mining"),
+        ):
+            with self.subTest(name=name):
+                self.assertIn(alongside, tools[name].description)
+                limit = "one craft at a time" if name == "craft" else "one walk/mine at a time"
+                self.assertIn(limit, tools[name].description)
+        for field in ("action", "craft_action", "walk/mine slot", "crafting slot"):
+            self.assertIn(field, tools["get_agent_status"].description)
+
+    async def test_agent_status_preserves_both_action_slots(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        slots = {
+            "action": {"id": "10", "type": "move", "status": "running"},
+            "craft_action": {"id": "11", "type": "craft", "status": "running"},
+        }
+        for running in (
+            {},
+            {"action": slots["action"]},
+            {"craft_action": slots["craft_action"]},
+            slots,
+        ):
+            with self.subTest(running=running):
+                bridge.call.return_value = {"result": {"inventory": {}, **running}}
+                value = payload(await server.call_tool("get_agent_status", {}))
+                self.assertEqual(value["inventory"], [])
+                for field in slots:
+                    self.assertEqual(value.get(field), running.get(field))
+
+    async def test_craft_conflict_preserves_the_conflicting_slot(self):
+        bridge = Mock()
+        detail = {"running_action": {"id": "11", "type": "craft"}}
+        bridge.call.side_effect = BridgeError("action_conflict", detail=detail)
+        result = await create_server(bridge).call_tool(
+            "craft", {"recipe": "iron-gear-wheel", "count": 1}
+        )
+        self.assertTrue(result.is_error)
+        value = payload(result)
+        self.assertEqual(value["detail"], detail)
+        self.assertEqual(value["hint"], HINTS["action_conflict"])
+        for text in ("detail.running_action", "one craft at a time", "one walk/mine at a time"):
+            self.assertIn(text, value["hint"])
+
     async def test_action_status_descriptions_explain_running_progress(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         for name in ("get_action_status", "wait_for_action"):
