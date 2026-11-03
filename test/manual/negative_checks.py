@@ -637,6 +637,45 @@ def main():
                 bridge.call("cancel_action", {"action_id": action_id})
         action("move_to", return_position)
 
+    # M10-J: check_placement uses require_item=false, so no pump item is needed.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    land = {"surface": "nauvis", "x": -10, "y": -4}
+
+    def water_edge_distance(position):
+        # The fixture's tiles (-12..-8) occupy the square [-12, -7] on each axis.
+        x, y = position["x"], position["y"]
+        nearest_x, nearest_y = max(-12, min(-7, x)), max(-12, min(-7, y))
+        return min(
+            math.hypot(x - nearest_x, y + 12),
+            math.hypot(x - nearest_x, y + 7),
+            math.hypot(x + 12, y - nearest_y),
+            math.hypot(x + 7, y - nearest_y),
+        )
+
+    try:
+        set_goal_tiles("water")
+        action("move_to", {**land, "y": -2})
+        bridge.call("observe_nearby")
+        checked = bridge.call("check_placement", {"item": "offshore-pump", **land})["result"]
+        nearby = checked.get("nearby_positions", [])
+        record(
+            "offshore pump on land suggests shoreline positions",
+            checked.get("placeable") is False
+            and checked.get("blocked_reason") == "placement_rules"
+            and isinstance(nearby, list)
+            and 1 <= len(nearby) <= 3
+            and all(
+                position.get("direction") in (0, 4, 8, 12)
+                and math.hypot(position["x"] - land["x"], position["y"] - land["y"]) <= 8
+                and water_edge_distance(position) <= 2
+                for position in nearby
+            ),
+            json.dumps(checked),
+        )
+    finally:
+        set_goal_tiles("grass-1")
+        action("move_to", return_position)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

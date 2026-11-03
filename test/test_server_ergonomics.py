@@ -348,6 +348,46 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 for text in ("blocking", "target_ref", "mine_entity", "60 seconds"):
                     self.assertIn(text, tools[name].description)
 
+    async def test_placement_descriptions_and_hint_explain_nearby_positions(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name, text in (
+            ("check_placement", tools["check_placement"].description),
+            ("place_entity", tools["place_entity"].description),
+            ("blocked hint", HINTS["blocked"]),
+        ):
+            with self.subTest(name=name):
+                for advice in (
+                    "placement_rules",
+                    "nearby_positions",
+                    "up to 3 placeable centres and directions",
+                    "within 8 tiles of the requested position",
+                    "may be out of reach",
+                    "move closer and check again with check_placement",
+                ):
+                    self.assertIn(advice, text)
+
+    async def test_nearby_positions_survive_placement_results_and_errors(self):
+        nearby = [{"x": -9.5, "y": -6.5, "direction": 0}]
+        bridge = Mock()
+        server = create_server(bridge)
+        params = {"item": "offshore-pump", "surface": "nauvis", "x": -10, "y": -4}
+        bridge.call.return_value = {
+            "result": {
+                "placeable": False,
+                "blocked_reason": "placement_rules",
+                "nearby_positions": nearby,
+            }
+        }
+        checked = payload(await server.call_tool("check_placement", params))
+        self.assertFalse(checked["placeable"])
+        self.assertEqual(checked["blocked_reason"], "placement_rules")
+        self.assertEqual(checked["nearby_positions"], nearby)
+        detail = {"reason": "placement_rules", "nearby_positions": nearby}
+        bridge.call.side_effect = BridgeError("blocked", detail=detail)
+        placed = payload(await server.call_tool("place_entity", params))
+        self.assertEqual(placed["detail"], detail)
+        self.assertEqual(placed["hint"], HINTS["blocked"])
+
     async def test_transfer_shortage_description_hint_and_detail(self):
         bridge = Mock()
         server = create_server(bridge)

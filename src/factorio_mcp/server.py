@@ -40,7 +40,10 @@ HINTS = {
     "blocked": (
         "Check valid_directions for another orientation, mine or recover blocking entities, "
         "or find another position with check_placement. "
-        "If reason is character_in_the_way, move the character away first."
+        "If reason is character_in_the_way, move the character away first. "
+        "For placement_rules, nearby_positions lists up to 3 placeable centres and directions "
+        "within 8 tiles of the requested position. They may be out of reach; "
+        "move closer and check again with check_placement."
     ),
     "invalid_target": "Check the entity and valid_roles in detail, then choose a supported target.",
     "out_of_range": "Move closer to the target, then observe_nearby again.",
@@ -315,6 +318,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " detail.reason is character_in_the_way when the character blocks placement"
             " (move the character away first), or placement_rules when no blocking entities,"
             " tiles, or character explain the failure."
+            " For placement_rules, detail.nearby_positions lists up to 3 placeable centres"
+            " and directions within 8 tiles of the requested position."
+            " They may be out of reach; move closer and check again with check_placement."
         )
     )
     async def place_entity(
@@ -341,7 +347,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "subject to reach and force checks. "
             "blocked_reason is character_in_the_way when the character blocks placement "
             "(move the character away first), or placement_rules when no blocking entities, "
-            "tiles, or character explain the failure."
+            "tiles, or character explain the failure. "
+            "For placement_rules, nearby_positions lists up to 3 placeable centres and "
+            "directions within 8 tiles of the requested position. "
+            "They may be out of reach; move closer and check again with check_placement."
         )
     )
     async def check_placement(
