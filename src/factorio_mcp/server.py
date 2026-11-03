@@ -29,6 +29,11 @@ HINTS = {
     "target_gone": "target_ref expires after 60 seconds. Refresh it with observe_nearby.",
     "not_visible": "Observe the placement area within 60 seconds before placing.",
     "action_conflict": "Wait with wait_for_action, or stop the running action with cancel_action.",
+    "path_not_found": (
+        "Check detail.goal_tiles and detail.goal_entities for obstacles explaining the failure. "
+        "If present, detail.nearby_free_position is a standable spot to try with move_to; "
+        "there is no path guarantee."
+    ),
     "blocked": (
         "Check valid_directions for another orientation, mine or recover blocking entities, "
         "or find another position with check_placement. "
@@ -254,7 +259,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Walk to a position on the current surface. Arrival is within 0.5 tiles. "
             "If the goal is blocked, succeeds within 1.5 tiles with detail.goal_blocked = true "
             "and detail.distance. Blocked or timeout failures include detail.distance and "
-            "detail.goal. Returns an action ID for polling."
+            "detail.goal. path_not_found includes goal details and may include goal_tiles, "
+            "goal_entities, and nearby_free_position (a standable spot with no path guarantee). "
+            "Returns an action ID for polling."
         )
     )
     async def move_to(surface: RequiredText, x: Coordinate, y: Coordinate) -> CallToolResult:

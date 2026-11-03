@@ -423,6 +423,63 @@ def main():
     if value.get("status") == "running":
         bridge.call("cancel_action", {"action_id": started["action_id"]})
 
+    # M9-G: a water goal reports its blocking tile and a nearby standable position.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    goal = {"x": -10, "y": -10}
+
+    def set_goal_tiles(name):
+        fixture = (
+            "/c local s=game.surfaces.nauvis;local tiles={};"
+            "for x=-12,-8 do for y=-12,-8 do "
+            f'tiles[#tiles+1]={{name="{name}",position={{x=x,y=y}}}} end end;'
+            "s.set_tiles(tiles);local ok=true;"
+            "for _,t in ipairs(tiles) do "
+            "if s.get_tile(t.position).name~=t.name then ok=false end end;"
+            f'rcon.print("m9g_tiles_{name}:"..(ok and "success" or "failed"))'
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            result = client.run(fixture)
+            if f"m9g_tiles_{name}:" not in result:
+                result = client.run(fixture)
+            print(result.strip(), flush=True)
+            if f"m9g_tiles_{name}:success" not in result:
+                raise RuntimeError("Could not set M9-G tile fixture: " + result)
+
+    started = None
+    try:
+        set_goal_tiles("water")
+        started = bridge.call("move_to", {"surface": return_position["surface"], **goal})["result"]
+        waited = asyncio.run(
+            create_server(bridge).call_tool(
+                "wait_for_action", {"action_id": started["action_id"], "timeout_seconds": 15}
+            )
+        )
+        value = json.loads(waited.content[0].text)
+        detail = value.get("detail") or {}
+        free = detail.get("nearby_free_position")
+        record(
+            "unreachable water goal explains path_not_found",
+            value.get("status") == "failed"
+            and value.get("error") == "path_not_found"
+            and "water" in detail.get("goal_tiles", [])
+            and isinstance(free, dict)
+            and isinstance(free.get("x"), (int, float))
+            and isinstance(free.get("y"), (int, float))
+            and math.hypot(free["x"] - goal["x"], free["y"] - goal["y"]) >= 2,
+            json.dumps(value),
+        )
+    finally:
+        if started is not None:
+            current = bridge.call("get_action_status", {"action_id": started["action_id"]})[
+                "result"
+            ]
+            if current.get("status") == "running":
+                bridge.call("cancel_action", {"action_id": started["action_id"]})
+        set_goal_tiles("grass-1")
+        action("move_to", return_position)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
