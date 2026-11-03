@@ -36,6 +36,126 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_m13_descriptions_and_role_hint(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name in ("mine_entity", "wait_for_action"):
+            for text in (
+                "estimated_seconds",
+                "estimate that can change",
+                "mining is interrupted or the target is depleted",
+                "timeout_seconds",
+            ):
+                with self.subTest(name=name, text=text):
+                    self.assertIn(text, tools[name].description)
+        self.assertIn("detail.estimated_seconds", tools["get_action_status"].description)
+        for name in ("check_placement", "place_entity"):
+            for text in (
+                "offshore-pump",
+                "water_direction side must face water",
+                "pipes/boilers",
+                "connect on the output_direction side",
+            ):
+                with self.subTest(name=name, text=text):
+                    self.assertIn(text, tools[name].description)
+        for text in ("input -> source", "output -> result", "source -> input"):
+            self.assertIn(text, tools["transfer_item"].description)
+            self.assertIn(text, HINTS["invalid_target"])
+        for text in ("stone-furnace", "assembling-machine-1", "lab", "canonical"):
+            self.assertIn(text, tools["transfer_item"].description)
+        self.assertIn("role_aliases", HINTS["invalid_target"])
+        self.assertIn("valid_roles", HINTS["invalid_target"])
+
+    async def test_role_alias_maps_normalize_and_keep_canonical_roles(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        for aliases in ({}, [], {"input": "source", "output": "result"}):
+            with self.subTest(aliases=aliases):
+                detail = {
+                    "entity": "stone-furnace",
+                    "valid_roles": ["fuel", "result", "source"],
+                    "role_aliases": aliases,
+                }
+                bridge.call.side_effect = BridgeError("invalid_target", detail=detail)
+                result = await server.call_tool(
+                    "transfer_item",
+                    {
+                        "target_ref": "42",
+                        "direction": "to_entity",
+                        "inventory_role": "unknown",
+                        "item": "stone",
+                        "count": 1,
+                    },
+                )
+                value = payload(result)
+                self.assertTrue(result.is_error)
+                self.assertEqual(value["detail"], {**detail, "role_aliases": aliases or {}})
+                self.assertIsInstance(value["detail"]["role_aliases"], dict)
+                self.assertEqual(detail["role_aliases"], aliases)
+                self.assertEqual(
+                    _normalize_result("get_entity_inventory", {"role_aliases": aliases}),
+                    {"role_aliases": aliases or {}},
+                )
+        bridge.call.side_effect = None
+        for name, params, result in (
+            ("get_entity_inventory", {"target_ref": "42"}, {"inventories": {"source": {}}}),
+            (
+                "transfer_item",
+                {
+                    "target_ref": "42",
+                    "direction": "to_entity",
+                    "inventory_role": "input",
+                    "item": "stone",
+                    "count": 1,
+                },
+                {"moved": 1, "inventory_role": "source"},
+            ),
+        ):
+            bridge.call.return_value = {"result": result}
+            value = payload(await server.call_tool(name, params))
+            if name == "get_entity_inventory":
+                self.assertEqual(value["inventories"], {"source": []})
+            else:
+                self.assertEqual(value["inventory_role"], "source")
+                bridge.call.assert_called_with("transfer_item", params)
+
+    async def test_mining_eta_survives_start_status_and_wait(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        bridge.call.return_value = {
+            "result": {"action_id": "42", "status": "running", "estimated_seconds": 6.0}
+        }
+        started = payload(await server.call_tool("mine_entity", {"target_ref": "7", "count": 3}))
+        self.assertEqual(started["estimated_seconds"], 6.0)
+        for eta in (None, 0.0, 4.5):
+            detail = {"gained": 1, "count": 3}
+            if eta is not None:
+                detail["estimated_seconds"] = eta
+            # A timed-out wait must preserve the latest running detail from the mod.
+            bridge.call.return_value = {
+                "result": {"action_id": "42", "status": "running", "detail": detail}
+            }
+            status = payload(await server.call_tool("get_action_status", {"action_id": "42"}))
+            with patch("factorio_mcp.server.time") as clock:
+                clock.monotonic.side_effect = [0, 1]
+                waited = payload(
+                    await server.call_tool(
+                        "wait_for_action", {"action_id": "42", "timeout_seconds": 1}
+                    )
+                )
+            self.assertTrue(waited["timed_out"])
+            self.assertEqual(status["detail"], detail)
+            self.assertEqual(waited["detail"], detail)
+
+    async def test_pump_sides_survive_placeable_blocked_and_observed_normalization(self):
+        sides = {"water_direction": 12, "output_direction": 4}
+        for placeable in (False, True):
+            result = _normalize_result("check_placement", {"placeable": placeable, **sides})
+            self.assertEqual(result, {"placeable": placeable, **sides})
+        result = _normalize_result(
+            "observe_nearby", {"entities": [{"name": "offshore-pump", **sides}]}
+        )
+        self.assertEqual(result["entities"], [{"name": "offshore-pump", **sides}])
+
     async def test_explored_map_description_schema_and_forwarding(self):
         bridge = Mock()
         bridge.call.return_value = {"tick": 42, "result": {}}

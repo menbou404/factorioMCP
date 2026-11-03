@@ -31,6 +31,8 @@
 | [18-trial5-fixes.md](18-trial5-fixes.md) | 5 回目の試行で見つかった問題の修正（M10） |
 | [19-trial6-fixes.md](19-trial6-fixes.md) | 6 回目の試行で見つかった問題の修正（M11） |
 | [20-trial7-fixes.md](20-trial7-fixes.md) | 7 回目の試行で残った指摘の修正と探索済みの地図（M12） |
+| [21-trial8-fixes.md](21-trial8-fixes.md) | 8 回目の試行で見つかった問題の修正（M13） |
+| [22-green-science.md](22-green-science.md) | 緑サイエンスの自動化（M14） |
 
 ## 共通の不変条件
 

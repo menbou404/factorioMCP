@@ -33,6 +33,11 @@ local INVENTORY_ROLES = {
   ["assembling-machine-1"] = {source = defines.inventory.crafter_input,
                               result = defines.inventory.crafter_output}
 }
+local ROLE_ALIASES = {
+  ["stone-furnace"] = {input = "source", output = "result"},
+  ["assembling-machine-1"] = {input = "source", output = "result"},
+  ["lab"] = {source = "input"}
+}
 
 local function ensure_storage()
   storage.ai_mcp = storage.ai_mcp or {
@@ -160,6 +165,41 @@ local function adjust_mining_inventory(state, before)
     state.action.last_inventory_count = state.action.last_inventory_count +
       mining_inventory_count(state.character) - before
   end
+end
+
+local function mining_estimated_seconds(character, action)
+  local target = action.target
+  if not character or not character.valid or not target or not target.valid then return nil end
+  local prototype = target.prototype
+  local character_prototype = character.prototype
+  local properties = prototype and prototype.mineable_properties
+  local base_speed = character_prototype and character_prototype.mining_speed
+  if not properties or type(properties.mining_time) ~= "number" or
+     not properties.products or type(base_speed) ~= "number" then return nil end
+  -- LuaForce documents the 1 + modifier multiplier; the character's bonus is additive.
+  local speed = base_speed * (1 + character.force.manual_mining_speed_modifier +
+                             character.character_mining_speed_modifier)
+  if speed <= 0 or properties.mining_time < 0 then return nil end
+  local items = 0
+  for _, product in pairs(properties.products) do
+    -- gained counts items in the main inventory, not fluid products.
+    if product.type == "item" then
+      local amount = product.amount
+      if amount == nil and product.amount_min ~= nil and product.amount_max ~= nil then
+        amount = (product.amount_min + product.amount_max) / 2
+      end
+      if amount == nil then return nil end
+      items = items + amount * (product.probability or 1)
+    end
+  end
+  local operations = math.ceil(math.max(0, action.goal_count - action.gained) / math.max(1, items))
+  local progress = 0
+  if character.mining_state.mining and character.selected == target then
+    progress = math.max(0, math.min(1, character.character_mining_progress))
+  end
+  local seconds = math.max(0, operations - progress) * properties.mining_time / speed
+  if seconds ~= seconds or seconds == math.huge then return nil end
+  return math.floor(seconds * 10 + 0.5) / 10
 end
 
 local function mine_partial_detail(character, action, detail)
@@ -452,6 +492,7 @@ local function do_mine(state, params)
     last_progress_tick = game.tick
   })
   character.mining_state = {mining = true, position = target.position}
+  result.estimated_seconds = mining_estimated_seconds(character, state.action)
   return result
 end
 
@@ -523,6 +564,16 @@ local function placed_fluid_connections(entity)
     end
   end
   if #connections > 0 then return connections end
+end
+
+local function offshore_pump_directions(name, connections)
+  if name ~= "offshore-pump" then return nil, nil end
+  for _, connection in ipairs(connections or {}) do
+    if connection.flow == "output" then
+      -- Base pump: south-facing output, north-facing water; rotate with the entity.
+      return (connection.direction + 8) % 16, connection.direction
+    end
+  end
 end
 
 local function map_cell_key(cx, cy)
@@ -855,6 +906,10 @@ local function do_observe(state, params)
     end
     if #fluids > 0 then observed.fluids = fluids end
     if observed.owned then observed.fluid_connections = placed_fluid_connections(entity) end
+    if entity.name == "offshore-pump" then
+      observed.water_direction, observed.output_direction = offshore_pump_directions(
+        entity.name, observed.fluid_connections or placed_fluid_connections(entity))
+    end
     if entity.type == "electric-pole" or entity.prototype.electric_energy_source_prototype then
       -- Some entity types cannot expose a network ID even with an electric source.
       local ok, network_id = pcall(function() return entity.electric_network_id end)
@@ -1343,9 +1398,12 @@ local function do_check_placement(state, params)
     fluid_connections = preview_fluid_connections(prototype, position, direction)
   end
   local blocked = reason == "blocked" and detail or {}
+  local water_direction, output_direction = offshore_pump_directions(
+    prototype and prototype.name, fluid_connections)
   return {placeable = placement ~= nil, reason = reason,
           entity = prototype and prototype.name or nil, has_item = has_item,
           position = position, bounding_box = box, fluid_connections = fluid_connections,
+          water_direction = water_direction, output_direction = output_direction,
           blocking = blocked.blocking, tiles = blocked.tiles,
           valid_directions = blocked.valid_directions, blocked_reason = blocked.reason,
           nearby_positions = blocked.nearby_positions}
@@ -1469,7 +1527,7 @@ local function do_entity_inventory(state, params)
                           target.drop_position or nil}
 end
 
-local function transfer_shortage_detail(source, params)
+local function transfer_shortage_detail(source, params, role)
   local contents = source.get_contents()
   table.sort(contents, function(a, b)
     if a.name ~= b.name then return a.name < b.name end
@@ -1481,7 +1539,7 @@ local function transfer_shortage_detail(source, params)
     preview[#preview + 1] = {name = item.name, count = item.count, quality = item.quality}
   end
   return {item = params.item, requested = params.count, available = 0,
-          inventory_role = params.direction == "from_entity" and params.inventory_role or nil,
+          inventory_role = params.direction == "from_entity" and role or nil,
           contents = #preview > 0 and preview or nil}
 end
 
@@ -1496,15 +1554,19 @@ local function do_transfer(state, params)
   end
   local target, roles, target_error, detail = get_entity_inventory(character, params)
   if not target then return nil, target_error, detail end
-  local inventory_id = roles[params.inventory_role]
+  local aliases = ROLE_ALIASES[target.name]
+  local role = (aliases and aliases[params.inventory_role]) or params.inventory_role
+  local inventory_id = roles[role]
   if not inventory_id then
-    return nil, "invalid_target", {entity = target.name, valid_roles = sorted_keys(roles)}
+    return nil, "invalid_target", {entity = target.name, valid_roles = sorted_keys(roles),
+                                  role_aliases = aliases}
   end
   local entity_inventory = target.get_inventory(inventory_id)
   local player_inventory = character.get_main_inventory()
   if not entity_inventory or not entity_inventory.valid or
      not player_inventory or not player_inventory.valid then
-    return nil, "invalid_target", {entity = target.name, valid_roles = sorted_keys(roles)}
+    return nil, "invalid_target", {entity = target.name, valid_roles = sorted_keys(roles),
+                                  role_aliases = aliases}
   end
   local source = params.direction == "to_entity" and player_inventory or entity_inventory
   local destination = params.direction == "to_entity" and entity_inventory or player_inventory
@@ -1513,14 +1575,14 @@ local function do_transfer(state, params)
                          destination.get_insertable_count(item_id))
   if count == 0 then
     if source.get_item_count(item_id) == 0 then
-      return nil, "missing_materials", transfer_shortage_detail(source, params)
+      return nil, "missing_materials", transfer_shortage_detail(source, params, role)
     end
     return nil, "inventory_full"
   end
   local removed = source.remove{name = params.item, quality = "normal", count = count}
   if removed == 0 then
     local shortage = source.get_item_count(item_id) == 0 and
-                     transfer_shortage_detail(source, params) or nil
+                     transfer_shortage_detail(source, params, role) or nil
     return nil, "missing_materials", shortage
   end
   local inserted = destination.insert{name = params.item, quality = "normal", count = removed}
@@ -1529,7 +1591,7 @@ local function do_transfer(state, params)
   end
   if inserted == 0 then return nil, "inventory_full" end
   return {moved = inserted, item = params.item, direction = params.direction,
-          inventory_role = params.inventory_role}
+          inventory_role = role}
 end
 
 local function running_action_slot(state, action_id)
@@ -1547,7 +1609,8 @@ local function do_action_status(state, params)
   local detail = action.detail
   if action.status == "running" then
     if action.type == "mine" then
-      detail = {gained = action.gained, count = action.goal_count}
+      detail = {gained = action.gained, count = action.goal_count,
+                estimated_seconds = mining_estimated_seconds(state.character, action)}
     elseif action.type == "craft" then
       local remaining = 0
       if valid_character(state) then

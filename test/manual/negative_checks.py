@@ -150,7 +150,7 @@ def main():
             {
                 "target_ref": furnace,
                 "direction": "to_entity",
-                "inventory_role": "input",
+                "inventory_role": "not-a-role",
                 "item": "iron-ore",
                 "count": 1,
             },
@@ -897,6 +897,204 @@ def main():
             json.dumps(mapped),
         )
     finally:
+        action("move_to", return_position)
+
+    # M13-Q: the stone fixture still has ample ore. Cancel before it can deplete;
+    # this only adds normally mined stone and never spends later scripts' materials.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    try:
+        action("move_to", {"surface": "nauvis", "x": 2, "y": 2.5})
+        observed = bridge.call("observe_nearby", {"names": ["stone"]})["result"]
+        stone = next(entity for entity in observed["entities"] if entity.get("amount", 0) >= 2)
+        started = bridge.call("mine_entity", {"target_ref": stone["target_ref"], "count": 2})[
+            "result"
+        ]
+        try:
+            time.sleep(0.25)  # Exercise progress in the current operation, before it completes.
+            running = bridge.call("get_action_status", {"action_id": started["action_id"]})[
+                "result"
+            ]
+            initial_eta = started.get("estimated_seconds")
+            running_eta = (running.get("detail") or {}).get("estimated_seconds")
+            record(
+                "mining reports estimated seconds",
+                running.get("status") == "running"
+                and type(initial_eta) in (int, float)
+                and type(running_eta) in (int, float)
+                and initial_eta > 0
+                and 0 < running_eta <= initial_eta + 0.5
+                and math.isclose(initial_eta * 10, round(initial_eta * 10), abs_tol=1e-6)
+                and math.isclose(running_eta * 10, round(running_eta * 10), abs_tol=1e-6),
+                json.dumps({"started": started, "running": running}),
+            )
+        finally:
+            current = bridge.call("get_action_status", {"action_id": started["action_id"]})[
+                "result"
+            ]
+            if current.get("status") == "running":
+                bridge.call("cancel_action", {"action_id": started["action_id"]})
+
+        # M13-R: reuse the spare furnace without fuel, so its input cannot be consumed.
+        action("mine_entity", {"target_ref": reference("stone"), "count": 1})
+        action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+        before = items()
+        bridge.call("observe_nearby")
+        bridge.call("place_entity", {"item": "stone-furnace", **spare_position})
+        spare = next(
+            entity
+            for entity in bridge.call("observe_nearby", {"names": ["stone-furnace"]})["result"][
+                "entities"
+            ]
+            if entity["x"] == spare_position["x"] and entity["y"] == spare_position["y"]
+        )
+        params = {"target_ref": spare["target_ref"], "item": "stone", "count": 1}
+        try:
+            inventories = bridge.call("get_entity_inventory", {"target_ref": spare["target_ref"]})[
+                "result"
+            ]["inventories"]
+            inserted = bridge.call(
+                "transfer_item", {**params, "direction": "to_entity", "inventory_role": "input"}
+            )["result"]
+            stocked = bridge.call("get_entity_inventory", {"target_ref": spare["target_ref"]})[
+                "result"
+            ]["inventories"]
+            removed = bridge.call(
+                "transfer_item", {**params, "direction": "from_entity", "inventory_role": "source"}
+            )["result"]
+            # An empty output must reach the canonical result inventory's shortage path.
+            expect_error(
+                "furnace output alias uses result inventory",
+                "transfer_item",
+                {**params, "direction": "from_entity", "inventory_role": "output"},
+                {"missing_materials"},
+            )
+            shortage = errors.get("furnace output alias uses result inventory")
+            record(
+                "furnace accepts input/output role aliases",
+                set(inventories) == {"fuel", "source", "result"}
+                and spare.get("inventory_roles") == ["fuel", "result", "source"]
+                and stocked["source"] == [{"name": "stone", "count": 1, "quality": "normal"}]
+                and inserted.get("moved") == removed.get("moved") == 1
+                and inserted.get("inventory_role") == removed.get("inventory_role") == "source"
+                and shortage is not None
+                and (shortage.detail or {}).get("inventory_role") == "result",
+            )
+            expect_error(
+                "invalid furnace role reports aliases",
+                "transfer_item",
+                {**params, "direction": "to_entity", "inventory_role": "not-a-role"},
+                {"invalid_target"},
+            )
+            error = errors.get("invalid furnace role reports aliases")
+            detail = (error.detail or {}) if error else {}
+            record(
+                "invalid role keeps canonical roles and aliases",
+                detail.get("valid_roles") == ["fuel", "result", "source"]
+                and detail.get("role_aliases") == {"input": "source", "output": "result"},
+                json.dumps(detail),
+            )
+        finally:
+            action("mine_entity", {"target_ref": spare["target_ref"], "count": 1})
+        record("role alias checks preserve held items", items() == before)
+    finally:
+        action("move_to", return_position)
+
+    # M13-S: reuse M10-J's suggestions and prove the reported sides against actual tiles.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    try:
+        set_goal_tiles("water")
+        action("move_to", {**land, "y": -2})
+        bridge.call("observe_nearby")
+        checked = bridge.call("check_placement", {"item": "offshore-pump", **land})["result"]
+        record(
+            "blocked offshore pump reports requested sides",
+            checked.get("placeable") is False
+            and checked.get("water_direction") == 0
+            and checked.get("output_direction") == 8,
+            json.dumps(checked),
+        )
+        nearby = checked.get("nearby_positions", [])
+        if not nearby:
+            raise RuntimeError("M13-S requires a shoreline suggestion from M10-J")
+        candidate = nearby[0]
+        # The build reach check is repeated after walking nearer the candidate.
+        action("move_to", {"surface": "nauvis", "x": -6, "y": -6})
+        observed = bridge.call("observe_nearby")["result"]
+        checked = bridge.call(
+            "check_placement", {"item": "offshore-pump", "surface": "nauvis", **candidate}
+        )["result"]
+        water_direction = checked.get("water_direction")
+        output_direction = checked.get("output_direction")
+        vectors = {0: (0, -1), 4: (1, 0), 8: (0, 1), 12: (-1, 0)}
+        water_tiles = {
+            (tile["x"], tile["y"]) for tile in observed["blocked_tiles"] if tile["name"] == "water"
+        }
+
+        def side_tile(direction):
+            dx, dy = vectors[direction]
+            position = checked["position"]
+            box = checked["bounding_box"]
+            edge = (
+                box["right_bottom"]["x"] - position["x"]
+                if dx > 0
+                else position["x"] - box["left_top"]["x"]
+                if dx < 0
+                else box["right_bottom"]["y"] - position["y"]
+                if dy > 0
+                else position["y"] - box["left_top"]["y"]
+            )
+            # Take one tile step past the collision edge, toward the indicated side.
+            return (
+                math.floor(position["x"] + dx * (edge + 1)),
+                math.floor(position["y"] + dy * (edge + 1)),
+            )
+
+        # Read the actual tiles as well: observation omits walkable land tiles.
+        tile_sides = {}
+        if water_direction in vectors and output_direction in vectors:
+            wx, wy = side_tile(water_direction)
+            ox, oy = side_tile(output_direction)
+            query = (
+                "/c local s=game.surfaces.nauvis;"
+                f"local w=s.get_tile({wx},{wy});local o=s.get_tile({ox},{oy});"
+                'rcon.print("m13_sides:"..helpers.table_to_json({'
+                'water=w.collides_with("water_tile"),land=o.collides_with("ground_tile")}))'
+            )
+            with Client(
+                "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+            ) as client:
+                raw = client.run(query)
+                if "m13_sides:" not in raw:
+                    raw = client.run(query)
+            tile_sides = json.loads(raw.split("m13_sides:", 1)[1].strip())
+        record(
+            "offshore pump reports water side",
+            checked.get("placeable") is True
+            and output_direction in vectors
+            and water_direction == (output_direction + 8) % 16
+            and output_direction == (candidate["direction"] + 8) % 16
+            and any(
+                port["direction"] == output_direction and port["flow"] == "output"
+                for port in checked.get("fluid_connections", [])
+            )
+            and side_tile(water_direction) in water_tiles
+            and side_tile(output_direction) not in water_tiles
+            and tile_sides == {"water": True, "land": True},
+            json.dumps(checked),
+        )
+        for direction in vectors:
+            rotated = bridge.call(
+                "check_placement",
+                {"item": "offshore-pump", "surface": "nauvis", **candidate, "direction": direction},
+            )["result"]
+            record(
+                f"offshore pump sides rotate with direction {direction}",
+                rotated.get("water_direction") == direction
+                and rotated.get("output_direction") == (direction + 8) % 16,
+                json.dumps(rotated),
+            )
+    finally:
+        set_goal_tiles("grass-1")
         action("move_to", return_position)
 
     failed = [label for label, passed, _ in results if not passed]
