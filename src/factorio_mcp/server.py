@@ -27,7 +27,10 @@ FilterNames = Annotated[
 
 HINTS = {
     "target_gone": "target_ref expires after 60 seconds. Refresh it with observe_nearby.",
-    "not_visible": "Observe the placement area within 60 seconds before placing.",
+    "not_visible": (
+        "Observe the placement area before placing."
+        " Any of the last 8 observations within 60 seconds counts."
+    ),
     "action_conflict": (
         "Wait for detail.running_action with wait_for_action, or stop it with cancel_action. "
         "Only one craft at a time and one walk/mine at a time; crafting can run alongside either."
@@ -314,7 +317,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Place a supported entity within build reach, consuming one real inventory item."
-            " Observe the placement area within 60 seconds before placing."
+            " The placement area must be covered by any of the last 8 observations"
+            " within 60 seconds."
             " Returns the snapped position and actual fluid_connections with port position,"
             " target_position, direction, flow, fluidbox_index, and connected when present."
             " Blocked errors may include valid_directions for another orientation."
@@ -343,7 +347,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Check placement within build reach without consuming items or building. "
-            "Requires an observation of the placement area within 60 seconds. "
+            "The placement area must be covered by any of the last 8 observations "
+            "within 60 seconds. "
             "Returns the snapped position and preview fluid_connections with port position, "
             "target_position, direction, flow, and fluidbox_index when present. "
             "Blocked results may include blocking, tiles, blocked_reason, "

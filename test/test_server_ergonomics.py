@@ -324,6 +324,17 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("connected", tools["observe_nearby"].description)
         self.assertIn("blocked_reason", tools["check_placement"].description)
 
+    async def test_placement_descriptions_and_hint_explain_recent_observations(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name, description in (
+            ("check_placement", tools["check_placement"].description),
+            ("place_entity", tools["place_entity"].description),
+            ("not_visible hint", HINTS["not_visible"]),
+        ):
+            with self.subTest(name=name):
+                for text in ("any of the last 8 observations", "within 60 seconds"):
+                    self.assertIn(text, description.lower())
+
     async def test_placement_tool_descriptions_explain_blocked_reasons(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         for name, field in (
