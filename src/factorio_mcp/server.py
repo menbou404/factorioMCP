@@ -49,6 +49,8 @@ HINTS = {
     "out_of_range": "Move closer to the target, then observe_nearby again.",
     "missing_materials": (
         "Gather the missing items before retrying. "
+        "For crafting, detail.missing_raw lists raw items such as plates that are short "
+        "after expanding hand-craftable intermediates and using held materials first. "
         "For transfers, check detail.contents for items in the source inventory."
     ),
 }
@@ -111,6 +113,7 @@ def _error_response(exc: Exception) -> CallToolResult:
             "blocking",
             "tiles",
             "missing",
+            "missing_raw",
             "valid_roles",
             "supported_entities",
             "contents",
@@ -300,7 +303,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         description=(
             "Start normal hand crafting using the AI character’s own materials. "
             "Crafting runs alongside walking and mining. Only one craft at a time. "
-            "Poll the returned action ID."
+            "Poll the returned action ID. On missing_materials, detail.missing_raw lists "
+            "raw items such as plates that are short after expanding hand-craftable "
+            "intermediates and using held materials first."
         )
     )
     async def craft(recipe: RequiredText, count: Count) -> CallToolResult:

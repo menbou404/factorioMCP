@@ -388,6 +388,47 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(placed["detail"], detail)
         self.assertEqual(placed["hint"], HINTS["blocked"])
 
+    async def test_craft_shortage_description_and_hint(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for text in (
+            "detail.missing_raw",
+            "raw items such as plates",
+            "hand-craftable intermediates",
+            "held materials first",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, tools["craft"].description)
+                self.assertIn(text, HINTS["missing_materials"])
+        self.assertIn("missing_materials", tools["craft"].description)
+
+    async def test_craft_shortage_normalizes_only_present_empty_raw_materials(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        missing = [{"name": "iron-gear-wheel", "count": 10}]
+        for raw in (None, {}, [], [{"name": "iron-plate", "count": 20}]):
+            with self.subTest(raw=raw):
+                detail = {
+                    "recipe": "automation-science-pack",
+                    "count": 10,
+                    "missing": missing,
+                    "best_effort": True,
+                }
+                if raw is not None:
+                    detail["missing_raw"] = raw
+                bridge.call.side_effect = BridgeError("missing_materials", detail=detail)
+                result = await server.call_tool(
+                    "craft", {"recipe": "automation-science-pack", "count": 10}
+                )
+                self.assertTrue(result.is_error)
+                value = payload(result)
+                self.assertEqual(value["error"], "missing_materials")
+                self.assertEqual(value["hint"], HINTS["missing_materials"])
+                expected = dict(detail)
+                if raw == {}:
+                    expected["missing_raw"] = []
+                self.assertEqual(value["detail"], expected)
+                self.assertEqual(detail.get("missing_raw"), raw)
+
     async def test_transfer_shortage_description_hint_and_detail(self):
         bridge = Mock()
         server = create_server(bridge)
