@@ -33,6 +33,64 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_count_descriptions_state_input_limits(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name in ("mine_entity", "craft", "transfer_item"):
+            with self.subTest(name=name):
+                self.assertIn("count is 1-100", tools[name].description)
+
+    async def test_action_conflict_hint_explains_immediate_operations(self):
+        hint = HINTS["action_conflict"]
+        for text in (
+            "detail.running_action",
+            "wait_for_action",
+            "cancel_action",
+            "one craft at a time",
+            "one walk/mine at a time",
+            "crafting can run alongside either",
+            "place_entity, transfer_item, rotate_entity, and set_recipe",
+            "also return action_conflict while a walk or mine is running",
+            "they are allowed while crafting",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, hint)
+
+    async def test_observe_description_explains_distance_reach_and_resource_summary(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        description = tools["observe_nearby"].description
+        for text in (
+            "distance from the character centre to the entity centre",
+            "reach gives build (placing)",
+            "interact (transferring, rotating, and setting recipes)",
+            "mine_resource (resource/tree/rock mining)",
+            "reach in tiles",
+            "Resources, trees, and rocks are judged to their collision edge",
+            "reachable at a slightly larger distance than mine_resource",
+            "include_resources = false",
+            "individual resource entities are omitted",
+            "resources summary still returns per-resource tile count, total amount, "
+            "and bounding area",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, description)
+
+    async def test_observe_normalization_preserves_distance_and_reach_object(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        entity = {"x": 3, "y": 4, "distance": 5.0}
+        for reach in ({"build": 10, "interact": 10, "mine_resource": 2.7}, {}):
+            with self.subTest(reach=reach):
+                bridge.call.return_value = {
+                    "result": {"entities": [entity.copy()], "resources": {}, "reach": reach.copy()}
+                }
+                result = await server.call_tool("observe_nearby", {})
+                self.assertFalse(result.is_error)
+                value = payload(result)
+                self.assertIsInstance(value["reach"], dict)
+                self.assertEqual(value["reach"], reach)
+                self.assertEqual(value["entities"], [entity])
+                self.assertEqual(value["resources"], [])
+
     async def test_action_descriptions_explain_concurrency(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         for name, alongside in (

@@ -598,6 +598,7 @@ local function do_observe(state, params)
       target_ref = register_target(state, entity),
       name = entity.name, type = entity.type,
       x = entity.position.x, y = entity.position.y,
+      distance = math.sqrt(distance_squared(character.position, entity.position)),
       surface = entity.surface.name, unit_number = entity.unit_number,
       amount = entity.type == "resource" and entity.amount or nil,
       owned = entity.force == character.force
@@ -679,6 +680,8 @@ local function do_observe(state, params)
     if game.tick - reference.tick > TARGET_TTL_TICKS then state.targets[key] = nil end
   end
   return {position = position_data(character), radius = radius, filters = filters,
+          reach = {build = character.build_distance, interact = character.reach_distance,
+                   mine_resource = character.resource_reach_distance},
           entities = output, entity_total = #visible, resources = resources,
           next_entity_offset = entity_offset + #output < #visible and
                                entity_offset + #output or nil,
