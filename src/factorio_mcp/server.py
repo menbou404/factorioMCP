@@ -212,7 +212,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await invoke("start_research", {"technology": technology})
 
     @server.tool(
-        description="Walk to a position on the current surface. Returns an action ID for polling."
+        description=(
+            "Walk to a position on the current surface. Arrival is within 0.5 tiles. "
+            "If the goal is blocked, succeeds within 1.5 tiles with detail.goal_blocked = true "
+            "and detail.distance. Blocked or timeout failures include detail.distance and "
+            "detail.goal. Returns an action ID for polling."
+        )
     )
     async def move_to(surface: RequiredText, x: Coordinate, y: Coordinate) -> CallToolResult:
         return await invoke("move_to", {"surface": surface, "x": x, "y": y})

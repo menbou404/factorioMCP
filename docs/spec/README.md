@@ -26,6 +26,7 @@
 | [13-factory-roadmap.md](13-factory-roadmap.md) | 工場づくりへの拡張計画（M1〜M5）と各段階の設計 |
 | [14-agent-ergonomics.md](14-agent-ergonomics.md) | AI エージェント向けの使いやすさ改善（M6） |
 | [15-agent-trial-fixes.md](15-agent-trial-fixes.md) | 自律試行で見つかった問題の修正（M7） |
+| [16-trial3-fixes.md](16-trial3-fixes.md) | 3 回目の試行で見つかった問題の修正（M8） |
 
 ## 共通の不変条件
 

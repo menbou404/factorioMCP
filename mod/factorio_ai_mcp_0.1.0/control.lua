@@ -139,6 +139,12 @@ local function finish_action(state, status, error_code, detail)
   if action.type == "mine" and status ~= "succeeded" then
     detail = mine_partial_detail(state.character, action, detail)
   end
+  if action.type == "move" and (error_code == "blocked" or error_code == "timeout") and
+     valid_character(state) then
+    detail = detail or {}
+    detail.distance = math.sqrt(distance_squared(state.character.position, action.goal))
+    detail.goal = {x = action.goal.x, y = action.goal.y}
+  end
   action.status = status
   action.error = error_code
   action.detail = detail
@@ -250,7 +256,20 @@ local function move_direction(dx, dy)
   return defines.direction.northwest
 end
 
+local function reset_move_progress(action)
+  action.last_waypoint_tick = game.tick
+  action.final_best_distance = nil
+  action.final_progress_distance = nil
+  action.final_progress_tick = nil
+end
+
 local function request_path(state, character, goal)
+  local action = state.action
+  action.path = nil
+  action.path_index = 1
+  action.stuck_ticks = 0
+  action.last_x, action.last_y = character.position.x, character.position.y
+  reset_move_progress(action)
   local id = character.surface.request_path{
     bounding_box = character.prototype.collision_box,
     collision_mask = character.prototype.collision_mask,
@@ -1204,6 +1223,7 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
   end
   state.action.path = event.path
   state.action.path_index = 1
+  reset_move_progress(state.action)
 end)
 
 script.on_event(defines.events.on_tick, function()
@@ -1232,14 +1252,36 @@ script.on_event(defines.events.on_tick, function()
   end
   if action.type == "move" then
     if not action.path then return end
-    if distance_squared(character.position, action.goal) <= 0.5 * 0.5 then
+    local d = math.sqrt(distance_squared(character.position, action.goal))
+    if d <= 0.5 then
       finish_action(state, "succeeded", nil, {position = position_data(character)})
       return
     end
     local waypoint = action.path[action.path_index]
     if waypoint and distance_squared(character.position, waypoint.position) <= 0.35 * 0.35 then
       action.path_index = action.path_index + 1
+      action.last_waypoint_tick = game.tick
       return
+    end
+    -- Saved moves from before progress tracking start their timers on this tick.
+    action.last_waypoint_tick = action.last_waypoint_tick or game.tick
+    if action.path_index > #action.path then
+      action.final_best_distance = math.min(action.final_best_distance or d, d)
+      -- Measure cumulative improvement so small steps towards the goal still count.
+      if not action.final_progress_tick or
+         action.final_progress_distance - action.final_best_distance >= 0.05 then
+        action.final_progress_distance = action.final_best_distance
+        action.final_progress_tick = game.tick
+      end
+      if game.tick - action.final_progress_tick >= 60 then
+        if d <= 1.5 then
+          finish_action(state, "succeeded", nil,
+            {position = position_data(character), distance = d, goal_blocked = true})
+        else
+          finish_action(state, "failed", "blocked")
+        end
+        return
+      end
     end
     local destination = waypoint and waypoint.position or action.goal
     local dx = destination.x - character.position.x
@@ -1251,14 +1293,13 @@ script.on_event(defines.events.on_tick, function()
       action.stuck_ticks = 0
       action.last_x, action.last_y = character.position.x, character.position.y
     end
-    if action.stuck_ticks > 120 then
+    if action.stuck_ticks > 120 or
+       (waypoint and game.tick - action.last_waypoint_tick >= 180) then
       stop_character(character)
       action.retries = action.retries + 1
       if action.retries > 3 then
         finish_action(state, "failed", "blocked")
       else
-        action.path = nil
-        action.stuck_ticks = 0
         request_path(state, character, action.goal)
       end
     end

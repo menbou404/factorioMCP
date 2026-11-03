@@ -33,6 +33,20 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_move_tool_description_explains_arrival_and_failure_distance(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        description = tools["move_to"].description
+        for text in (
+            "within 0.5 tiles",
+            "goal is blocked",
+            "succeeds within 1.5 tiles",
+            "detail.goal_blocked = true",
+            "Blocked or timeout failures include detail.distance",
+            "detail.goal",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, description)
+
     async def test_placement_tool_descriptions_explain_preview_metadata(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         for name in ("check_placement", "place_entity", "observe_nearby"):
