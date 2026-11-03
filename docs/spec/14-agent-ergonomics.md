@@ -35,7 +35,7 @@
 `wait_for_action(action_id, timeout_seconds)` を MCP サーバーに加える。
 
 - MCP サーバーの中で、0.25 秒ごとに `get_action_status` を呼び、`running` でなくなるか時間切れになったら、最後の状態を返す。Mod の変更は要らない。
-- `timeout_seconds` は 1〜30、既定は 20。時間切れの場合は `timed_out = true` を付け、状態は `running` のまま返す。
+- `timeout_seconds` は 1〜30（M7 で上限を 50 に変更）、既定は 20。時間切れの場合は `timed_out = true` を付け、状態は `running` のまま返す。
 - 待っている間も、既存の接続確認（ハートビート）は続く。
 
 ## エラーへの案内

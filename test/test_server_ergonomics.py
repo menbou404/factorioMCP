@@ -33,6 +33,14 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expiry_hints_mention_60_seconds(self):
+        for code in ("target_gone", "not_visible"):
+            with self.subTest(code=code):
+                bridge = Mock()
+                bridge.call.side_effect = BridgeError(code)
+                result = payload(await create_server(bridge).call_tool("factorio_ping", {}))
+                self.assertIn("60 seconds", result["hint"])
+
     async def test_error_detail_hint_and_transport_request_id(self):
         for operation, params in [
             ("get_entity_inventory", {"target_ref": "42"}),
@@ -82,9 +90,13 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             _normalize_result("check_placement", {"blocking": {}, "tiles": {}}),
             {"blocking": [], "tiles": []},
         )
-        observed = _normalize_result("observe_nearby", {"filters": {"types": {}, "names": {}}})
+        observed = _normalize_result(
+            "observe_nearby",
+            {"filters": {"types": {}, "names": {}}, "entities": [{"inventory_roles": {}}]},
+        )
         self.assertEqual(observed["filters"], {"types": [], "names": []})
         self.assertEqual(observed["blocked_tiles"], [])
+        self.assertEqual(observed["entities"][0]["inventory_roles"], [])
 
     async def test_wait_completes_after_running_polls(self):
         bridge = Mock()
@@ -233,7 +245,16 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wait["required"], ["action_id"])
         self.assertEqual(wait["properties"]["timeout_seconds"]["default"], 20)
         self.assertEqual(wait["properties"]["timeout_seconds"]["minimum"], 1)
-        self.assertEqual(wait["properties"]["timeout_seconds"]["maximum"], 30)
+        self.assertEqual(wait["properties"]["timeout_seconds"]["maximum"], 50)
+
+    async def test_wait_accepts_maximum_timeout(self):
+        bridge = Mock()
+        bridge.call.return_value = {"result": {"status": "succeeded"}}
+        result = await create_server(bridge).call_tool(
+            "wait_for_action", {"action_id": "1", "timeout_seconds": 50}
+        )
+        self.assertFalse(result.is_error)
+        self.assertEqual(payload(result)["status"], "succeeded")
 
     async def test_invalid_observe_and_wait_params_are_rejected_before_bridge(self):
         bridge = Mock()
@@ -254,7 +275,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
         ]:
             with self.subTest(params=params), self.assertRaises(ToolError):
                 await server.call_tool("observe_nearby", params)
-        for timeout in (0, 31, float("inf")):
+        for timeout in (0, 51, float("inf")):
             with self.subTest(timeout=timeout), self.assertRaises(ToolError):
                 await server.call_tool(
                     "wait_for_action", {"action_id": "1", "timeout_seconds": timeout}
