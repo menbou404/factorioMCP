@@ -563,6 +563,80 @@ def main():
         json.dumps(checked),
     )
 
+    # M10-I: use real plates from the running furnace; keep wood for later scripts.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    craft_count = 4  # Two seconds of crafting leaves time to start walking and test the conflict.
+    before = items()
+    needed = 2 * craft_count - before.get("iron-plate", 0)
+    if needed > 0:
+        bridge.call(
+            "transfer_item",
+            {
+                "target_ref": reference("stone-furnace"),
+                "direction": "from_entity",
+                "inventory_role": "result",
+                "item": "iron-plate",
+                "count": needed,
+            },
+        )
+    before = items()
+    if before.get("iron-plate", 0) < 2 * craft_count:
+        raise RuntimeError("M10-I needs eight normally smelted iron plates")
+    started_actions = []
+    server = create_server(bridge)
+    try:
+        crafting = bridge.call("craft", {"recipe": "iron-gear-wheel", "count": craft_count})[
+            "result"
+        ]
+        started_actions.append(crafting["action_id"])
+        # The production fixture cleared this route; the drill and furnace are east of it.
+        walking = bridge.call(
+            "move_to",
+            {**return_position, "y": return_position["y"] - 6},
+        )["result"]
+        started_actions.append(walking["action_id"])
+        record(
+            "crafting runs while walking",
+            crafting.get("status") == "running"
+            and walking.get("status") == "running"
+            and crafting["action_id"] != walking["action_id"],
+        )
+        try:
+            bridge.call("craft", {"recipe": "iron-gear-wheel", "count": 1})
+        except BridgeError as error:
+            running = (error.detail or {}).get("running_action") or {}
+            record(
+                "second craft conflicts with the running craft",
+                error.code == "action_conflict"
+                and running.get("type") == "craft"
+                and running.get("id") == crafting["action_id"],
+                json.dumps(error.detail),
+            )
+        else:
+            record("second craft conflicts with the running craft", False, "unexpected success")
+        for label, started in (("concurrent craft", crafting), ("concurrent walk", walking)):
+            waited = asyncio.run(
+                server.call_tool("wait_for_action", {"action_id": started["action_id"]})
+            )
+            value = json.loads(waited.content[0].text)
+            record(
+                label + " succeeds",
+                not waited.is_error and value.get("status") == "succeeded",
+                json.dumps(value),
+            )
+        after = items()
+        record(
+            "concurrent craft produces gears and consumes plates",
+            after.get("iron-gear-wheel", 0) == before.get("iron-gear-wheel", 0) + craft_count
+            and after.get("iron-plate", 0) == before.get("iron-plate", 0) - 2 * craft_count,
+        )
+    finally:
+        for action_id in started_actions:
+            current = bridge.call("get_action_status", {"action_id": action_id})["result"]
+            if current.get("status") == "running":
+                bridge.call("cancel_action", {"action_id": action_id})
+        action("move_to", return_position)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

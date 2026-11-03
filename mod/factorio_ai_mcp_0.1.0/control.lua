@@ -36,6 +36,7 @@ local function ensure_storage()
     spawned_once = false,
     character = nil,
     action = nil,
+    craft_action = nil,
     last_action = nil,
     completed_actions = {},
     completed_order = {},
@@ -55,6 +56,12 @@ local function ensure_storage()
   storage.ai_mcp.completed_actions = storage.ai_mcp.completed_actions or {}
   storage.ai_mcp.completed_order = storage.ai_mcp.completed_order or {}
   storage.ai_mcp.hand_crafted = storage.ai_mcp.hand_crafted or {}
+  -- Preserve the ID and live crafting queue when loading a single-slot save.
+  if storage.ai_mcp.action and storage.ai_mcp.action.type == "craft" and
+     not storage.ai_mcp.craft_action then
+    storage.ai_mcp.craft_action = storage.ai_mcp.action
+    storage.ai_mcp.action = nil
+  end
   return storage.ai_mcp
 end
 
@@ -87,8 +94,8 @@ local function range_detail(character, position, reach)
   return {distance = math.sqrt(distance_squared(character.position, position)), reach = reach}
 end
 
-local function conflict_detail(state)
-  return {running_action = state.action and {id = state.action.id, type = state.action.type} or nil}
+local function conflict_detail(action)
+  return {running_action = action and {id = action.id, type = action.type} or nil}
 end
 
 local function sorted_keys(values)
@@ -116,6 +123,33 @@ local function stop_character(character)
   character.mining_state = {mining = false}
 end
 
+local function mining_inventory_count(character)
+  local inventory = character.get_main_inventory()
+  local count = inventory and inventory.get_item_count() or 0
+  -- Include pending final products so completing crafts does not count as mining.
+  -- Prerequisite products stay in the crafting queue for use by later recipes.
+  for _, item in ipairs(character.crafting_queue or {}) do
+    if not item.prerequisite then
+      local recipe = character.force.recipes[item.recipe]
+      if recipe then
+        for _, product in pairs(recipe.products) do
+          if product.type == "item" then
+            count = count + item.count * (product.amount or 0)
+          end
+        end
+      end
+    end
+  end
+  return count
+end
+
+local function adjust_mining_inventory(state, before)
+  if before and state.action and state.action.type == "mine" then
+    state.action.last_inventory_count = state.action.last_inventory_count +
+      mining_inventory_count(state.character) - before
+  end
+end
+
 local function mine_partial_detail(character, action, detail)
   detail = detail or {}
   detail.gained = action.gained or 0
@@ -124,7 +158,7 @@ local function mine_partial_detail(character, action, detail)
     local inventory = character.get_main_inventory()
     if inventory and inventory.valid then
       -- Cancellation and early tick failures can precede the next progress update.
-      local current = inventory.get_item_count()
+      local current = mining_inventory_count(character)
       detail.gained = detail.gained + math.max(0, current - (action.last_inventory_count or current))
       detail.inventory = inventory.get_contents()
     end
@@ -132,10 +166,12 @@ local function mine_partial_detail(character, action, detail)
   return detail
 end
 
-local function finish_action(state, status, error_code, detail)
-  local action = state.action
+local function finish_action(state, slot, status, error_code, detail)
+  local action = state[slot]
   if not action then return end
-  stop_character(state.character)
+  if action.type == "move" or action.type == "mine" then
+    stop_character(state.character)
+  end
   if action.type == "mine" and status ~= "succeeded" then
     detail = mine_partial_detail(state.character, action, detail)
   end
@@ -162,8 +198,8 @@ local function finish_action(state, status, error_code, detail)
     local oldest = table.remove(state.completed_order, 1)
     state.completed_actions[oldest] = nil
   end
-  state.action = nil
-  state.path_request_id = nil
+  state[slot] = nil
+  if action.type == "move" then state.path_request_id = nil end
 end
 
 local function spawn_character()
@@ -201,7 +237,9 @@ local function status(state)
     health = character.health,
     inventory = inventory_contents(character),
     crafting_queue_size = character.crafting_queue_size,
-    action = state.action and {id = state.action.id, type = state.action.type, status = state.action.status} or nil
+    action = state.action and {id = state.action.id, type = state.action.type, status = state.action.status} or nil,
+    craft_action = state.craft_action and {id = state.craft_action.id,
+      type = state.craft_action.type, status = state.craft_action.status} or nil
   }
 end
 
@@ -239,13 +277,13 @@ local function target_entity(character, params, max_distance, mining)
   return nil, "invalid_input"
 end
 
-local function begin_action(state, action)
-  if state.action then return nil, "action_conflict", conflict_detail(state) end
+local function begin_action(state, slot, action)
+  if state[slot] then return nil, "action_conflict", conflict_detail(state[slot]) end
   action.id = tostring(state.next_action_id)
   state.next_action_id = state.next_action_id + 1
   action.status = "running"
   action.started_tick = game.tick
-  state.action = action
+  state[slot] = action
   return {action_id = action.id, status = action.status}
 end
 
@@ -338,7 +376,7 @@ end
 local function do_move(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state) end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
   if type(params.x) ~= "number" or type(params.y) ~= "number" or
      params.x ~= params.x or params.y ~= params.y or
      math.abs(params.x) > 1000000 or math.abs(params.y) > 1000000 then
@@ -349,7 +387,7 @@ local function do_move(state, params)
   if distance_squared(character.position, goal) > 128 * 128 then
     return nil, "out_of_range", range_detail(character, goal, 128)
   end
-  local result = begin_action(state, {
+  local result = begin_action(state, "action", {
     type = "move", goal = goal, path = nil, path_index = 1,
     last_x = character.position.x, last_y = character.position.y,
     stuck_ticks = 0, retries = 0
@@ -357,7 +395,7 @@ local function do_move(state, params)
   local ok = pcall(request_path, state, character, goal)
   if not ok then
     local detail = path_not_found_detail(character, goal)
-    finish_action(state, "failed", "path_not_found", detail)
+    finish_action(state, "action", "failed", "path_not_found", detail)
     return nil, "path_not_found", detail
   end
   return result
@@ -366,7 +404,7 @@ end
 local function do_mine(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state) end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
   local count = params.count or 1
   if type(count) ~= "number" or count < 1 or count > 100 or count % 1 ~= 0 then
     return nil, "invalid_input"
@@ -390,13 +428,13 @@ local function do_mine(state, params)
   end
   local inventory = character.get_main_inventory()
   if not inventory or inventory.is_full() then return nil, "inventory_full" end
-  local before = inventory.get_item_count()
+  local before = mining_inventory_count(character)
   character.selected = target
   if character.selected ~= target then
     character.selected = nil
     return nil, "invalid_target", {entity = target.name, reason = "not_selectable"}
   end
-  local result = begin_action(state, {
+  local result = begin_action(state, "action", {
     type = "mine", target = target, reach = reach, goal_count = count, gained = 0,
     last_inventory_count = before,
     last_progress_tick = game.tick
@@ -782,7 +820,7 @@ end
 local function do_craft(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state) end
+  if state.craft_action then return nil, "action_conflict", conflict_detail(state.craft_action) end
   if type(params.recipe) ~= "string" or type(params.count) ~= "number" or
      params.count < 1 or params.count > 100 or params.count % 1 ~= 0 then
     return nil, "invalid_input"
@@ -790,7 +828,6 @@ local function do_craft(state, params)
   local recipe = character.force.recipes[params.recipe]
   if not recipe or not recipe.enabled or recipe.hidden or
      params.recipe == "recipe-unknown" then return nil, "recipe_unavailable" end
-  if character.crafting_queue_size > 0 then return nil, "action_conflict", conflict_detail(state) end
   local available = character.get_craftable_count(params.recipe)
   if available < params.count then
     local missing = {}
@@ -807,9 +844,12 @@ local function do_craft(state, params)
     return nil, "missing_materials", {recipe = params.recipe, count = params.count,
                                       missing = missing, best_effort = true}
   end
+  local before = state.action and state.action.type == "mine" and
+                 mining_inventory_count(character) or nil
   local started = character.begin_crafting{recipe = params.recipe, count = params.count}
+  adjust_mining_inventory(state, before)
   if started ~= params.count then return nil, "craft_failed" end
-  local action = begin_action(state, {type = "craft", recipe = params.recipe,
+  local action = begin_action(state, "craft_action", {type = "craft", recipe = params.recipe,
                                       count = started})
   action.started = started
   return action
@@ -971,7 +1011,7 @@ end
 local function do_place(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state) end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
   local placement, reason, detail = validate_placement(state, character, params, true)
   if not placement then return nil, reason, detail end
   local inventory = placement.inventory
@@ -1105,7 +1145,7 @@ end
 local function do_transfer(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state) end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
   if (params.direction ~= "to_entity" and params.direction ~= "from_entity") or
      type(params.item) ~= "string" or type(params.count) ~= "number" or
      params.count < 1 or params.count > 100 or params.count % 1 ~= 0 then
@@ -1149,8 +1189,14 @@ local function do_transfer(state, params)
           inventory_role = params.inventory_role}
 end
 
+local function running_action_slot(state, action_id)
+  if state.action and state.action.id == action_id then return "action" end
+  if state.craft_action and state.craft_action.id == action_id then return "craft_action" end
+end
+
 local function do_action_status(state, params)
-  local action = state.action
+  local slot = running_action_slot(state, params.action_id)
+  local action = slot and state[slot]
   if not action or action.id ~= params.action_id then
     action = state.completed_actions[params.action_id] or state.last_action
   end
@@ -1181,13 +1227,15 @@ local function do_action_status(state, params)
 end
 
 local function do_cancel(state, params)
-  if not state.action or state.action.id ~= params.action_id then
-    return nil, "action_not_found"
+  local slot = running_action_slot(state, params.action_id)
+  if not slot then return nil, "action_not_found" end
+  local action = state[slot]
+  if action.type == "craft" and valid_character(state) then
+    local before = mining_inventory_count(state.character)
+    pcall(state.character.cancel_crafting, {count = action.count, index = 1})
+    adjust_mining_inventory(state, before)
   end
-  if state.action.type == "craft" and valid_character(state) then
-    pcall(state.character.cancel_crafting, {count = state.action.count, index = 1})
-  end
-  finish_action(state, "cancelled", "cancelled")
+  finish_action(state, slot, "cancelled", "cancelled")
   return do_action_status(state, params)
 end
 
@@ -1296,6 +1344,7 @@ commands.add_command("ai_mcp_admin", "AI MCP administrator reset (RCON only)",
     state.spawned_once = false
     state.character = nil
     state.action = nil
+    state.craft_action = nil
     state.last_action = nil
     state.completed_actions = {}
     state.completed_order = {}
@@ -1317,7 +1366,7 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
   if event.try_again_later then
     state.action.retries = state.action.retries + 1
     if state.action.retries > 3 then
-      finish_action(state, "failed", "path_not_found",
+      finish_action(state, "action", "failed", "path_not_found",
         path_not_found_detail(state.character, state.action.goal))
     else
       request_path(state, state.character, state.action.goal)
@@ -1325,7 +1374,7 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
     return
   end
   if not event.path or #event.path == 0 then
-    finish_action(state, "failed", "path_not_found",
+    finish_action(state, "action", "failed", "path_not_found",
       path_not_found_detail(state.character, state.action.goal))
     return
   end
@@ -1334,35 +1383,31 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
   reset_move_progress(state.action)
 end)
 
-script.on_event(defines.events.on_tick, function()
-  local state = ensure_storage()
-  if not state.spawned_once then
-    spawn_character()
-  end
-  local action = state.action
+local function tick_action(state, slot)
+  local action = state[slot]
   if not action then return end
   local character = state.character
   if not valid_character(state) then
-    finish_action(state, "failed", "character_dead")
+    finish_action(state, slot, "failed", "character_dead")
     return
   end
   if game.tick - (state.last_heartbeat_tick or action.started_tick) > 60 * 10 then
     if action.type == "craft" then
       pcall(character.cancel_crafting, {count = action.count, index = 1})
     end
-    finish_action(state, "failed", "connection_lost")
+    finish_action(state, slot, "failed", "connection_lost")
     return
   end
   if action.type ~= "craft" and action.type ~= "mine" and
      game.tick - action.started_tick > ACTION_TIMEOUT_TICKS then
-    finish_action(state, "failed", "timeout")
+    finish_action(state, slot, "failed", "timeout")
     return
   end
   if action.type == "move" then
     if not action.path then return end
     local d = math.sqrt(distance_squared(character.position, action.goal))
     if d <= 0.5 then
-      finish_action(state, "succeeded", nil, {position = position_data(character)})
+      finish_action(state, slot, "succeeded", nil, {position = position_data(character)})
       return
     end
     local waypoint = action.path[action.path_index]
@@ -1383,10 +1428,10 @@ script.on_event(defines.events.on_tick, function()
       end
       if game.tick - action.final_progress_tick >= 60 then
         if d <= 1.5 then
-          finish_action(state, "succeeded", nil,
+          finish_action(state, slot, "succeeded", nil,
             {position = position_data(character), distance = d, goal_blocked = true})
         else
-          finish_action(state, "failed", "blocked")
+          finish_action(state, slot, "failed", "blocked")
         end
         return
       end
@@ -1406,7 +1451,7 @@ script.on_event(defines.events.on_tick, function()
       stop_character(character)
       action.retries = action.retries + 1
       if action.retries > 3 then
-        finish_action(state, "failed", "blocked")
+        finish_action(state, slot, "failed", "blocked")
       else
         request_path(state, character, action.goal)
       end
@@ -1414,23 +1459,23 @@ script.on_event(defines.events.on_tick, function()
   elseif action.type == "mine" then
     local inventory = character.get_main_inventory()
     if not inventory then
-      finish_action(state, "failed", "inventory_full")
+      finish_action(state, slot, "failed", "inventory_full")
       return
     end
-    local current = inventory.get_item_count()
+    local current = mining_inventory_count(character)
     if current > action.last_inventory_count then
       action.gained = action.gained + current - action.last_inventory_count
       action.last_progress_tick = game.tick
     end
     action.last_inventory_count = current
     if action.gained >= action.goal_count then
-      finish_action(state, "succeeded", nil,
+      finish_action(state, slot, "succeeded", nil,
         {gained = action.gained, inventory = inventory.get_contents()})
       return
     end
     local target = action.target
     if not target or not target.valid then
-      finish_action(state, "failed", "target_gone", {reason = "entity_gone"})
+      finish_action(state, slot, "failed", "target_gone", {reason = "entity_gone"})
       return
     end
     -- Actions saved before reach was recorded still use the target's reach rule.
@@ -1440,16 +1485,16 @@ script.on_event(defines.events.on_tick, function()
     if (target.type == "resource" and
         distance_squared(character.position, target.position) > reach * reach) or
        not character.can_reach_entity(target) then
-      finish_action(state, "failed", "out_of_range",
+      finish_action(state, slot, "failed", "out_of_range",
                     range_detail(character, target.position, reach))
       return
     end
     if inventory.is_full() then
-      finish_action(state, "failed", "inventory_full")
+      finish_action(state, slot, "failed", "inventory_full")
       return
     end
     if game.tick - action.last_progress_tick >= 60 * 20 then
-      finish_action(state, "failed", "blocked")
+      finish_action(state, slot, "failed", "blocked")
       return
     end
     if character.selected ~= target then
@@ -1458,10 +1503,20 @@ script.on_event(defines.events.on_tick, function()
     end
   elseif action.type == "craft" then
     if character.crafting_queue_size == 0 then
-      finish_action(state, "succeeded", nil,
+      finish_action(state, slot, "succeeded", nil,
         {recipe = action.recipe, count = action.count,
          inventory = inventory_contents(character)})
       record_hand_crafted(state, character, action)
     end
   end
+end
+
+script.on_event(defines.events.on_tick, function()
+  local state = ensure_storage()
+  if not state.spawned_once then
+    spawn_character()
+  end
+  -- A return or completion in one slot must not skip the other slot.
+  tick_action(state, "action")
+  tick_action(state, "craft_action")
 end)
