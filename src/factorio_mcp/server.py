@@ -26,8 +26,8 @@ FilterNames = Annotated[
 ]
 
 HINTS = {
-    "target_gone": "target_ref expires after 10 seconds. Refresh it with observe_nearby.",
-    "not_visible": "Observe the placement area within 10 seconds before placing.",
+    "target_gone": "target_ref expires after 60 seconds. Refresh it with observe_nearby.",
+    "not_visible": "Observe the placement area within 60 seconds before placing.",
     "action_conflict": "Wait with wait_for_action, or stop the running action with cancel_action.",
     "blocked": "Mine or recover blocking entities, or find another position with check_placement.",
     "invalid_target": "Check the entity and valid_roles in detail, then choose a supported target.",
@@ -56,7 +56,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
                 if field in filters and not isinstance(filters[field], list):
                     filters[field] = []
         for entity in result["entities"]:
-            for field in ("belt_items", "fluids"):
+            for field in ("belt_items", "fluids", "inventory_roles"):
                 if field in entity and not isinstance(entity[field], list):
                     entity[field] = []
     if operation == "check_placement":
@@ -136,6 +136,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Observe nearby entities and blocked terrain tiles within 16 tiles. "
+            "Target refs and placement observations expire after 60 seconds. "
+            "Supported structures in your force include sorted inventory_roles. "
             "Follow offsets for additional pages."
         )
     )
@@ -229,6 +231,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Place a supported entity within build reach, consuming one real inventory item."
+            " Observe the placement area within 60 seconds before placing."
         )
     )
     async def place_entity(
@@ -244,7 +247,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         )
 
     @server.tool(
-        description="Check placement within build reach without consuming items or building."
+        description=(
+            "Check placement within build reach without consuming items or building. "
+            "Requires an observation of the placement area within 60 seconds."
+        )
     )
     async def check_placement(
         item: RequiredText,
@@ -267,7 +273,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await invoke("get_entity_inventory", {"target_ref": target_ref})
 
     @server.tool(
-        description="Move a real item between the AI character and a nearby observed structure."
+        description=(
+            "Move a real item between the AI character and a nearby observed structure. "
+            "Choose inventory_role from the structure's inventory_roles in observe_nearby."
+        )
     )
     async def transfer_item(
         target_ref: RequiredText,
@@ -295,12 +304,13 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         description=(
             "Wait for a walking, mining, or crafting action to finish. Prefer this over polling "
             "get_action_status. A timeout returns the last running status "
-            "and leaves the action running."
+            "and leaves the action running. The maximum wait is 50 seconds to keep it under "
+            "common 60-second client tool timeouts."
         )
     )
     async def wait_for_action(
         action_id: RequiredText,
-        timeout_seconds: Annotated[float, Field(ge=1, le=30, allow_inf_nan=False)] = 20,
+        timeout_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] = 20,
     ) -> CallToolResult:
         started = time.monotonic()
         try:

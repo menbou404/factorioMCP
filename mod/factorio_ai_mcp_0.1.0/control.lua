@@ -2,6 +2,7 @@ local PROTOCOL_VERSION = 1
 local AGENT_ID = "agent-1"
 local MAX_OBSERVATIONS = 100
 local OBSERVATION_RADIUS = 16
+local TARGET_TTL_TICKS = 60 * 60
 local ACTION_TIMEOUT_TICKS = 60 * 120
 local ENTITY_STATUS_NAMES = {}
 for name, value in pairs(defines.entity_status) do
@@ -207,7 +208,7 @@ local function target_entity(character, params, max_distance, mining)
   local state = ensure_storage()
   if type(params.target_ref) == "string" then
     local reference = state.targets[params.target_ref]
-    if not reference or game.tick - reference.tick > 60 * 10 then
+    if not reference or game.tick - reference.tick > TARGET_TTL_TICKS then
       return nil, "target_gone", {reason = "expired"}
     end
     local entity = reference.entity
@@ -429,6 +430,11 @@ local function do_observe(state, params)
       amount = entity.type == "resource" and entity.amount or nil,
       owned = entity.force == character.force
     }
+    local roles = INVENTORY_ROLES[entity.name]
+    if observed.owned and roles then
+      local inventory_roles = sorted_keys(roles)
+      if #inventory_roles > 0 then observed.inventory_roles = inventory_roles end
+    end
     if entity.supports_direction then observed.direction = entity.direction end
     local entity_status = entity.status
     if entity_status ~= nil then observed.status = ENTITY_STATUS_NAMES[entity_status] end
@@ -497,7 +503,7 @@ local function do_observe(state, params)
     }
   end
   for key, reference in pairs(state.targets) do
-    if game.tick - reference.tick > 60 * 10 then state.targets[key] = nil end
+    if game.tick - reference.tick > TARGET_TTL_TICKS then state.targets[key] = nil end
   end
   return {position = position_data(character), radius = radius, filters = filters,
           entities = output, entity_total = #visible, resources = resources,
@@ -740,7 +746,7 @@ local function validate_placement(state, character, params, require_item)
   end
   local observation = state.last_observation
   if not observation or observation.surface ~= character.surface.name or
-     game.tick - observation.tick > 60 * 10 or
+     game.tick - observation.tick > TARGET_TTL_TICKS or
      distance_squared(observation.position, position) >
        (observation.radius or OBSERVATION_RADIUS) ^ 2 then
     return nil, "not_visible", observation_detail(state)

@@ -33,7 +33,7 @@ Python 側の単体テストは `uv run python -m unittest discover -s test -p '
 6. `craft` で手作業製作を始め、`get_action_status` で完了を確認します。`place_entity` は対応する設備アイテムを 1 個消費します。
 7. `get_entity_inventory` と `transfer_item` で、近くの箱・石の炉などとアイテムを移動します。
 
-設備や資源の `target_ref` は観察から 10 秒間有効です。期限切れのときは再観察します。作成した設備は観察者の画面にも現れます。
+設備や資源の `target_ref` は観察から 60 秒間有効です。期限切れのときは再観察します。作成した設備は観察者の画面にも現れます。
 
 変更操作で `not_connected` が返り、結果に `request_id` が含まれる場合は、接続回復後に `get_request_result` で実行済みかを確認します。同じ操作をすぐに再実行しないでください。
 

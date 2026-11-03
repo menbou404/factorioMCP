@@ -22,7 +22,7 @@
 | `get_recipe_info` | 読み取り | レシピの有効・無効、材料、生成物、手作業で作れるか |
 | `transfer_item` | 変更 | キャラクターと設備の間でアイテムを移す |
 | `get_action_status` | 読み取り | 長時間操作の進捗と結果 |
-| `wait_for_action` | 読み取り | 長時間操作の完了を最大 30 秒待って結果を返す（[14-agent-ergonomics.md](14-agent-ergonomics.md)） |
+| `wait_for_action` | 読み取り | 長時間操作の完了を最大 50 秒待って結果を返す（[14-agent-ergonomics.md](14-agent-ergonomics.md)、[15-agent-trial-fixes.md](15-agent-trial-fixes.md)） |
 | `cancel_action` | 変更 | 自分の進行中の操作を中断 |
 | `get_request_result` | 読み取り | 通信切断後に元の変更要求が実行されたか照会 |
 

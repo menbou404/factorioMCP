@@ -71,7 +71,7 @@ def main():
     action("craft", {"recipe": "stone-furnace", "count": 1})
     action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
 
-    # place_entity requires an observation from the last 10 seconds.
+    # place_entity requires an observation from the last 60 seconds.
     before = items()
     bridge.call("observe_nearby")
     expect_error(
@@ -133,7 +133,7 @@ def main():
     )
     record("out-of-reach mining keeps inventory", items() == before)
 
-    time.sleep(11)
+    time.sleep(61)
     expect_error(
         "expired target_ref", "get_entity_inventory", {"target_ref": furnace}, {"target_gone"}
     )
@@ -238,6 +238,26 @@ def main():
         and value.get("timed_out") is False
         and value.get("action_id") == started["action_id"],
     )
+
+    # M7-B checks run within reach of the furnace at (6, 4).
+    action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+    observed = bridge.call("observe_nearby", {"types": ["furnace"], "owned_only": True})["result"]
+    record(
+        "observation lists furnace inventory_roles",
+        any(
+            entity["name"] == "stone-furnace"
+            and entity.get("inventory_roles") == ["fuel", "result", "source"]
+            for entity in observed["entities"]
+        ),
+    )
+    furnace = reference("stone-furnace")
+    time.sleep(30)
+    try:
+        bridge.call("get_entity_inventory", {"target_ref": furnace})
+    except BridgeError as error:
+        record("target_ref survives 30 seconds", False, error.code)
+    else:
+        record("target_ref survives 30 seconds", True)
 
     failed = [label for label, passed, _ in results if not passed]
     if failed:

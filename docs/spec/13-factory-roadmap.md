@@ -32,6 +32,7 @@ M1 と M2 は 1 つの変更として実装する。M3 以降の詳細は、各�
 | `pickup_position` | インサーター | 拾う位置 |
 | `drop_position` | インサーター、採掘機 | 置く位置 |
 | `belt_items` | ベルト | ベルト上のアイテム。両方の列を合算した `{name, quality, count}` の配列 |
+| `inventory_roles` | 受け渡しに対応する自分の設備 | `transfer_item` で使える区画名の一覧（M7 で追加、[15-agent-trial-fixes.md](15-agent-trial-fixes.md)） |
 
 観察結果の最上位に `resources` を加える。観察半径内の資源エンティティを資源名ごとに集計し、`{name, tiles, total_amount, left_top = {x, y}, right_bottom = {x, y}}` を返す。ページングの対象外とし、エンティティ一覧のページに関係なく常に半径内の全資源を集計する。半径外の資源は含めない。
 
