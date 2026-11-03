@@ -224,6 +224,49 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text):
                 self.assertIn(text, description)
 
+    async def test_move_tool_description_explains_path_not_found_detail(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        description = tools["move_to"].description
+        for text in (
+            "path_not_found",
+            "goal_tiles",
+            "goal_entities",
+            "nearby_free_position",
+            "standable spot",
+            "no path guarantee",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, description)
+
+    async def test_path_not_found_hint_and_detail(self):
+        bridge = Mock()
+        detail = {
+            "goal": {"x": -10, "y": -10},
+            "distance": 20,
+            "goal_tiles": ["water"],
+            "goal_entities": [{"name": "stone-wall", "type": "wall", "x": -10, "y": -10}],
+            "nearby_free_position": {"x": -7, "y": -10},
+        }
+        bridge.call.side_effect = BridgeError("path_not_found", detail=detail)
+        result = await create_server(bridge).call_tool(
+            "move_to", {"surface": "nauvis", "x": -10, "y": -10}
+        )
+        self.assertTrue(result.is_error)
+        value = payload(result)
+        self.assertEqual(value["error"], "path_not_found")
+        self.assertEqual(value["detail"], detail)
+        self.assertEqual(value["hint"], HINTS["path_not_found"])
+        for text in (
+            "goal_tiles",
+            "goal_entities",
+            "explaining the failure",
+            "nearby_free_position",
+            "standable spot to try with move_to",
+            "no path guarantee",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, value["hint"])
+
     async def test_placement_tool_descriptions_explain_preview_metadata(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         for name in ("check_placement", "place_entity", "observe_nearby"):

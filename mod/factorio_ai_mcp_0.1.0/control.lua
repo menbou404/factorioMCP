@@ -263,6 +263,51 @@ local function reset_move_progress(action)
   action.final_progress_tick = nil
 end
 
+local function path_not_found_detail(character, goal)
+  local detail = {goal = {x = goal.x, y = goal.y}}
+  -- A path response can arrive after the character has been removed.
+  if not character or not character.valid then return detail end
+  detail.distance = math.sqrt(distance_squared(character.position, goal))
+  local surface = character.surface
+  local prototype = character.prototype
+  local layers = prototype.collision_mask.layers
+  local tile = surface.get_tile(goal.x, goal.y)
+  local tiles = {}
+  for layer in pairs(layers) do
+    if tile.collides_with(layer) then tiles[tile.name] = true; break end
+  end
+  local tile_names = sorted_keys(tiles)
+  if #tile_names > 0 then detail.goal_tiles = tile_names end
+
+  local box = prototype.collision_box
+  local area = {left_top = {x = goal.x + box.left_top.x, y = goal.y + box.left_top.y},
+                right_bottom = {x = goal.x + box.right_bottom.x, y = goal.y + box.right_bottom.y}}
+  local entities = {}
+  for _, entity in pairs(surface.find_entities_filtered{area = area}) do
+    if entity.valid and entity ~= character then
+      local entity_box = entity.bounding_box
+      if entity_box.left_top.x < area.right_bottom.x and
+         entity_box.right_bottom.x > area.left_top.x and
+         entity_box.left_top.y < area.right_bottom.y and
+         entity_box.right_bottom.y > area.left_top.y then
+        local entity_layers = entity.prototype.collision_mask.layers
+        for layer in pairs(layers) do
+          if entity_layers[layer] then
+            entities[#entities + 1] = {name = entity.name, type = entity.type,
+                                      x = entity.position.x, y = entity.position.y}
+            break
+          end
+        end
+      end
+      if #entities == 5 then break end
+    end
+  end
+  if #entities > 0 then detail.goal_entities = entities end
+  local free = surface.find_non_colliding_position("character", goal, 10, 0.5)
+  if free then detail.nearby_free_position = {x = free.x, y = free.y} end
+  return detail
+end
+
 local function request_path(state, character, goal)
   local action = state.action
   action.path = nil
@@ -304,8 +349,9 @@ local function do_move(state, params)
   })
   local ok = pcall(request_path, state, character, goal)
   if not ok then
-    finish_action(state, "failed", "path_not_found")
-    return nil, "path_not_found"
+    local detail = path_not_found_detail(character, goal)
+    finish_action(state, "failed", "path_not_found", detail)
+    return nil, "path_not_found", detail
   end
   return result
 end
@@ -1242,14 +1288,16 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
   if event.try_again_later then
     state.action.retries = state.action.retries + 1
     if state.action.retries > 3 then
-      finish_action(state, "failed", "path_not_found")
+      finish_action(state, "failed", "path_not_found",
+        path_not_found_detail(state.character, state.action.goal))
     else
       request_path(state, state.character, state.action.goal)
     end
     return
   end
   if not event.path or #event.path == 0 then
-    finish_action(state, "failed", "path_not_found")
+    finish_action(state, "failed", "path_not_found",
+      path_not_found_detail(state.character, state.action.goal))
     return
   end
   state.action.path = event.path

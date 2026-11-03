@@ -27,6 +27,7 @@
 | [14-agent-ergonomics.md](14-agent-ergonomics.md) | AI エージェント向けの使いやすさ改善（M6） |
 | [15-agent-trial-fixes.md](15-agent-trial-fixes.md) | 自律試行で見つかった問題の修正（M7） |
 | [16-trial3-fixes.md](16-trial3-fixes.md) | 3 回目の試行で見つかった問題の修正（M8） |
+| [17-trial4-fixes.md](17-trial4-fixes.md) | 4 回目の試行で見つかった問題の修正（M9） |
 
 ## 共通の不変条件
 
