@@ -788,6 +788,117 @@ def main():
         json.dumps(observed),
     )
 
+    # M12-P: remember the resource fixture even after the most recent observation moves away.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    try:
+        action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+        observed = bridge.call("observe_nearby")["result"]
+        fixture = next(
+            entity
+            for entity in observed["entities"]
+            if entity["name"] == coal["name"]
+            and entity["x"] == coal["x"]
+            and entity["y"] == coal["y"]
+        )
+        action("move_to", {"surface": "nauvis", "x": -18, "y": 4})
+        observed = bridge.call("observe_nearby")["result"]
+        mapped = bridge.call("get_explored_map", {"resource_names": [fixture["name"]]})["result"]
+        remembered = [
+            patch
+            for patch in mapped["resources"]
+            if patch["name"] == fixture["name"]
+            and patch["left_top"]["x"] <= fixture["x"] < patch["right_bottom"]["x"]
+            and patch["left_top"]["y"] <= fixture["y"] < patch["right_bottom"]["y"]
+        ]
+        record(
+            "explored map remembers resources",
+            math.hypot(
+                fixture["x"] - observed["position"]["x"],
+                fixture["y"] - observed["position"]["y"],
+            )
+            > observed["radius"]
+            and bool(remembered)
+            and all(
+                math.isclose(
+                    patch["distance"],
+                    math.hypot(
+                        patch["nearest"]["x"] - mapped["position"]["x"],
+                        patch["nearest"]["y"] - mapped["position"]["y"],
+                    ),
+                    rel_tol=0,
+                    abs_tol=1e-6,
+                )
+                for patch in remembered
+            ),
+            json.dumps(mapped),
+        )
+
+        before_cells = bridge.call("get_explored_map")["result"]["explored"]["cells"]
+        bridge.call("observe_nearby", {"radius": 1})
+        after_cells = bridge.call("get_explored_map")["result"]["explored"]["cells"]
+        record("explored map only covers observed cells", after_cells == before_cells)
+    finally:
+        action("move_to", return_position)
+
+    def assert_water_fixture_covered(observation):
+        position, radius = observation["position"], observation["radius"]
+        for cx in (-2, -1):
+            for cy in (-2, -1):
+                for x in (8 * cx, 8 * cx + 8):
+                    for y in (8 * cy, 8 * cy + 8):
+                        if math.hypot(x - position["x"], y - position["y"]) > radius:
+                            raise RuntimeError(
+                                "M12-P walk ended too far from (-6, -6) to fully observe "
+                                f"water fixture cell ({cx}, {cy}): {position}, radius={radius}"
+                            )
+
+    # All four cells containing the water fixture must be refreshed, including empty ones.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    try:
+        try:
+            set_goal_tiles("water")
+            action("move_to", {"surface": "nauvis", "x": -6, "y": -6})
+            observed = bridge.call("observe_nearby")["result"]
+            assert_water_fixture_covered(observed)
+            water_position = observed["position"]
+            mapped = bridge.call("get_explored_map", {"limit": 50})["result"]
+            shores = [
+                group["nearest_shore"]
+                for group in mapped["water"]
+                if group.get("tiles", 0) >= 1 and group.get("nearest_shore")
+            ]
+            record(
+                "explored map records water",
+                any(
+                    -12 <= shore["x"] < -7
+                    and -12 <= shore["y"] < -7
+                    and math.isclose(shore["x"] % 1, 0.5, abs_tol=1e-6)
+                    and math.isclose(shore["y"] % 1, 0.5, abs_tol=1e-6)
+                    and (math.floor(shore["x"]) in (-12, -8) or math.floor(shore["y"]) in (-12, -8))
+                    for shore in shores
+                ),
+                json.dumps(mapped),
+            )
+        finally:
+            set_goal_tiles("grass-1")
+        observed = bridge.call("observe_nearby")["result"]
+        assert_water_fixture_covered(observed)
+        mapped = bridge.call("get_explored_map", {"limit": 50})["result"]
+        record(
+            "explored map forgets water after re-observation",
+            observed["position"] == water_position
+            and not any(
+                group["left_top"]["x"] < -7
+                and group["right_bottom"]["x"] > -12
+                and group["left_top"]["y"] < -7
+                and group["right_bottom"]["y"] > -12
+                for group in mapped["water"]
+            ),
+            json.dumps(mapped),
+        )
+    finally:
+        action("move_to", return_position)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

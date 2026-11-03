@@ -36,6 +36,86 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explored_map_description_schema_and_forwarding(self):
+        bridge = Mock()
+        bridge.call.return_value = {"tick": 42, "result": {}}
+        server = create_server(bridge)
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        tool = tools["get_explored_map"]
+        for text in (
+            "only what this character saw with observe_nearby",
+            "current surface",
+            "8x8 tiles",
+            "fully inside an observation circle",
+            "as of observed_tick",
+            "update when the area is observed again",
+            "resource patches",
+            "shore tile for offshore pumps",
+            "forests and rocks nearest first",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, tool.description)
+        self.assertIn("fully observed 8x8 cells", tools["observe_nearby"].description)
+        self.assertIn("get_explored_map", tools["observe_nearby"].description)
+        schema = tool.input_schema
+        self.assertFalse(schema.get("required"))
+        props = schema["properties"]
+        self.assertEqual(props["limit"]["type"], "integer")
+        self.assertEqual(props["limit"]["minimum"], 1)
+        self.assertEqual(props["limit"]["maximum"], 50)
+        self.assertEqual(props["limit"]["default"], 10)
+        array = next(item for item in props["resource_names"]["anyOf"] if item["type"] == "array")
+        self.assertEqual(array["maxItems"], 32)
+        self.assertEqual(array["items"]["minLength"], 1)
+        self.assertEqual(array["items"]["maxLength"], 200)
+        await server.call_tool("get_explored_map", {})
+        bridge.call.assert_called_with("get_explored_map", {"limit": 10})
+        for names in (None, [], ["iron-ore", "coal"]):
+            params = {"limit": 50, "resource_names": names}
+            result = await server.call_tool("get_explored_map", params)
+            self.assertFalse(result.is_error)
+            expected = {"limit": 50}
+            if names is not None:
+                expected["resource_names"] = names
+            bridge.call.assert_called_with("get_explored_map", expected)
+
+    async def test_explored_map_normalizes_empty_lists_and_preserves_records(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        lists = ("resources", "water", "trees", "rocks")
+        for field in lists:
+            with self.subTest(field=field):
+                entry = {
+                    "cells": 2,
+                    "distance": 10,
+                    "observed_tick": 30,
+                    "left_top": {"x": -16, "y": 0},
+                    "right_bottom": {"x": 0, "y": 8},
+                }
+                expected = {
+                    "position": {"surface": "nauvis", "x": 1, "y": 2},
+                    "cell_size": 8,
+                    "explored": {"cells": 0},
+                    **{name: [entry] if name == field else [] for name in lists},
+                    **{name + "_total": int(name == field) for name in lists},
+                }
+                raw = {key: {} if value == [] else value for key, value in expected.items()}
+                bridge.call.return_value = {"tick": 42, "result": raw}
+                result = payload(await server.call_tool("get_explored_map", {}))
+                self.assertEqual(result, {"ok": True, "tick": 42, **expected})
+
+    async def test_invalid_explored_map_params_are_rejected_before_bridge(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        cases = [{"limit": value} for value in (0, 51, -1, 1.5, True, "10", float("nan"))]
+        cases += [
+            {"resource_names": value} for value in ([""], ["x" * 201], ["coal"] * 33, [1], "coal")
+        ]
+        for params in cases:
+            with self.subTest(params=params), self.assertRaises(ToolError):
+                await server.call_tool("get_explored_map", params)
+        bridge.call.assert_not_called()
+
     async def test_mining_description_explains_conflicting_operations(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         description = tools["mine_entity"].description
