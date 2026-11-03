@@ -3,6 +3,8 @@ local AGENT_ID = "agent-1"
 local MAX_OBSERVATIONS = 100
 local MAX_RECENT_OBSERVATIONS = 8
 local OBSERVATION_RADIUS = 16
+local MAP_CELL_SIZE = 8
+local MAX_EXPLORED_CELLS = 16384
 local TARGET_TTL_TICKS = 60 * 60
 local ACTION_TIMEOUT_TICKS = 60 * 120
 local ENTITY_STATUS_NAMES = {}
@@ -50,11 +52,13 @@ local function ensure_storage()
     targets = {},
     last_observation = nil,
     recent_observations = {},
+    explored_map = {},
     last_heartbeat_tick = nil
   }
   storage.ai_mcp.next_action_id = storage.ai_mcp.next_action_id or 1
   storage.ai_mcp.next_target_id = storage.ai_mcp.next_target_id or 1
   storage.ai_mcp.targets = storage.ai_mcp.targets or {}
+  storage.ai_mcp.explored_map = storage.ai_mcp.explored_map or {}
   if not storage.ai_mcp.recent_observations then
     storage.ai_mcp.recent_observations = {}
     if storage.ai_mcp.last_observation then
@@ -521,6 +525,222 @@ local function placed_fluid_connections(entity)
   if #connections > 0 then return connections end
 end
 
+local function map_cell_key(cx, cy)
+  return cx .. "," .. cy
+end
+
+local function map_cell_centre(cell)
+  return {x = (cell.cx + 0.5) * MAP_CELL_SIZE, y = (cell.cy + 0.5) * MAP_CELL_SIZE}
+end
+
+local function nearest_sample(previous, candidate, origin)
+  if not candidate then return previous end
+  if not previous then return {x = candidate.x, y = candidate.y} end
+  local old_distance = distance_squared(previous, origin)
+  local new_distance = distance_squared(candidate, origin)
+  if new_distance < old_distance or (new_distance == old_distance and
+     (candidate.x < previous.x or (candidate.x == previous.x and candidate.y < previous.y))) then
+    return {x = candidate.x, y = candidate.y}
+  end
+  return previous
+end
+
+local function record_explored_map(state, character, radius, entities)
+  local surface, position = character.surface, character.position
+  local map = state.explored_map[surface.name]
+  if not map then
+    map = {cells = {}, count = 0}
+    state.explored_map[surface.name] = map
+  end
+  local fresh = {}
+  for cx = math.floor((position.x - radius) / MAP_CELL_SIZE),
+           math.floor((position.x + radius) / MAP_CELL_SIZE) do
+    for cy = math.floor((position.y - radius) / MAP_CELL_SIZE),
+             math.floor((position.y + radius) / MAP_CELL_SIZE) do
+      local left, top = cx * MAP_CELL_SIZE, cy * MAP_CELL_SIZE
+      local right, bottom = left + MAP_CELL_SIZE, top + MAP_CELL_SIZE
+      -- A rectangle is fully inside a circle exactly when all four corners are inside.
+      if distance_squared(position, {x = left, y = top}) <= radius * radius and
+         distance_squared(position, {x = right, y = top}) <= radius * radius and
+         distance_squared(position, {x = left, y = bottom}) <= radius * radius and
+         distance_squared(position, {x = right, y = bottom}) <= radius * radius then
+        local cell = {cx = cx, cy = cy, tick = game.tick, resources = {},
+                      water = 0, trees = 0, rocks = 0}
+        local centre = map_cell_centre(cell)
+        local water = surface.find_tiles_filtered{
+          area = {{left, top}, {right, bottom}}, collision_mask = "water_tile"
+        }
+        for _, tile in pairs(water) do
+          local x, y = tile.position.x, tile.position.y
+          -- Keep the cell half-open even if a tile search includes a boundary tile.
+          if x >= left and x < right and y >= top and y < bottom then
+            cell.water = cell.water + 1
+            if not surface.get_tile(x - 1, y).collides_with("water_tile") or
+               not surface.get_tile(x + 1, y).collides_with("water_tile") or
+               not surface.get_tile(x, y - 1).collides_with("water_tile") or
+               not surface.get_tile(x, y + 1).collides_with("water_tile") then
+              cell.shore = nearest_sample(cell.shore, {x = x + 0.5, y = y + 0.5}, centre)
+            end
+          end
+        end
+        fresh[map_cell_key(cx, cy)] = cell
+      end
+    end
+  end
+  -- Use the original search, before any observation filters or paging are applied.
+  for _, entity in pairs(entities) do
+    if entity.valid then
+      local position = entity.position
+      local cell = fresh[map_cell_key(math.floor(position.x / MAP_CELL_SIZE),
+                                      math.floor(position.y / MAP_CELL_SIZE))]
+      if cell then
+        local centre = map_cell_centre(cell)
+        if entity.type == "resource" then
+          local resource = cell.resources[entity.name] or {tiles = 0, amount = 0}
+          resource.tiles = resource.tiles + 1
+          resource.amount = resource.amount + entity.amount
+          resource.sample = nearest_sample(resource.sample, position, centre)
+          cell.resources[entity.name] = resource
+        elseif entity.type == "tree" then
+          cell.trees = cell.trees + 1
+          cell.tree_sample = nearest_sample(cell.tree_sample, position, centre)
+        elseif entity.type == "simple-entity" and string.find(entity.name, "rock", 1, true) then
+          cell.rocks = cell.rocks + 1
+          cell.rock_sample = nearest_sample(cell.rock_sample, position, centre)
+        end
+      end
+    end
+  end
+  for key, cell in pairs(fresh) do
+    if not map.cells[key] then map.count = map.count + 1 end
+    map.cells[key] = cell
+  end
+  if map.count > MAX_EXPLORED_CELLS then
+    local oldest = {}
+    for key, cell in pairs(map.cells) do
+      oldest[#oldest + 1] = {key = key, tick = cell.tick}
+    end
+    table.sort(oldest, function(a, b)
+      if a.tick ~= b.tick then return a.tick < b.tick end
+      return a.key < b.key
+    end)
+    for index = 1, map.count - MAX_EXPLORED_CELLS do
+      map.cells[oldest[index].key] = nil
+      map.count = map.count - 1
+    end
+  end
+end
+
+local function extend_map_bounds(bounds, cell)
+  local left, top = cell.cx * MAP_CELL_SIZE, cell.cy * MAP_CELL_SIZE
+  if not bounds.left_top then
+    bounds.left_top = {x = left, y = top}
+    bounds.right_bottom = {x = left + MAP_CELL_SIZE, y = top + MAP_CELL_SIZE}
+  else
+    bounds.left_top.x = math.min(bounds.left_top.x, left)
+    bounds.left_top.y = math.min(bounds.left_top.y, top)
+    bounds.right_bottom.x = math.max(bounds.right_bottom.x, left + MAP_CELL_SIZE)
+    bounds.right_bottom.y = math.max(bounds.right_bottom.y, top + MAP_CELL_SIZE)
+  end
+end
+
+local function map_components(cells, kind, name, position)
+  local remaining, components = {}, {}
+  for key, cell in pairs(cells) do
+    if (kind == "resources" and cell.resources[name]) or
+       (kind ~= "resources" and cell[kind] > 0) then
+      remaining[key] = cell
+    end
+  end
+  for key in pairs(cells) do
+    local seed = remaining[key]
+    if seed then
+      local group = {name = name, cells = 0, observed_tick = seed.tick}
+      local queue, index = {seed}, 1
+      remaining[key] = nil
+      local nearest_centre
+      while index <= #queue do
+        local cell = queue[index]
+        index = index + 1
+        group.cells = group.cells + 1
+        group.observed_tick = math.min(group.observed_tick, cell.tick)
+        extend_map_bounds(group, cell)
+        if kind == "resources" then
+          local resource = cell.resources[name]
+          group.tiles = (group.tiles or 0) + resource.tiles
+          group.total_amount = (group.total_amount or 0) + resource.amount
+          group.nearest = nearest_sample(group.nearest, resource.sample, position)
+        elseif kind == "water" then
+          group.tiles = (group.tiles or 0) + cell.water
+          group.nearest_shore = nearest_sample(group.nearest_shore, cell.shore, position)
+          nearest_centre = nearest_sample(nearest_centre, map_cell_centre(cell), position)
+        else
+          group.count = (group.count or 0) + cell[kind]
+          local sample = kind == "trees" and cell.tree_sample or cell.rock_sample
+          group.nearest = nearest_sample(group.nearest, sample, position)
+        end
+        for dx = -1, 1 do
+          for dy = -1, 1 do
+            if dx ~= 0 or dy ~= 0 then
+              local neighbour_key = map_cell_key(cell.cx + dx, cell.cy + dy)
+              local neighbour = remaining[neighbour_key]
+              if neighbour then
+                queue[#queue + 1] = neighbour
+                remaining[neighbour_key] = nil
+              end
+            end
+          end
+        end
+      end
+      local nearest = group.nearest or group.nearest_shore or nearest_centre
+      group.distance = math.sqrt(distance_squared(position, nearest))
+      components[#components + 1] = group
+    end
+  end
+  return components
+end
+
+local function do_get_explored_map(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  local limit = params.limit == nil and 10 or params.limit
+  if type(limit) ~= "number" or limit % 1 ~= 0 or limit < 1 or limit > 50 then
+    return nil, "invalid_input"
+  end
+  local names, names_error = string_filter(params.resource_names)
+  if names_error then return nil, "invalid_input" end
+  local map = state.explored_map[character.surface.name] or {cells = {}, count = 0}
+  local result = {position = position_data(character), cell_size = MAP_CELL_SIZE,
+                  explored = {cells = map.count}, resources = {}}
+  local resource_names = {}
+  for _, cell in pairs(map.cells) do
+    extend_map_bounds(result.explored, cell)
+    for name in pairs(cell.resources) do
+      if not names or names[name] then resource_names[name] = true end
+    end
+  end
+  for name in pairs(resource_names) do
+    for _, group in ipairs(map_components(map.cells, "resources", name, character.position)) do
+      result.resources[#result.resources + 1] = group
+    end
+  end
+  for _, kind in ipairs({"water", "trees", "rocks"}) do
+    result[kind] = map_components(map.cells, kind, nil, character.position)
+  end
+  for _, kind in ipairs({"resources", "water", "trees", "rocks"}) do
+    local groups = result[kind]
+    result[kind .. "_total"] = #groups
+    table.sort(groups, function(a, b)
+      if a.distance ~= b.distance then return a.distance < b.distance end
+      if a.name ~= b.name then return a.name < b.name end
+      if a.left_top.x ~= b.left_top.x then return a.left_top.x < b.left_top.x end
+      return a.left_top.y < b.left_top.y
+    end)
+    for index = #groups, limit + 1, -1 do groups[index] = nil end
+  end
+  return result
+end
+
 local function do_observe(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -549,6 +769,7 @@ local function do_observe(state, params)
   local entities = character.surface.find_entities_filtered{
     position = character.position, radius = radius
   }
+  record_explored_map(state, character, radius, entities)
   local visible = {}
   local resources_by_name = {}
   for _, entity in pairs(entities) do
@@ -1368,6 +1589,7 @@ local handlers = {
   end,
   get_agent_status = function(state) return status(state) end,
   observe_nearby = do_observe,
+  get_explored_map = do_get_explored_map,
   get_inventory = function(state)
     local character, err = require_character(state)
     if not character then return nil, err end
@@ -1473,6 +1695,7 @@ commands.add_command("ai_mcp_admin", "AI MCP administrator reset (RCON only)",
     state.targets = {}
     state.last_observation = nil
     state.recent_observations = {}
+    state.explored_map = {}
     spawn_character()
     reply(nil, valid_character(state), status(state),
           valid_character(state) and nil or "spawn_blocked")

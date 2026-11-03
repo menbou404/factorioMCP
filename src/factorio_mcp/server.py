@@ -70,6 +70,7 @@ HINTS = {
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     array_fields = {
         "observe_nearby": ("entities", "blocked_tiles", "resources"),
+        "get_explored_map": ("resources", "water", "trees", "rocks"),
         "get_inventory": ("items",),
         "get_agent_status": ("inventory",),
         "list_craftable_recipes": ("recipes",),
@@ -226,6 +227,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "direction, flow, fluidbox_index, and connected. "
             "Use check_placement for snapped position and valid_directions before building. "
             "Follow offsets for additional pages."
+            " Each call also records fully observed 8x8 cells for get_explored_map, "
+            "independent of filters and paging."
         )
     )
     async def observe_nearby(
@@ -252,6 +255,26 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         if not include_tiles:
             params["include_tiles"] = include_tiles
         return await invoke("observe_nearby", params)
+
+    @server.tool(
+        description=(
+            "Read only what this character saw with observe_nearby on the current surface: "
+            "8x8 tiles per cell, recorded only when fully inside an observation circle. "
+            "Values are as of observed_tick and update when the area is observed again. "
+            "Lists resource patches, water (with a shore tile for offshore pumps), forests "
+            "and rocks nearest first. Each list contains at most limit components; "
+            "resources_total, water_total, trees_total and rocks_total count components "
+            "before truncation. Use resource_names to filter resource kinds."
+        )
+    )
+    async def get_explored_map(
+        limit: Annotated[int, Field(ge=1, le=50, strict=True)] = 10,
+        resource_names: FilterNames | None = None,
+    ) -> CallToolResult:
+        params: dict[str, Any] = {"limit": limit}
+        if resource_names is not None:
+            params["resource_names"] = resource_names
+        return await invoke("get_explored_map", params)
 
     @server.tool(description="Read the AI character’s actual in-game inventory.")
     async def get_inventory() -> CallToolResult:
