@@ -33,6 +33,183 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_action_status_descriptions_explain_running_progress(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name in ("get_action_status", "wait_for_action"):
+            with self.subTest(name=name):
+                for field in ("detail.gained", "detail.count", "detail.remaining"):
+                    self.assertIn(field, tools[name].description)
+
+    async def test_research_wait_returns_immediately_when_researched(self):
+        bridge = Mock()
+        bridge.call.return_value = {"result": {"researched": ["automation"], "queue": {}}}
+        with patch("factorio_mcp.server.asyncio.sleep") as sleep:
+            result = await create_server(bridge).call_tool(
+                "wait_for_research", {"technology": "automation"}
+            )
+        self.assertFalse(result.is_error)
+        value = payload(result)
+        waited = value.pop("waited_seconds")
+        self.assertGreaterEqual(waited, 0)
+        self.assertEqual(
+            value,
+            {
+                "technology": "automation",
+                "researched": True,
+                "researching": False,
+                "progress": None,
+                "timed_out": False,
+            },
+        )
+        bridge.call.assert_called_once_with("get_research_status", None)
+        sleep.assert_not_awaited()
+
+    async def test_research_wait_returns_immediately_when_not_queued(self):
+        bridge = Mock()
+        bridge.call.return_value = {
+            "result": {
+                "researched": {},
+                "queue": ["other-technology"],
+                "current": "other-technology",
+                "progress": 0.5,
+            }
+        }
+        server = create_server(bridge)
+        for technology in ("automation", "unknown-technology"):
+            with self.subTest(technology=technology):
+                bridge.call.reset_mock()
+                with patch("factorio_mcp.server.asyncio.sleep") as sleep:
+                    result = await server.call_tool("wait_for_research", {"technology": technology})
+                self.assertFalse(result.is_error)
+                value = payload(result)
+                self.assertEqual(value["technology"], technology)
+                self.assertFalse(value["researched"])
+                self.assertFalse(value["researching"])
+                self.assertIsNone(value["progress"])
+                self.assertFalse(value["timed_out"])
+                bridge.call.assert_called_once_with("get_research_status", None)
+                sleep.assert_not_awaited()
+
+    async def test_research_wait_follows_queue_until_researched(self):
+        bridge = Mock()
+        bridge.call.side_effect = [
+            {"result": {"queue": ["automation"], "current": "other", "progress": 0.9}},
+            {"result": {"current": "automation", "progress": 0.5}},
+            {"result": {"researched": ["automation"]}},
+        ]
+        with patch("factorio_mcp.server.asyncio.sleep") as sleep:
+            result = await create_server(bridge).call_tool(
+                "wait_for_research", {"technology": "automation"}
+            )
+        self.assertFalse(result.is_error)
+        self.assertTrue(payload(result)["researched"])
+        self.assertFalse(payload(result)["timed_out"])
+        self.assertEqual(bridge.call.call_count, 3)
+        self.assertEqual(sleep.await_count, 2)
+        sleep.assert_awaited_with(0.25)
+
+    async def test_research_wait_returns_when_removed_from_queue(self):
+        bridge = Mock()
+        bridge.call.side_effect = [
+            {"result": {"queue": ["automation"]}},
+            {"result": {"queue": {}}},
+        ]
+        with patch("factorio_mcp.server.asyncio.sleep") as sleep:
+            result = await create_server(bridge).call_tool(
+                "wait_for_research", {"technology": "automation"}
+            )
+        self.assertFalse(result.is_error)
+        self.assertFalse(payload(result)["researched"])
+        self.assertFalse(payload(result)["researching"])
+        self.assertIsNone(payload(result)["progress"])
+        self.assertFalse(payload(result)["timed_out"])
+        self.assertEqual(bridge.call.call_count, 2)
+        sleep.assert_awaited_once_with(0.25)
+
+    async def test_research_wait_timeout_preserves_current_progress(self):
+        # Current research must be recognized even when the queue is empty.
+        for current, progress in (("automation", 0.375), ("other", None)):
+            with self.subTest(current=current):
+                bridge = Mock()
+                bridge.call.return_value = {
+                    "result": {
+                        "current": current,
+                        "progress": 0.375,
+                        "queue": ["automation"] if current == "other" else {},
+                    }
+                }
+                with (
+                    patch("factorio_mcp.server.time") as clock,
+                    patch("factorio_mcp.server.asyncio.sleep") as sleeper,
+                ):
+                    clock.monotonic.side_effect = [0, 0, 0.25, 0.5, 0.75, 1]
+                    result = await create_server(bridge).call_tool(
+                        "wait_for_research", {"technology": "automation", "timeout_seconds": 1}
+                    )
+                self.assertFalse(result.is_error)
+                self.assertEqual(
+                    payload(result),
+                    {
+                        "technology": "automation",
+                        "researched": False,
+                        "researching": True,
+                        "progress": progress,
+                        "timed_out": True,
+                        "waited_seconds": 1,
+                    },
+                )
+                self.assertEqual(sleeper.await_count, 4)
+                self.assertEqual(bridge.call.call_count, 5)
+
+    async def test_research_wait_handles_bridge_errors_and_unconfigured(self):
+        bridge = Mock()
+        bridge.call.side_effect = [
+            {"result": {"current": "automation"}},
+            BridgeError("not_connected", "Disconnected", {"request_id": "req"}),
+        ]
+        with patch("factorio_mcp.server.asyncio.sleep") as sleep:
+            result = await create_server(bridge).call_tool(
+                "wait_for_research", {"technology": "automation"}
+            )
+        self.assertTrue(result.is_error)
+        self.assertEqual(payload(result)["error"], "not_connected")
+        self.assertEqual(payload(result)["request_id"], "req")
+        sleep.assert_awaited_once_with(0.25)
+        result = await create_server(None).call_tool(
+            "wait_for_research", {"technology": "automation"}
+        )
+        self.assertTrue(result.is_error)
+        self.assertEqual(payload(result)["error"], "not_configured")
+
+    async def test_research_wait_schema_and_timeout_bounds(self):
+        bridge = Mock()
+        bridge.call.return_value = {"result": {"researched": ["automation"]}}
+        server = create_server(bridge)
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        tool = tools["wait_for_research"]
+        schema = tool.input_schema
+        self.assertEqual(schema["required"], ["technology"])
+        self.assertEqual(schema["properties"]["technology"]["minLength"], 1)
+        self.assertEqual(schema["properties"]["timeout_seconds"]["minimum"], 1)
+        self.assertEqual(schema["properties"]["timeout_seconds"]["maximum"], 50)
+        self.assertEqual(schema["properties"]["timeout_seconds"]["default"], 20)
+        for text in ("not queued", "Prefer this", "50 seconds", "60-second"):
+            self.assertIn(text, tool.description)
+        result = await server.call_tool(
+            "wait_for_research", {"technology": "automation", "timeout_seconds": 50}
+        )
+        self.assertFalse(result.is_error)
+        self.assertTrue(payload(result)["researched"])
+        bridge.call.reset_mock()
+        for timeout in (0, 51, float("inf"), float("nan")):
+            with self.subTest(timeout=timeout), self.assertRaises(ToolError):
+                await server.call_tool(
+                    "wait_for_research", {"technology": "automation", "timeout_seconds": timeout}
+                )
+        with self.assertRaises(ToolError):
+            await server.call_tool("wait_for_research", {"technology": ""})
+        bridge.call.assert_not_called()
+
     async def test_move_tool_description_explains_arrival_and_failure_distance(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         description = tools["move_to"].description

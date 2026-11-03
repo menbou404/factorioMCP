@@ -4,6 +4,7 @@ Only resource entities and water tiles are created by /c. All equipment and
 science packs come from pickup, mining, smelting, and normal hand crafting.
 """
 
+import asyncio
 import json
 import math
 import time
@@ -14,6 +15,7 @@ from logistics_line import entity_at, observe, place, tile_center
 from rcon.source import Client
 
 from factorio_mcp.bridge import RCON_FRAG_THRESHOLD, BridgeError
+from factorio_mcp.server import create_server
 from production_line import action, amount, bridge, call, password
 
 RAW = {"iron-plate", "copper-plate", "stone", "coal", "wood"}
@@ -422,20 +424,27 @@ def main():
     lab = entity_at(observe(), "lab", LAB)
     transfer(lab, "input", "automation-science-pack", 10)
     call("start_research", {"technology": "automation"})
+    server = create_server(bridge)
     deadline = time.monotonic() + 300
     while True:
         check_deadline(deadline)
         top_up("boiler", BOILER, threshold=3, target_count=10)
-        research = bridge.call("get_research_status")["result"]
-        if "automation" in (research["researched"] or []):
+        waited = asyncio.run(
+            server.call_tool(
+                "wait_for_research", {"technology": "automation", "timeout_seconds": 5}
+            )
+        )
+        research = json.loads(waited.content[0].text)
+        assert not waited.is_error, research
+        if research["researched"] is True:
             power_snapshot()
             print("POWER_RESEARCH_SUCCEEDED", flush=True)
             return
+        assert research["researching"] is True and research["timed_out"] is True, research
         if time.monotonic() >= next_report:
             print("research", json.dumps(research), flush=True)
             power_snapshot()
         report("researching")
-        time.sleep(2)
 
 
 if __name__ == "__main__":
