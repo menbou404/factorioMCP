@@ -30,6 +30,7 @@
 | [17-trial4-fixes.md](17-trial4-fixes.md) | 4 回目の試行で見つかった問題の修正（M9） |
 | [18-trial5-fixes.md](18-trial5-fixes.md) | 5 回目の試行で見つかった問題の修正（M10） |
 | [19-trial6-fixes.md](19-trial6-fixes.md) | 6 回目の試行で見つかった問題の修正（M11） |
+| [20-trial7-fixes.md](20-trial7-fixes.md) | 7 回目の試行で残った指摘の修正と探索済みの地図（M12） |
 
 ## 共通の不変条件
 
