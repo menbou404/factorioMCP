@@ -928,6 +928,40 @@ local function placement_blocking(state, character, prototype, position, directi
     end
   end
   if #valid_directions > 0 then detail.valid_directions = valid_directions end
+  if detail.reason == "placement_rules" then
+    local nearby, seen = {}, {}
+    for dx = -8, 8 do
+      for dy = -8, 8 do
+        -- Other directions at the requested position are covered above.
+        if dx ~= 0 or dy ~= 0 then
+          for _, candidate in ipairs({0, 4, 8, 12}) do
+            local snapped = snapped_position(prototype, {x = position.x + dx, y = position.y + dy},
+                                              candidate)
+            local key = snapped.x .. ":" .. snapped.y .. ":" .. candidate
+            if not seen[key] then
+              seen[key] = true
+              if distance_squared(snapped, position) <= 64 and
+                 character.can_place_entity{name = prototype.name, position = snapped,
+                                            direction = candidate} and
+                 character.surface.can_place_entity{name = prototype.name, position = snapped,
+                                                    direction = candidate, force = character.force} then
+                nearby[#nearby + 1] = {x = snapped.x, y = snapped.y, direction = candidate}
+              end
+            end
+          end
+        end
+      end
+    end
+    table.sort(nearby, function(a, b)
+      local da, db = distance_squared(a, position), distance_squared(b, position)
+      if da ~= db then return da < db end
+      if a.direction ~= b.direction then return a.direction < b.direction end
+      if a.x ~= b.x then return a.x < b.x end
+      return a.y < b.y
+    end)
+    while #nearby > 3 do table.remove(nearby) end
+    if #nearby > 0 then detail.nearby_positions = nearby end
+  end
   return detail
 end
 
@@ -1005,7 +1039,8 @@ local function do_check_placement(state, params)
           entity = prototype and prototype.name or nil, has_item = has_item,
           position = position, bounding_box = box, fluid_connections = fluid_connections,
           blocking = blocked.blocking, tiles = blocked.tiles,
-          valid_directions = blocked.valid_directions, blocked_reason = blocked.reason}
+          valid_directions = blocked.valid_directions, blocked_reason = blocked.reason,
+          nearby_positions = blocked.nearby_positions}
 end
 
 local function do_place(state, params)
