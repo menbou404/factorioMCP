@@ -29,7 +29,10 @@ HINTS = {
     "target_gone": "target_ref expires after 60 seconds. Refresh it with observe_nearby.",
     "not_visible": "Observe the placement area within 60 seconds before placing.",
     "action_conflict": "Wait with wait_for_action, or stop the running action with cancel_action.",
-    "blocked": "Mine or recover blocking entities, or find another position with check_placement.",
+    "blocked": (
+        "Check valid_directions for another orientation, mine or recover blocking entities, "
+        "or find another position with check_placement."
+    ),
     "invalid_target": "Check the entity and valid_roles in detail, then choose a supported target.",
     "out_of_range": "Move closer to the target, then observe_nearby again.",
     "missing_materials": "Gather the missing items before retrying.",
@@ -138,6 +141,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Observe nearby entities and blocked terrain tiles within 16 tiles. "
             "Target refs and placement observations expire after 60 seconds. "
             "Supported structures in your force include sorted inventory_roles. "
+            "Owned fluid structures include fluid_connections with port position, target_position, "
+            "direction, flow, fluidbox_index, and connected. "
+            "Use check_placement for snapped position and valid_directions before building. "
             "Follow offsets for additional pages."
         )
     )
@@ -232,6 +238,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         description=(
             "Place a supported entity within build reach, consuming one real inventory item."
             " Observe the placement area within 60 seconds before placing."
+            " Returns the snapped position and actual fluid_connections with port position,"
+            " target_position, direction, flow, fluidbox_index, and connected when present."
+            " Blocked errors may include valid_directions for another orientation."
         )
     )
     async def place_entity(
@@ -249,7 +258,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Check placement within build reach without consuming items or building. "
-            "Requires an observation of the placement area within 60 seconds."
+            "Requires an observation of the placement area within 60 seconds. "
+            "Returns the snapped position and preview fluid_connections with port position, "
+            "target_position, direction, flow, and fluidbox_index when present. "
+            "Blocked results may include blocking, tiles, blocked_reason (placement_rules), "
+            "and valid_directions for another orientation."
         )
     )
     async def check_placement(

@@ -350,6 +350,59 @@ local function string_filter(value)
   return set
 end
 
+local function preview_fluid_connections(prototype, position, direction)
+  local connections = {}
+  local vectors = {
+    [0] = {x = 0, y = -1}, [4] = {x = 1, y = 0},
+    [8] = {x = 0, y = 1}, [12] = {x = -1, y = 0}
+  }
+  for index, fluidbox in ipairs(prototype.fluidbox_prototypes or {}) do
+    for _, connection in ipairs(fluidbox.pipe_connections) do
+      if connection.connection_type == "normal" then
+        -- The API supplies an offset for each cardinal entity direction.
+        local offset = connection.positions[direction / 4 + 1]
+        local port_direction = (connection.direction + direction) % 16
+        local vector = vectors[port_direction]
+        if offset and vector then
+          local port = {x = position.x + offset.x, y = position.y + offset.y}
+          connections[#connections + 1] = {
+            position = port,
+            target_position = {x = port.x + vector.x, y = port.y + vector.y},
+            direction = port_direction, flow = connection.flow_direction, fluidbox_index = index
+          }
+        end
+      end
+    end
+  end
+  if #connections > 0 then return connections end
+end
+
+local function placed_fluid_connections(entity)
+  local connections = {}
+  local fluidbox = entity.fluidbox
+  if not fluidbox then return nil end
+  for index = 1, #fluidbox do
+    for _, connection in ipairs(fluidbox.get_pipe_connections(index)) do
+      if connection.connection_type == "normal" then
+        local position, target = connection.position, connection.target_position
+        local dx, dy = target.x - position.x, target.y - position.y
+        local direction
+        if dx > 0 then direction = defines.direction.east
+        elseif dx < 0 then direction = defines.direction.west
+        elseif dy > 0 then direction = defines.direction.south
+        else direction = defines.direction.north end
+        connections[#connections + 1] = {
+          position = {x = position.x, y = position.y},
+          target_position = {x = target.x, y = target.y},
+          direction = direction, flow = connection.flow_direction, fluidbox_index = index,
+          connected = connection.target ~= nil
+        }
+      end
+    end
+  end
+  if #connections > 0 then return connections end
+end
+
 local function do_observe(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -460,6 +513,7 @@ local function do_observe(state, params)
       if fluid then fluids[#fluids + 1] = {name = fluid.name, amount = fluid.amount} end
     end
     if #fluids > 0 then observed.fluids = fluids end
+    if observed.owned then observed.fluid_connections = placed_fluid_connections(entity) end
     if entity.type == "electric-pole" or entity.prototype.electric_energy_source_prototype then
       -- Some entity types cannot expose a network ID even with an electric source.
       local ok, network_id = pcall(function() return entity.electric_network_id end)
@@ -692,6 +746,15 @@ local function do_craft(state, params)
   return action
 end
 
+local function snapped_position(prototype, position, direction)
+  local width, height = prototype.tile_width, prototype.tile_height
+  if direction == 4 or direction == 12 then width, height = height, width end
+  return {
+    x = width % 2 == 1 and math.floor(position.x) + 0.5 or math.floor(position.x + 0.5),
+    y = height % 2 == 1 and math.floor(position.y) + 0.5 or math.floor(position.y + 0.5)
+  }
+end
+
 local function placement_bounding_box(prototype, position, direction)
   local box = prototype.collision_box
   local left, top = box.left_top.x, box.left_top.y
@@ -704,7 +767,9 @@ local function placement_bounding_box(prototype, position, direction)
 end
 
 local function placement_blocking(character, prototype, position, direction)
-  local area = placement_bounding_box(prototype, position, direction)
+  -- Keep the requested position so every alternative direction snaps independently.
+  local area = placement_bounding_box(prototype, snapped_position(prototype, position, direction),
+                                      direction)
   local blocking = {}
   for _, entity in pairs(character.surface.find_entities_filtered{area = area}) do
     if entity.valid and entity ~= character then
@@ -723,7 +788,22 @@ local function placement_blocking(character, prototype, position, direction)
       if tile.collides_with(layer) then tiles[tile.name] = true; break end
     end
   end
-  return {blocking = blocking, tiles = sorted_keys(tiles)}
+  local tile_names = sorted_keys(tiles)
+  local detail = {blocking = blocking, tiles = tile_names}
+  if #blocking == 0 and #tile_names == 0 then detail.reason = "placement_rules" end
+  local valid_directions = {}
+  for _, candidate in ipairs({0, 4, 8, 12}) do
+    if candidate ~= direction then
+      local snapped = snapped_position(prototype, position, candidate)
+      if character.can_place_entity{name = prototype.name, position = snapped, direction = candidate}
+         and character.surface.can_place_entity{name = prototype.name, position = snapped,
+                                                direction = candidate, force = character.force} then
+        valid_directions[#valid_directions + 1] = candidate
+      end
+    end
+  end
+  if #valid_directions > 0 then detail.valid_directions = valid_directions end
+  return detail
 end
 
 local function validate_placement(state, character, params, require_item)
@@ -739,7 +819,11 @@ local function validate_placement(state, character, params, require_item)
      math.abs(params.x) > 1000000 or math.abs(params.y) > 1000000 then
     return nil, "invalid_input"
   end
-  local position = {x = params.x, y = params.y}
+  local item_proto = prototypes.item[params.item]
+  local prototype = item_proto and item_proto.place_result
+  local requested_position = {x = params.x, y = params.y}
+  local position = prototype and snapped_position(prototype, requested_position, direction) or
+                   requested_position
   if distance_squared(character.position, position) >
      character.build_distance * character.build_distance then
     return nil, "out_of_range", range_detail(character, position, character.build_distance)
@@ -751,9 +835,8 @@ local function validate_placement(state, character, params, require_item)
        (observation.radius or OBSERVATION_RADIUS) ^ 2 then
     return nil, "not_visible", observation_detail(state)
   end
-  local item_proto = prototypes.item[params.item]
-  if not item_proto or not item_proto.place_result then return nil, "invalid_target" end
-  local entity_name = item_proto.place_result.name
+  if not prototype then return nil, "invalid_target" end
+  local entity_name = prototype.name
   local inventory = character.get_main_inventory()
   local has_item = inventory and inventory.get_item_count({name = params.item, quality = "normal"}) >= 1
   if require_item and not has_item then
@@ -761,11 +844,11 @@ local function validate_placement(state, character, params, require_item)
   end
   if not character.can_place_entity{name = entity_name, position = position,
                                      direction = direction} then
-    return nil, "blocked", placement_blocking(character, item_proto.place_result, position, direction)
+    return nil, "blocked", placement_blocking(character, prototype, requested_position, direction)
   end
   if not character.surface.can_place_entity{name = entity_name, position = position,
                                              direction = direction, force = character.force} then
-    return nil, "blocked", placement_blocking(character, item_proto.place_result, position, direction)
+    return nil, "blocked", placement_blocking(character, prototype, requested_position, direction)
   end
   return {name = entity_name, position = position, direction = direction,
           inventory = inventory}
@@ -782,18 +865,22 @@ local function do_check_placement(state, params)
   local has_item = item_proto ~= nil and inventory ~= nil and
     inventory.get_item_count({name = params.item, quality = "normal"}) >= 1
   local direction = params.direction or defines.direction.north
-  local box
-  if prototype and (direction == 0 or direction == 4 or direction == 8 or direction == 12) and
+  local position, box, fluid_connections
+  if prototype and PLACEABLE_ITEMS[params.item] and params.surface == character.surface.name and
+     (direction == 0 or direction == 4 or direction == 8 or direction == 12) and
      type(params.x) == "number" and type(params.y) == "number" and
      params.x == params.x and params.y == params.y and
      math.abs(params.x) <= 1000000 and math.abs(params.y) <= 1000000 then
-    box = placement_bounding_box(prototype, {x = params.x, y = params.y}, direction)
+    position = snapped_position(prototype, {x = params.x, y = params.y}, direction)
+    box = placement_bounding_box(prototype, position, direction)
+    fluid_connections = preview_fluid_connections(prototype, position, direction)
   end
+  local blocked = reason == "blocked" and detail or {}
   return {placeable = placement ~= nil, reason = reason,
           entity = prototype and prototype.name or nil, has_item = has_item,
-          bounding_box = box,
-          blocking = reason == "blocked" and detail.blocking or nil,
-          tiles = reason == "blocked" and detail.tiles or nil}
+          position = position, bounding_box = box, fluid_connections = fluid_connections,
+          blocking = blocked.blocking, tiles = blocked.tiles,
+          valid_directions = blocked.valid_directions, blocked_reason = blocked.reason}
 end
 
 local function do_place(state, params)
@@ -813,10 +900,11 @@ local function do_place(state, params)
   if not created or not created.valid then
     inventory.insert(item)
     return nil, "blocked", placement_blocking(character, prototypes.entity[placement.name],
-                                              placement.position, placement.direction)
+                                              {x = params.x, y = params.y}, placement.direction)
   end
   return {name = created.name, position = position_data(created),
-          direction = created.direction, consumed_item = params.item}
+          direction = created.direction, consumed_item = params.item,
+          fluid_connections = placed_fluid_connections(created)}
 end
 
 local function do_rotate(state, params)

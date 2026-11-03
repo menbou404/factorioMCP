@@ -33,6 +33,27 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_placement_tool_descriptions_explain_preview_metadata(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name in ("check_placement", "place_entity", "observe_nearby"):
+            with self.subTest(name=name):
+                for field in ("snapped position", "fluid_connections", "valid_directions"):
+                    self.assertIn(field, tools[name].description)
+        self.assertIn("connected", tools["observe_nearby"].description)
+        self.assertIn("blocked_reason", tools["check_placement"].description)
+
+    async def test_blocked_placement_preserves_rules_and_direction_advice(self):
+        bridge = Mock()
+        detail = {"reason": "placement_rules", "valid_directions": [4, 12]}
+        bridge.call.side_effect = BridgeError("blocked", detail=detail)
+        result = await create_server(bridge).call_tool(
+            "place_entity", {"item": "offshore-pump", "surface": "nauvis", "x": 1, "y": 2}
+        )
+        self.assertTrue(result.is_error)
+        value = payload(result)
+        self.assertEqual(value["detail"], detail)
+        self.assertIn("valid_directions", value["hint"])
+
     async def test_expiry_hints_mention_60_seconds(self):
         for code in ("target_gone", "not_visible"):
             with self.subTest(code=code):

@@ -367,9 +367,32 @@ def main():
     )
     print("lab craft trigger: automation-science-pack researched", flush=True)
     walk((20, -18))
-    place("offshore-pump", PUMP, 12)
-    place("boiler", BOILER)
-    place("steam-engine", ENGINE)
+    for name, position, direction in [
+        ("offshore-pump", PUMP, 12),
+        ("boiler", BOILER, 0),
+        ("steam-engine", ENGINE, 0),
+    ]:
+        observe()
+        params = {
+            "item": name,
+            "surface": "nauvis",
+            "x": position[0],
+            "y": position[1],
+            "direction": direction,
+        }
+        checked = call("check_placement", params)
+        assert checked["placeable"] and checked["has_item"], (name, checked)
+        if name == "boiler":
+            connections = checked.get("fluid_connections", [])
+            print("boiler preview fluid_connections", json.dumps(connections), flush=True)
+            assert len(connections) == 3, connections
+        placed = call("place_entity", params)
+        assert checked["position"] == {
+            "x": placed["position"]["x"],
+            "y": placed["position"]["y"],
+        }, (name, checked, placed)
+    pump = entity_at(observe(), "offshore-pump", PUMP)
+    assert any(c.get("connected") is True for c in pump.get("fluid_connections", [])), pump
     place("lab", LAB)
     assert all(math.dist(a, b) <= 7 for a, b in zip(POLES, POLES[1:], strict=False)), POLES
     for position in POLES:
