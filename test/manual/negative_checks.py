@@ -720,6 +720,37 @@ def main():
         record("craft shortage lists raw materials", False, "unexpected success")
     record("raw shortage check keeps inventory", items() == before)
 
+    # M11-L: the cleared area west of the character is free and within build reach.
+    before = items()
+    item = next(
+        (name for name in ("stone-furnace", "wooden-chest") if before.get(name, 0) > 0),
+        None,
+    )
+    if item is None:
+        raise RuntimeError("M11-L requires a held stone furnace or wooden chest")
+    current = bridge.call("get_agent_status")["result"]["position"]
+    offset = 0.5 if item == "wooden-chest" else 0
+    free_position = {
+        "surface": current["surface"],
+        "x": math.floor(current["x"]) - 5 + offset,
+        "y": math.floor(current["y"]) + offset,
+    }
+    bridge.call("observe_nearby")  # Default radius 16 covers the free point.
+    bridge.call("observe_nearby", {"radius": 2})
+    checked = bridge.call("check_placement", {"item": item, **free_position})["result"]
+    record(
+        "older wide observation still allows placement",
+        checked.get("placeable") is True
+        and 4
+        <= math.hypot(
+            checked["position"]["x"] - current["x"], checked["position"]["y"] - current["y"]
+        )
+        <= 6
+        and items() == before
+        and bridge.call("get_agent_status")["result"]["position"] == current,
+        json.dumps(checked),
+    )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

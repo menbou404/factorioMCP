@@ -1,6 +1,7 @@
 local PROTOCOL_VERSION = 1
 local AGENT_ID = "agent-1"
 local MAX_OBSERVATIONS = 100
+local MAX_RECENT_OBSERVATIONS = 8
 local OBSERVATION_RADIUS = 16
 local TARGET_TTL_TICKS = 60 * 60
 local ACTION_TIMEOUT_TICKS = 60 * 120
@@ -48,11 +49,18 @@ local function ensure_storage()
     next_target_id = 1,
     targets = {},
     last_observation = nil,
+    recent_observations = {},
     last_heartbeat_tick = nil
   }
   storage.ai_mcp.next_action_id = storage.ai_mcp.next_action_id or 1
   storage.ai_mcp.next_target_id = storage.ai_mcp.next_target_id or 1
   storage.ai_mcp.targets = storage.ai_mcp.targets or {}
+  if not storage.ai_mcp.recent_observations then
+    storage.ai_mcp.recent_observations = {}
+    if storage.ai_mcp.last_observation then
+      storage.ai_mcp.recent_observations[1] = storage.ai_mcp.last_observation
+    end
+  end
   storage.ai_mcp.completed_actions = storage.ai_mcp.completed_actions or {}
   storage.ai_mcp.completed_order = storage.ai_mcp.completed_order or {}
   storage.ai_mcp.hand_crafted = storage.ai_mcp.hand_crafted or {}
@@ -580,6 +588,10 @@ local function do_observe(state, params)
   local output = {}
   state.last_observation = {position = {x = character.position.x, y = character.position.y},
                             surface = character.surface.name, tick = game.tick, radius = radius}
+  state.recent_observations[#state.recent_observations + 1] = state.last_observation
+  if #state.recent_observations > MAX_RECENT_OBSERVATIONS then
+    table.remove(state.recent_observations, 1)
+  end
   for index = entity_offset + 1, math.min(entity_offset + MAX_OBSERVATIONS, #visible) do
     local entity = visible[index]
     local observed = {
@@ -1053,11 +1065,17 @@ local function validate_placement(state, character, params, require_item)
      character.build_distance * character.build_distance then
     return nil, "out_of_range", range_detail(character, position, character.build_distance)
   end
-  local observation = state.last_observation
-  if not observation or observation.surface ~= character.surface.name or
-     game.tick - observation.tick > TARGET_TTL_TICKS or
-     distance_squared(observation.position, position) >
-       (observation.radius or OBSERVATION_RADIUS) ^ 2 then
+  local visible = false
+  for _, observation in ipairs(state.recent_observations) do
+    if observation.surface == character.surface.name and
+       game.tick - observation.tick <= TARGET_TTL_TICKS and
+       distance_squared(observation.position, position) <=
+         (observation.radius or OBSERVATION_RADIUS) ^ 2 then
+      visible = true
+      break
+    end
+  end
+  if not visible then
     return nil, "not_visible", observation_detail(state)
   end
   if not prototype then return nil, "invalid_target" end
@@ -1450,6 +1468,8 @@ commands.add_command("ai_mcp_admin", "AI MCP administrator reset (RCON only)",
     state.completed_actions = {}
     state.completed_order = {}
     state.targets = {}
+    state.last_observation = nil
+    state.recent_observations = {}
     spawn_character()
     reply(nil, valid_character(state), status(state),
           valid_character(state) and nil or "spawn_blocked")
