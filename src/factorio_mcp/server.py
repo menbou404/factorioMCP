@@ -31,7 +31,8 @@ HINTS = {
     "action_conflict": "Wait with wait_for_action, or stop the running action with cancel_action.",
     "blocked": (
         "Check valid_directions for another orientation, mine or recover blocking entities, "
-        "or find another position with check_placement."
+        "or find another position with check_placement. "
+        "If reason is character_in_the_way, move the character away first."
     ),
     "invalid_target": "Check the entity and valid_roles in detail, then choose a supported target.",
     "out_of_range": "Move closer to the target, then observe_nearby again.",
@@ -246,6 +247,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " Returns the snapped position and actual fluid_connections with port position,"
             " target_position, direction, flow, fluidbox_index, and connected when present."
             " Blocked errors may include valid_directions for another orientation."
+            " detail.reason is character_in_the_way when the character blocks placement"
+            " (move the character away first), or placement_rules when no blocking entities,"
+            " tiles, or character explain the failure."
         )
     )
     async def place_entity(
@@ -266,8 +270,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Requires an observation of the placement area within 60 seconds. "
             "Returns the snapped position and preview fluid_connections with port position, "
             "target_position, direction, flow, and fluidbox_index when present. "
-            "Blocked results may include blocking, tiles, blocked_reason (placement_rules), "
-            "and valid_directions for another orientation."
+            "Blocked results may include blocking, tiles, blocked_reason, "
+            "and valid_directions for another orientation. "
+            "blocked_reason is character_in_the_way when the character blocks placement "
+            "(move the character away first), or placement_rules when no blocking entities, "
+            "tiles, or character explain the failure."
         )
     )
     async def check_placement(

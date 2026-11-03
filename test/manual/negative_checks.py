@@ -325,6 +325,70 @@ def main():
         bridge.call("cancel_action", {"action_id": started["action_id"]})
     action("move_to", return_position)
 
+    # M8-E: preview collisions without consuming the spare furnace or moving the character.
+    before = items()
+    if before.get("stone-furnace", 0) < 1:
+        raise RuntimeError(
+            "M8-E checks require the spare stone furnace from the occupied-tile check"
+        )
+    current = bridge.call("get_agent_status")["result"]["position"]
+    bridge.call("observe_nearby")
+    snapped = {axis: math.floor(current[axis] + 0.5) for axis in ("x", "y")}
+    response = bridge.call(
+        "check_placement",
+        {"item": "stone-furnace", "surface": current["surface"], **snapped},
+    )
+    checked = response["result"]
+    record(
+        "placement under the character reports character_in_the_way",
+        response.get("ok") is True
+        and checked.get("placeable") is False
+        and checked.get("reason") == "blocked"
+        and checked.get("blocked_reason") == "character_in_the_way"
+        and checked.get("has_item") is True
+        and not any(entity["type"] == "character" for entity in checked.get("blocking", []))
+        and items() == before
+        and bridge.call("get_agent_status")["result"]["position"] == current,
+        json.dumps(checked),
+    )
+
+    # The production fixture's drill at (6, 6) overlaps iron ore; (4, 4) stays clear of it.
+    action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+    observed = bridge.call("observe_nearby", {"types": ["mining-drill", "resource"], "radius": 8})[
+        "result"
+    ]
+    drill = next(
+        entity
+        for entity in observed["entities"]
+        if entity["name"] == "burner-mining-drill"
+        and entity["owned"]
+        and entity["x"] == 6
+        and entity["y"] == 6
+    )
+    ore_under_drill = any(
+        entity["type"] == "resource"
+        and abs(entity["x"] - drill["x"]) < 1
+        and abs(entity["y"] - drill["y"]) < 1
+        for entity in observed["entities"]
+    )
+    response = bridge.call(
+        "check_placement",
+        {"item": "stone-furnace", "surface": "nauvis", "x": drill["x"], "y": drill["y"]},
+    )
+    checked = response["result"]
+    blocking = checked.get("blocking", [])
+    record(
+        "placement on ore lists no resources",
+        ore_under_drill
+        and response.get("ok") is True
+        and checked.get("placeable") is False
+        and checked.get("reason") == "blocked"
+        and checked.get("blocked_reason") != "character_in_the_way"
+        and any(entity["name"] == "burner-mining-drill" for entity in blocking)
+        and all(entity["type"] != "resource" for entity in blocking),
+        json.dumps(checked),
+    )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

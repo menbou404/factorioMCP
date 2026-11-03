@@ -56,6 +56,39 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("connected", tools["observe_nearby"].description)
         self.assertIn("blocked_reason", tools["check_placement"].description)
 
+    async def test_placement_tool_descriptions_explain_blocked_reasons(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name, field in (
+            ("check_placement", "blocked_reason"),
+            ("place_entity", "detail.reason"),
+        ):
+            with self.subTest(name=name):
+                description = tools[name].description
+                for text in (
+                    field,
+                    "character_in_the_way",
+                    "move the character away first",
+                    "placement_rules",
+                    "no blocking entities, tiles, or character",
+                ):
+                    self.assertIn(text, description)
+
+    async def test_blocked_character_hint_explains_moving_away(self):
+        bridge = Mock()
+        detail = {"reason": "character_in_the_way", "blocking": {}, "tiles": {}}
+        bridge.call.side_effect = BridgeError("blocked", detail=detail)
+        result = await create_server(bridge).call_tool(
+            "place_entity", {"item": "stone-furnace", "surface": "nauvis", "x": 1, "y": 2}
+        )
+        self.assertTrue(result.is_error)
+        value = payload(result)
+        self.assertEqual(
+            value["detail"], {"reason": "character_in_the_way", "blocking": [], "tiles": []}
+        )
+        self.assertEqual(value["hint"], HINTS["blocked"])
+        self.assertIn("character_in_the_way", value["hint"])
+        self.assertIn("move the character away first", value["hint"])
+
     async def test_blocked_placement_preserves_rules_and_direction_advice(self):
         bridge = Mock()
         detail = {"reason": "placement_rules", "valid_directions": [4, 12]}
