@@ -3,7 +3,10 @@ import json
 import unittest
 from unittest.mock import Mock, patch
 
+from mcp import Client
+from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import BaseModel, ValidationError
 
 from factorio_mcp.bridge import BridgeError, parse_bridge_response
 from factorio_mcp.server import HINTS, _normalize_result, create_server
@@ -33,6 +36,139 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mining_description_explains_conflicting_operations(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        description = tools["mine_entity"].description
+        self.assertIn("Crafting runs alongside mining", description)
+        self.assertIn(
+            "While mining runs, place_entity, transfer_item, rotate_entity, and set_recipe "
+            "return action_conflict",
+            description,
+        )
+
+    async def test_move_description_explains_distance_limit_and_intermediate_points(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        description = tools["move_to"].description
+        self.assertIn("within 128 tiles in a straight line from the character", description)
+        self.assertIn("For farther goals, move via intermediate points", description)
+
+    async def test_input_errors_through_mcp_client(self):
+        cases = [
+            ("wait_for_action", {}, {"action_id": "missing"}),
+            (
+                "mine_entity",
+                {"target_ref": "42", "count": 160},
+                {"count": "less_than_equal"},
+            ),
+            (
+                "mine_entity",
+                {"target_ref": "42", "count": "2"},
+                {"count": "int_type"},
+            ),
+            (
+                "move_to",
+                {"surface": "nauvis", "x": "a", "y": 0},
+                {"x": "float_parsing"},
+            ),
+            ("move_to", {}, {"surface": "missing", "x": "missing", "y": "missing"}),
+            ("observe_nearby", {"types": [1]}, {"types.0": "string_type"}),
+        ]
+        # Exercise both the modern request dispatcher and the stream/session path.
+        for mode in ("auto", "legacy"):
+            async with Client(create_server(None), mode=mode) as client:
+                for name, arguments, expected in cases:
+                    with self.subTest(mode=mode, tool=name, arguments=arguments):
+                        result = await client.call_tool(name, arguments)
+                        self.assertTrue(result.is_error)
+                        self.assertTrue(result.model_dump(by_alias=True)["isError"])
+                        self.assertEqual(len(result.content), 1)
+                        value = payload(result)
+                        self.assertIs(value["ok"], False)
+                        self.assertEqual(value["error"], "invalid_input")
+                        self.assertTrue(value["message"])
+                        self.assertEqual(value["hint"], HINTS["invalid_input"])
+                        errors = value["detail"]["errors"]
+                        self.assertEqual({e["field"]: e["type"] for e in errors}, expected)
+                        for error in errors:
+                            self.assertEqual(set(error), {"field", "type", "message"})
+                            self.assertTrue(error["message"])
+                result = await client.call_tool("wait_for_action", {"action_id": "42"})
+                self.assertTrue(result.is_error)
+                self.assertEqual(payload(result)["error"], "not_configured")
+
+    async def test_input_validation_covers_every_tool_schema(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        async with Client(server) as client:
+            for tool in await server.list_tools():
+                properties = tool.input_schema.get("properties", {})
+                if not properties:
+                    continue  # No-argument tools have no fields to validate.
+                with self.subTest(tool=tool.name):
+                    # None violates every current tool's first parameter schema.
+                    field = next(iter(properties))
+                    result = await client.call_tool(tool.name, {field: None})
+                    self.assertTrue(result.is_error)
+                    value = payload(result)
+                    self.assertEqual(value["error"], "invalid_input")
+                    self.assertEqual(value["hint"], HINTS["invalid_input"])
+                    self.assertIn(field, [e["field"] for e in value["detail"]["errors"]])
+        bridge.call.assert_not_called()
+
+    async def test_extra_arguments_keep_sdk_behavior(self):
+        # The installed SDK ignores extra arguments rather than rejecting them.
+        async with Client(create_server(None)) as client:
+            result = await client.call_tool("wait_for_action", {"action_id": "42", "extra": 1})
+        self.assertTrue(result.is_error)
+        self.assertEqual(payload(result)["error"], "not_configured")
+
+    async def test_mod_invalid_input_gets_hint_without_validation_detail(self):
+        bridge = Mock()
+        bridge.call.side_effect = BridgeError("invalid_input")
+        async with Client(create_server(bridge)) as client:
+            result = await client.call_tool("factorio_ping", {})
+        self.assertTrue(result.is_error)
+        value = payload(result)
+        self.assertEqual(value["error"], "invalid_input")
+        self.assertEqual(value["hint"], HINTS["invalid_input"])
+        self.assertNotIn("detail", value)
+
+    async def test_tool_body_validation_errors_keep_sdk_behavior(self):
+        class BodyModel(BaseModel):
+            count: int
+
+        async def body_validation_error() -> str:
+            BodyModel.model_validate({})
+            return "unreachable"
+
+        async def deliberate_body_error() -> str:
+            try:
+                BodyModel.model_validate({})
+            except ValidationError as exc:
+                raise ToolError("body failed") from exc
+            return "unreachable"
+
+        results = []
+        for server in (MCPServer("baseline"), create_server(None)):
+            server.add_tool(body_validation_error)
+            server.add_tool(deliberate_body_error)
+            async with Client(server) as client:
+                for name in ("body_validation_error", "deliberate_body_error", "unknown_tool"):
+                    with self.subTest(server=server.name, tool=name):
+                        result = await client.call_tool(name, {})
+                        self.assertTrue(result.is_error)
+                        results.append(result.content[0].text)
+        self.assertEqual(results[:3], results[3:])
+
+    async def test_success_through_mcp_client_is_unchanged(self):
+        bridge = Mock()
+        bridge.call.return_value = {"tick": 12, "result": {"connected": True}}
+        async with Client(create_server(bridge)) as client:
+            result = await client.call_tool("factorio_ping", {})
+        self.assertFalse(result.is_error)
+        self.assertEqual(payload(result), {"ok": True, "tick": 12, "connected": True})
+        bridge.call.assert_called_once_with("ping", None)
+
     async def test_count_descriptions_state_input_limits(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         for name in ("mine_entity", "craft", "transfer_item"):

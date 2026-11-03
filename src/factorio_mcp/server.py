@@ -10,8 +10,10 @@ import time
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
-from mcp.types import CallToolResult, TextContent
-from pydantic import Field
+from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from mcp.types import CallToolResult, InputRequiredResult, TextContent
+from pydantic import Field, ValidationError
 
 from .bridge import BridgeError, FactorioBridge
 
@@ -26,6 +28,10 @@ FilterNames = Annotated[
 ]
 
 HINTS = {
+    "invalid_input": (
+        "Check the tool's input schema and argument values. "
+        "When present, detail.errors lists each invalid field."
+    ),
     "target_gone": "target_ref expires after 60 seconds. Refresh it with observe_nearby.",
     "not_visible": (
         "Observe the placement area before placing."
@@ -140,8 +146,42 @@ def _success_value(operation: str, response: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+class _InputErrorServer(MCPServer):
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any], context: Context | None = None
+    ) -> CallToolResult | InputRequiredResult:
+        try:
+            return await super().call_tool(name, arguments, context)
+        except ToolError as exc:
+            # Tool.run wraps argument validation directly in ToolError. Body/output
+            # validation failures use UnexpectedToolError; nested errors have another
+            # wrapper as their cause. Leave both on the SDK's existing error path.
+            if isinstance(exc, UnexpectedToolError) or not isinstance(
+                exc.__cause__, ValidationError
+            ):
+                raise
+            errors = [
+                {
+                    "field": ".".join(str(part) for part in error["loc"]),
+                    "type": error["type"],
+                    "message": error["msg"],
+                }
+                for error in exc.__cause__.errors(
+                    include_url=False, include_context=False, include_input=False
+                )
+            ]
+            result = _error_response(
+                BridgeError(
+                    "invalid_input", "Tool arguments failed validation.", {"errors": errors}
+                )
+            )
+            # Preserve call_tool's exception contract. The SDK's wire handler turns
+            # this message into a text tool result with isError=true.
+            raise ToolError(result.content[0].text) from exc
+
+
 def create_server(bridge: FactorioBridge | None) -> MCPServer:
-    server = MCPServer("factorio-ai", version="0.1.0")
+    server = _InputErrorServer("factorio-ai", version="0.1.0")
 
     async def call(operation: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         if bridge is None:
@@ -292,6 +332,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Walk to a position on the current surface. Arrival is within 0.5 tiles. "
+            "The goal must be within 128 tiles in a straight line from the character. "
+            "For farther goals, move via intermediate points. "
             "If the goal is blocked, succeeds within 1.5 tiles with detail.goal_blocked = true "
             "and detail.distance. Blocked or timeout failures include detail.distance and "
             "detail.goal. path_not_found includes goal details and may include goal_tiles, "
@@ -307,7 +349,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         description=(
             "Mine an observed entity within reach over normal game time. Returns an action ID. "
             "count is 1-100. "
-            "Crafting runs alongside mining. Only one walk/mine at a time."
+            "Crafting runs alongside mining. Only one walk/mine at a time. "
+            "While mining runs, place_entity, transfer_item, rotate_entity, and set_recipe "
+            "return action_conflict."
         )
     )
     async def mine_entity(target_ref: RequiredText, count: Count = 1) -> CallToolResult:
