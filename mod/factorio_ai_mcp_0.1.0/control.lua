@@ -115,10 +115,29 @@ local function stop_character(character)
   character.mining_state = {mining = false}
 end
 
+local function mine_partial_detail(character, action, detail)
+  detail = detail or {}
+  detail.gained = action.gained or 0
+  detail.inventory = nil
+  if character and character.valid then
+    local inventory = character.get_main_inventory()
+    if inventory and inventory.valid then
+      -- Cancellation and early tick failures can precede the next progress update.
+      local current = inventory.get_item_count()
+      detail.gained = detail.gained + math.max(0, current - (action.last_inventory_count or current))
+      detail.inventory = inventory.get_contents()
+    end
+  end
+  return detail
+end
+
 local function finish_action(state, status, error_code, detail)
   local action = state.action
   if not action then return end
   stop_character(state.character)
+  if action.type == "mine" and status ~= "succeeded" then
+    detail = mine_partial_detail(state.character, action, detail)
+  end
   action.status = status
   action.error = error_code
   action.detail = detail
@@ -282,24 +301,33 @@ local function do_mine(state, params)
   local target, target_error, detail = target_entity(character, params,
     math.max(character.resource_reach_distance, character.reach_distance), true)
   if not target then return nil, target_error, detail end
-  local reach = target.type == "resource" and character.resource_reach_distance or
+  local reach = (target.type == "resource" or target.type == "tree" or
+                 target.type == "simple-entity") and character.resource_reach_distance or
                 character.reach_distance
-  if distance_squared(character.position, target.position) > reach * reach then
+  if target.type == "resource" and
+     distance_squared(character.position, target.position) > reach * reach then
     return nil, "out_of_range", range_detail(character, target.position, reach)
   end
   if target.force ~= character.force and target.force.name ~= "neutral" then
     return nil, "invalid_target", {entity = target.name, reason = "other_force"}
   end
   if not target.minable then return nil, "invalid_target" end
+  if not character.can_reach_entity(target) then
+    return nil, "out_of_range", range_detail(character, target.position, reach)
+  end
   local inventory = character.get_main_inventory()
   if not inventory or inventory.is_full() then return nil, "inventory_full" end
   local before = inventory.get_item_count()
+  character.selected = target
+  if character.selected ~= target then
+    character.selected = nil
+    return nil, "invalid_target", {entity = target.name, reason = "not_selectable"}
+  end
   local result = begin_action(state, {
     type = "mine", target = target, reach = reach, goal_count = count, gained = 0,
     last_inventory_count = before,
     last_progress_tick = game.tick
   })
-  character.update_selected_entity(target.position)
   character.mining_state = {mining = true, position = target.position}
   return result
 end
@@ -1103,7 +1131,8 @@ script.on_event(defines.events.on_tick, function()
     finish_action(state, "failed", "connection_lost")
     return
   end
-  if action.type ~= "craft" and game.tick - action.started_tick > ACTION_TIMEOUT_TICKS then
+  if action.type ~= "craft" and action.type ~= "mine" and
+     game.tick - action.started_tick > ACTION_TIMEOUT_TICKS then
     finish_action(state, "failed", "timeout")
     return
   end
@@ -1162,10 +1191,12 @@ script.on_event(defines.events.on_tick, function()
       return
     end
     -- Actions saved before reach was recorded still use the target's reach rule.
-    local reach = action.reach or (target.type == "resource" and
+    local reach = action.reach or ((target.type == "resource" or target.type == "tree" or
+                  target.type == "simple-entity") and
                   character.resource_reach_distance or character.reach_distance)
-    if distance_squared(character.position, target.position) >
-       reach * reach then
+    if (target.type == "resource" and
+        distance_squared(character.position, target.position) > reach * reach) or
+       not character.can_reach_entity(target) then
       finish_action(state, "failed", "out_of_range",
                     range_detail(character, target.position, reach))
       return
@@ -1176,6 +1207,11 @@ script.on_event(defines.events.on_tick, function()
     end
     if game.tick - action.last_progress_tick >= 60 * 20 then
       finish_action(state, "failed", "blocked")
+      return
+    end
+    if character.selected ~= target then
+      character.selected = target
+      character.mining_state = {mining = true, position = target.position}
     end
   elseif action.type == "craft" then
     if character.crafting_queue_size == 0 then
