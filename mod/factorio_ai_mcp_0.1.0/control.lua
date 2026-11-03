@@ -789,27 +789,42 @@ local function placement_blocking(character, prototype, position, direction)
   -- Keep the requested position so every alternative direction snaps independently.
   local area = placement_bounding_box(prototype, snapped_position(prototype, position, direction),
                                       direction)
+  local layers = prototype.collision_mask.layers
+  local function overlaps_and_collides(entity)
+    if not entity.valid then return false end
+    local box = entity.bounding_box
+    if box.left_top.x < area.right_bottom.x and box.right_bottom.x > area.left_top.x and
+       box.left_top.y < area.right_bottom.y and box.right_bottom.y > area.left_top.y then
+      local entity_layers = entity.prototype.collision_mask.layers
+      for layer in pairs(layers) do
+        if entity_layers[layer] then return true end
+      end
+    end
+    return false
+  end
+  -- Check separately so the blocking list's cap cannot hide the character.
+  local character_in_the_way = overlaps_and_collides(character)
   local blocking = {}
   for _, entity in pairs(character.surface.find_entities_filtered{area = area}) do
-    if entity.valid and entity ~= character then
-      local box = entity.bounding_box
-      if box.left_top.x < area.right_bottom.x and box.right_bottom.x > area.left_top.x and
-         box.left_top.y < area.right_bottom.y and box.right_bottom.y > area.left_top.y then
-        blocking[#blocking + 1] = {name = entity.name, type = entity.type,
-                                  x = entity.position.x, y = entity.position.y}
-        if #blocking == 10 then break end
-      end
+    if entity ~= character and overlaps_and_collides(entity) then
+      blocking[#blocking + 1] = {name = entity.name, type = entity.type,
+                                x = entity.position.x, y = entity.position.y}
+      if #blocking == 10 then break end
     end
   end
   local tiles = {}
   for _, tile in pairs(character.surface.find_tiles_filtered{area = area}) do
-    for layer in pairs(prototype.collision_mask.layers) do
+    for layer in pairs(layers) do
       if tile.collides_with(layer) then tiles[tile.name] = true; break end
     end
   end
   local tile_names = sorted_keys(tiles)
   local detail = {blocking = blocking, tiles = tile_names}
-  if #blocking == 0 and #tile_names == 0 then detail.reason = "placement_rules" end
+  if character_in_the_way then
+    detail.reason = "character_in_the_way"
+  elseif #blocking == 0 and #tile_names == 0 then
+    detail.reason = "placement_rules"
+  end
   local valid_directions = {}
   for _, candidate in ipairs({0, 4, 8, 12}) do
     if candidate ~= direction then
