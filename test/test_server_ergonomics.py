@@ -36,6 +36,93 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_m14u_descriptions_and_schema(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for name in ("place_entity", "check_placement"):
+            tool = tools[name]
+            for text in (
+                "underground-belt",
+                "splitter",
+                "long-handed-inserter",
+                "pipe-to-ground",
+                "underground_type is only valid for underground-belt",
+                "default input",
+                "for output it is the direction items leave",
+            ):
+                with self.subTest(tool=name, text=text):
+                    self.assertIn(text, tool.description)
+            schema = tool.input_schema
+            self.assertNotIn("underground_type", schema.get("required", []))
+            parameter = schema["properties"]["underground_type"]
+            self.assertIsNone(parameter["default"])
+            self.assertIn({"enum": ["input", "output"], "type": "string"}, parameter["anyOf"])
+        for text in (
+            "belt_items",
+            "all transport lines",
+            "underground_type",
+            "neighbour = {x, y}",
+            "connection_type (normal or underground)",
+            "long-handed-inserter",
+            "pickup_position and drop_position",
+        ):
+            self.assertIn(text, tools["observe_nearby"].description)
+
+    async def test_underground_type_forwarded_only_when_set(self):
+        bridge = Mock()
+        bridge.call.return_value = {"result": {}}
+        server = create_server(bridge)
+        for name in ("place_entity", "check_placement"):
+            for item in ("underground-belt", "splitter", "long-handed-inserter", "pipe-to-ground"):
+                params = {"item": item, "surface": "nauvis", "x": 1, "y": 2, "direction": 4}
+                for optional in ({}, {"underground_type": None}):
+                    await server.call_tool(name, {**params, **optional})
+                    bridge.call.assert_called_with(name, params)
+                if item == "underground-belt":
+                    for underground_type in ("input", "output"):
+                        supplied = {**params, "underground_type": underground_type}
+                        await server.call_tool(name, supplied)
+                        bridge.call.assert_called_with(name, supplied)
+
+    async def test_underground_type_validation(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        for name in ("place_entity", "check_placement"):
+            params = {"item": "underground-belt", "surface": "nauvis", "x": 1, "y": 2}
+            for invalid in ("invalid", "INPUT", "", 1, False, {}, []):
+                with (
+                    self.subTest(tool=name, invalid=invalid),
+                    self.assertRaises(ToolError) as caught,
+                ):
+                    await server.call_tool(name, {**params, "underground_type": invalid})
+                self.assertEqual(json.loads(str(caught.exception))["error"], "invalid_input")
+            for item in ("transport-belt", "splitter", "long-handed-inserter", "pipe-to-ground"):
+                for underground_type in ("input", "output"):
+                    result = await server.call_tool(
+                        name, {**params, "item": item, "underground_type": underground_type}
+                    )
+                    self.assertTrue(result.is_error)
+                    self.assertEqual(payload(result)["error"], "invalid_input")
+        bridge.call.assert_not_called()
+
+    async def test_belt_items_normalize_and_observation_fields_survive(self):
+        cargo = [{"name": "iron-plate", "quality": "normal", "count": 3}]
+        for belt_type in ("transport-belt", "underground-belt", "splitter"):
+            for fields, expected in (
+                ({}, []),
+                ({"belt_items": {}}, []),
+                ({"belt_items": []}, []),
+                ({"belt_items": cargo}, cargo),
+            ):
+                entity = {"type": belt_type, **fields}
+                if belt_type == "underground-belt":
+                    entity.update(underground_type="output", neighbour={"x": 1.5, "y": 2.5})
+                expected_entity = {**entity}
+                if "belt_items" in fields:
+                    expected_entity["belt_items"] = expected
+                result = _normalize_result("observe_nearby", {"entities": [entity]})
+                self.assertEqual(result["entities"][0], expected_entity)
+                self.assertEqual(result["entities"][0].get("belt_items", []), expected)
+
     async def test_m13_descriptions_and_role_hint(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         for name in ("mine_entity", "wait_for_action"):
