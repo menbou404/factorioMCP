@@ -6,6 +6,7 @@ fixture's stone patch and the running stone furnace at (6, 4).
 
 import asyncio
 import json
+import math
 import time
 
 from factorio_mcp.bridge import BridgeError, parse_bridge_response
@@ -258,6 +259,21 @@ def main():
         record("target_ref survives 30 seconds", False, error.code)
     else:
         record("target_ref survives 30 seconds", True)
+
+    # M7-C: a north-facing 3x2 boiler snaps to half-tile x and integer y.
+    current = bridge.call("get_agent_status")["result"]["position"]
+    bridge.call("observe_nearby")
+    requested = {"x": current["x"] + 0.3, "y": current["y"] + 0.3}
+    checked = bridge.call(
+        "check_placement",
+        {"item": "boiler", "surface": current["surface"], **requested, "direction": 0},
+    )["result"]
+    expected = {"x": math.floor(requested["x"]) + 0.5, "y": math.floor(requested["y"] + 0.5)}
+    record(
+        "boiler placement snaps position",
+        checked.get("position") == expected,
+        json.dumps({"requested": requested, "position": checked.get("position")}),
+    )
 
     failed = [label for label, passed, _ in results if not passed]
     if failed:
