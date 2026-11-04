@@ -37,3 +37,16 @@ def position_in_tile_footprint(position, bounding_box):
         <= math.ceil(bounding_box["right_bottom"][axis] - epsilon) - 1
         for axis in ("x", "y")
     )
+
+
+def successful_batch_results(batch, expected_count):
+    """Require every ordered batch entry to succeed, including nested errors."""
+    entries = batch.get("results", [])
+    assert (
+        batch.get("succeeded") == expected_count
+        and batch.get("failed") == 0
+        and len(entries) == expected_count
+        and [entry.get("index") for entry in entries] == list(range(1, expected_count + 1))
+        and all(entry.get("ok") is True and "result" in entry for entry in entries)
+    ), f"Batch did not complete all {expected_count} entries: {batch}"
+    return [entry["result"] for entry in entries]

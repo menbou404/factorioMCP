@@ -1,6 +1,10 @@
 import unittest
 
-from manual.helpers import position_in_tile_footprint, select_automation_technology
+from manual.helpers import (
+    position_in_tile_footprint,
+    select_automation_technology,
+    successful_batch_results,
+)
 
 
 class TechnologySelectionTests(unittest.TestCase):
@@ -90,6 +94,43 @@ class TileFootprintTests(unittest.TestCase):
         ]:
             with self.subTest(position=position):
                 self.assertFalse(position_in_tile_footprint(position, box))
+
+
+class BatchResultTests(unittest.TestCase):
+    def test_returns_ordered_entry_results(self):
+        batch = {
+            "succeeded": 2,
+            "failed": 0,
+            "results": [
+                {"index": 1, "ok": True, "result": {"moved": 10}},
+                {"index": 2, "ok": True, "result": {"moved": 12}},
+            ],
+        }
+        self.assertEqual(successful_batch_results(batch, 2), [{"moved": 10}, {"moved": 12}])
+
+    def test_rejects_partial_failure_even_when_outer_call_succeeds(self):
+        batch = {
+            "succeeded": 1,
+            "failed": 1,
+            "results": [
+                {"index": 1, "ok": True, "result": {"moved": 10}},
+                {"index": 2, "ok": False, "error": "out_of_range"},
+            ],
+        }
+        with self.assertRaisesRegex(AssertionError, "out_of_range"):
+            successful_batch_results(batch, 2)
+
+    def test_rejects_missing_reordered_and_inconsistent_entries(self):
+        good = {"index": 1, "ok": True, "result": {}}
+        for entries in (
+            [],
+            [good, good],
+            [{**good, "index": 2}],
+            [{**good, "ok": False}],
+            [{"index": 1, "ok": True}],
+        ):
+            with self.subTest(entries=entries), self.assertRaises(AssertionError):
+                successful_batch_results({"succeeded": 1, "failed": 0, "results": entries}, 1)
 
 
 if __name__ == "__main__":
