@@ -235,6 +235,13 @@ local function finish_action(state, slot, status, error_code, detail)
     detail.distance = math.sqrt(distance_squared(state.character.position, action.goal))
     detail.goal = {x = action.goal.x, y = action.goal.y}
   end
+  if action.type == "move" and action.within ~= nil then
+    detail = detail or {}
+    detail.within = action.within
+    if state.character and state.character.valid then
+      detail.distance = math.sqrt(distance_squared(state.character.position, action.goal))
+    end
+  end
   action.status = status
   action.error = error_code
   action.detail = detail
@@ -254,6 +261,17 @@ local function finish_action(state, slot, status, error_code, detail)
   end
   state[slot] = nil
   if action.type == "move" then state.path_request_id = nil end
+end
+
+local function finish_move_within(state)
+  local action = state.action
+  if not action or action.type ~= "move" or action.within == nil or
+     not valid_character(state) then return false end
+  if distance_squared(state.character.position, action.goal) > action.within * action.within then
+    return false
+  end
+  finish_action(state, "action", "succeeded", nil, {position = position_data(state.character)})
+  return true
 end
 
 local function spawn_character()
@@ -420,6 +438,7 @@ local function request_path(state, character, goal)
     start = character.position,
     goal = goal,
     force = character.force,
+    radius = action.within, -- double; nil preserves the API's default radius of 1.
     entity_to_ignore = character,
     can_open_gates = true
   }
@@ -436,16 +455,26 @@ local function do_move(state, params)
      math.abs(params.x) > 1000000 or math.abs(params.y) > 1000000 then
     return nil, "invalid_input"
   end
+  if params.within ~= nil and (type(params.within) ~= "number" or
+     params.within ~= params.within or params.within < 0.5 or params.within > 10) then
+    return nil, "invalid_input"
+  end
   if params.surface ~= character.surface.name then return nil, "out_of_range" end
   local goal = {x = params.x, y = params.y}
   if distance_squared(character.position, goal) > 128 * 128 then
     return nil, "out_of_range", range_detail(character, goal, 128)
   end
   local result = begin_action(state, "action", {
-    type = "move", goal = goal, path = nil, path_index = 1,
+    type = "move", goal = goal, within = params.within, path = nil, path_index = 1,
     last_x = character.position.x, last_y = character.position.y,
     stuck_ticks = 0, retries = 0
   })
+  if params.within ~= nil then result.within = params.within end
+  if finish_move_within(state) then
+    result.status = "succeeded"
+    result.distance = math.sqrt(distance_squared(character.position, goal))
+    return result
+  end
   local ok = pcall(request_path, state, character, goal)
   if not ok then
     local detail = path_not_found_detail(character, goal)
@@ -855,6 +884,9 @@ local function do_observe(state, params)
   for _, resource in pairs(resources_by_name) do resources[#resources + 1] = resource end
   table.sort(resources, function(a, b) return a.name < b.name end)
   table.sort(visible, function(a, b)
+    local da = distance_squared(character.position, a.position)
+    local db = distance_squared(character.position, b.position)
+    if da ~= db then return da < db end
     if a.position.x ~= b.position.x then return a.position.x < b.position.x end
     if a.position.y ~= b.position.y then return a.position.y < b.position.y end
     return a.name < b.name
@@ -1940,6 +1972,11 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
     return
   end
   state.path_request_id = nil
+  if not valid_character(state) then
+    finish_action(state, "action", "failed", "character_dead")
+    return
+  end
+  if finish_move_within(state) then return end
   if event.try_again_later then
     state.action.retries = state.action.retries + 1
     if state.action.retries > 3 then
@@ -1981,6 +2018,7 @@ local function tick_action(state, slot)
     return
   end
   if action.type == "move" then
+    if finish_move_within(state) then return end
     if not action.path then return end
     local d = math.sqrt(distance_squared(character.position, action.goal))
     if d <= 0.5 then

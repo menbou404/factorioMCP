@@ -22,6 +22,7 @@ Count = Annotated[int, Field(ge=1, le=100, strict=True)]
 RequiredText = Annotated[str, Field(min_length=1)]
 Coordinate = Annotated[float, Field(allow_inf_nan=False)]
 ObservationRadius = Annotated[float, Field(ge=1, le=16, allow_inf_nan=False, strict=True)]
+MoveWithin = Annotated[float, Field(ge=0.5, le=10, allow_inf_nan=False, strict=True)]
 FilterNames = Annotated[
     list[Annotated[str, Field(min_length=1, max_length=200, strict=True)]],
     Field(max_length=32, strict=True),
@@ -99,7 +100,8 @@ HINTS = {
     "path_not_found": (
         "Check detail.goal_tiles and detail.goal_entities for obstacles explaining the failure. "
         "If present, detail.nearby_free_position is a standable spot to try with move_to; "
-        "there is no path guarantee."
+        "there is no path guarantee. To reach a structure among buildings, retry with "
+        "within set to the interaction reach (reach.interact from observe_nearby)."
     ),
     "blocked": (
         "Check valid_directions for another orientation, mine or recover blocking entities, "
@@ -353,6 +355,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         description=(
             "Observe nearby entities and blocked terrain tiles within 16 tiles. "
             "Each entity includes distance from the character centre to the entity centre. "
+            "Entities are nearest first, with ties ordered by x, y, then name; "
+            "entity_offset pages follow this order. "
             "reach gives build (placing), interact (transferring, rotating, and setting recipes), "
             "and mine_resource (resource/tree/rock mining) reach in tiles. "
             "Resources, trees, and rocks are judged to their collision edge, so they may be "
@@ -509,7 +513,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
 
     @server.tool(
         description=(
-            "Walk to a position on the current surface. Arrival is within 0.5 tiles. "
+            "Walk to a position on the current surface. By default, arrival is within 0.5 tiles. "
+            "Set within (0.5-10 tiles) to stop when the character centre is within that "
+            "Euclidean distance of the goal; the pathfinder uses the same radius. "
+            "Use within = the needed reach (e.g. reach.interact from observe_nearby) to walk "
+            "next to a structure surrounded by other buildings. "
+            "When set, completion detail includes within and the final distance. "
             "The goal must be within 128 tiles in a straight line from the character. "
             "For farther goals, move via intermediate points. "
             "If the goal is blocked, succeeds within 1.5 tiles with detail.goal_blocked = true "
@@ -520,8 +529,13 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Returns an action ID for polling."
         )
     )
-    async def move_to(surface: RequiredText, x: Coordinate, y: Coordinate) -> CallToolResult:
-        return await invoke("move_to", {"surface": surface, "x": x, "y": y})
+    async def move_to(
+        surface: RequiredText, x: Coordinate, y: Coordinate, within: MoveWithin | None = None
+    ) -> CallToolResult:
+        params: dict[str, Any] = {"surface": surface, "x": x, "y": y}
+        if within is not None:
+            params["within"] = within
+        return await invoke("move_to", params)
 
     @server.tool(
         description=(
