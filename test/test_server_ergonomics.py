@@ -10,7 +10,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ValidationError
 
 from factorio_mcp.bridge import BridgeError, parse_bridge_response
-from factorio_mcp.server import HINTS, _normalize_result, create_server
+from factorio_mcp.server import HINTS, OPERATION_HINTS, _normalize_result, create_server
 
 
 def payload(result):
@@ -37,6 +37,97 @@ class ErrorDetailTests(unittest.TestCase):
 
 
 class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_operation_hints_override_code_hints_and_fall_back(self):
+        cases = [
+            ("start_research", {"technology": "military-2"}, "invalid_target"),
+            ("move_to", {"surface": "nauvis", "x": 129, "y": 0}, "out_of_range"),
+            ("get_entity_inventory", {"target_ref": "42"}, "invalid_target"),
+            ("mine_entity", {"target_ref": "42"}, "invalid_target"),
+            ("rotate_entity", {"target_ref": "42"}, "invalid_target"),
+            ("set_recipe", {"target_ref": "42", "recipe": "inserter"}, "invalid_target"),
+            ("get_recipe_info", {"recipe": "unknown"}, "invalid_target"),
+            (
+                "place_entity",
+                {"item": "unknown", "surface": "nauvis", "x": 1, "y": 2},
+                "invalid_target",
+            ),
+            ("get_entity_inventory", {"target_ref": "42"}, "out_of_range"),
+            ("start_research", {"technology": "automation"}, "target_gone"),
+            ("factorio_ping", {}, "invalid_target"),
+            ("move_to", {"surface": "nauvis", "x": 129, "y": 0}, "unknown"),
+        ]
+        for operation, params, code in cases:
+            with self.subTest(operation=operation, code=code):
+                bridge = Mock()
+                detail = {"reason": "test", "request_id": "req"}
+                bridge.call.side_effect = BridgeError(code, detail=detail)
+                result = await create_server(bridge).call_tool(operation, params)
+                self.assertTrue(result.is_error)
+                value = payload(result)
+                expected = OPERATION_HINTS.get((operation, code), HINTS.get(code))
+                self.assertEqual(value.get("hint"), expected)
+                self.assertEqual(value["detail"], {"reason": "test"})
+                self.assertEqual(value["request_id"], "req")
+                self.assertEqual(detail, {"reason": "test", "request_id": "req"})
+        self.assertNotIn("role_aliases", HINTS["invalid_target"])
+        self.assertIn("current surface", HINTS["out_of_range"])
+
+    async def test_research_error_detail_normalization_and_descriptions(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        hint = OPERATION_HINTS["start_research", "invalid_target"]
+        for text in ("detail.reason", "missing_prerequisites", "get_research_status"):
+            self.assertIn(text, hint)
+            self.assertIn(text, tools["start_research"].description)
+        for reason in ("unknown", "researched", "not_enabled", "queue_rejected"):
+            self.assertIn(reason, tools["start_research"].description)
+        self.assertIn("detail.technology", tools["start_research"].description)
+        self.assertIn("sorted direct prerequisite names", tools["start_research"].description)
+        for missing in (None, {}, [], ["military", "steel-processing"]):
+            with self.subTest(missing=missing):
+                detail = {"technology": "military-2", "reason": "missing_prerequisites"}
+                if missing is not None:
+                    detail["missing_prerequisites"] = missing
+                bridge = Mock()
+                bridge.call.side_effect = BridgeError("invalid_target", detail=detail)
+                result = await create_server(bridge).call_tool(
+                    "start_research", {"technology": "military-2"}
+                )
+                self.assertTrue(result.is_error)
+                value = payload(result)
+                expected = dict(detail)
+                if missing == {}:
+                    expected["missing_prerequisites"] = []
+                self.assertEqual(value["detail"], expected)
+                self.assertEqual(value["hint"], hint)
+                self.assertEqual(detail.get("missing_prerequisites"), missing)
+        move_hint = OPERATION_HINTS["move_to", "out_of_range"]
+        for text in ("detail.reach", "128", "straight line", "intermediate points"):
+            self.assertIn(text, move_hint)
+
+    async def test_lab_missing_science_normalization_and_description(self):
+        bridge = Mock()
+        entities = [
+            {"name": "lab"},
+            {"name": "lab", "missing_science": {}},
+            {"name": "lab", "missing_science": []},
+            {
+                "name": "lab",
+                "missing_science": ["automation-science-pack", "logistic-science-pack"],
+            },
+        ]
+        bridge.call.return_value = {"result": {"entities": copy.deepcopy(entities)}}
+        server = create_server(bridge)
+        result = await server.call_tool("observe_nearby", {})
+        self.assertFalse(result.is_error)
+        observed = payload(result)["entities"]
+        self.assertNotIn("missing_science", observed[0])
+        self.assertEqual(observed[1]["missing_science"], [])
+        self.assertEqual(observed[2]["missing_science"], [])
+        self.assertEqual(observed[3], entities[3])
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        for text in ("owned labs", "missing_science", "input inventory", "no current research"):
+            self.assertIn(text, tools["observe_nearby"].description)
+
     async def test_batch_schemas_match_single_tools_and_describe_execution(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         for batch, single in (
@@ -176,7 +267,13 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(entries[6]["detail"], raw["results"][6]["detail"])
                 for entry in entries[1:]:
                     if entry["error"] in HINTS:
-                        self.assertEqual(entry["hint"], HINTS[entry["error"]])
+                        single = (
+                            "transfer_item" if operation == "transfer_items" else "place_entity"
+                        )
+                        expected = OPERATION_HINTS.get(
+                            (single, entry["error"]), HINTS[entry["error"]]
+                        )
+                        self.assertEqual(entry["hint"], expected)
 
     async def test_batch_all_failed_is_success_and_cached_results_are_normalized(self):
         failed = {"index": 1, "ok": False, "error": "action_conflict"}
@@ -197,6 +294,30 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             cached["original_response"]["result"], {key: payload(result)[key] for key in batch}
         )
         self.assertEqual(cached["original_response"]["request_id"], "batch-1")
+
+    async def test_cached_batch_uses_preserved_single_operation_for_hints(self):
+        for operation in ("transfer_item", "place_entity"):
+            with self.subTest(operation=operation):
+                bridge = Mock()
+                bridge.call.return_value = {
+                    "result": {
+                        "original_response": {
+                            "ok": True,
+                            "result": {
+                                "operation": operation,
+                                "results": [{"index": 1, "ok": False, "error": "invalid_target"}],
+                                "succeeded": 0,
+                                "failed": 1,
+                            },
+                        }
+                    }
+                }
+                result = await create_server(bridge).call_tool(
+                    "get_request_result", {"request_id": "batch-1"}
+                )
+                self.assertFalse(result.is_error)
+                entry = payload(result)["original_response"]["result"]["results"][0]
+                self.assertEqual(entry["hint"], OPERATION_HINTS[operation, "invalid_target"])
 
     async def test_batch_input_validation_through_mcp_client(self):
         transfer = {
@@ -410,11 +531,12 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(text, tools[name].description)
         for text in ("input -> source", "output -> result", "source -> input"):
             self.assertIn(text, tools["transfer_item"].description)
-            self.assertIn(text, HINTS["invalid_target"])
+            self.assertIn(text, OPERATION_HINTS["transfer_item", "invalid_target"])
         for text in ("stone-furnace", "assembling-machine-1", "lab", "canonical"):
             self.assertIn(text, tools["transfer_item"].description)
-        self.assertIn("role_aliases", HINTS["invalid_target"])
-        self.assertIn("valid_roles", HINTS["invalid_target"])
+        for operation in ("transfer_item", "get_entity_inventory"):
+            self.assertIn("role_aliases", OPERATION_HINTS[operation, "invalid_target"])
+            self.assertIn("valid_roles", OPERATION_HINTS[operation, "invalid_target"])
 
     async def test_role_alias_maps_normalize_and_keep_canonical_roles(self):
         bridge = Mock()
@@ -439,6 +561,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 )
                 value = payload(result)
                 self.assertTrue(result.is_error)
+                self.assertEqual(value["hint"], OPERATION_HINTS["transfer_item", "invalid_target"])
                 self.assertEqual(value["detail"], {**detail, "role_aliases": aliases or {}})
                 self.assertIsInstance(value["detail"]["role_aliases"], dict)
                 self.assertEqual(detail["role_aliases"], aliases)

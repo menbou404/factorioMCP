@@ -1097,6 +1097,68 @@ def main():
         set_goal_tiles("grass-1")
         action("move_to", return_position)
 
+    # M15-X: these are military-2's direct prerequisites in the 2.0.77 prototypes.
+    # Unlike trial 9, this early script has not unlocked green science yet.
+    prerequisites = ["logistic-science-pack", "military", "steel-processing"]
+    research_before = bridge.call("get_research_status")["result"]
+    record(
+        "research fixture has unresearched military prerequisites",
+        not set(prerequisites).intersection(research_before["researched"] or []),
+        json.dumps(research_before),
+    )
+    server = create_server(bridge)
+    for technology, reason, expected_missing in (
+        ("military-2", "missing_prerequisites", prerequisites),
+        ("m15-unknown-technology", "unknown", None),
+    ):
+        result = asyncio.run(server.call_tool("start_research", {"technology": technology}))
+        value = json.loads(result.content[0].text)
+        detail = value.get("detail", {})
+        hint = value.get("hint", "")
+        record(
+            "research with missing prerequisites explains why"
+            if expected_missing is not None
+            else "unknown research explains why",
+            result.is_error
+            and value.get("error") == "invalid_target"
+            and detail.get("technology") == technology
+            and detail.get("reason") == reason
+            and detail.get("missing_prerequisites") == expected_missing
+            and all(
+                text in hint
+                for text in ("detail.reason", "detail.missing_prerequisites", "get_research_status")
+            ),
+            json.dumps(value),
+        )
+    research_after = bridge.call("get_research_status")["result"]
+    record(
+        "rejected research preserves research state",
+        all(
+            research_after.get(key) == research_before.get(key)
+            for key in ("researched", "queue", "current")
+        ),
+    )
+    current = bridge.call("get_agent_status")["result"]["position"]
+    result = asyncio.run(server.call_tool("move_to", {**current, "x": current["x"] + 128.7}))
+    value = json.loads(result.content[0].text)
+    detail = value.get("detail", {})
+    hint = value.get("hint", "")
+    record(
+        "move beyond 128 tiles hints intermediate points",
+        result.is_error
+        and value.get("error") == "out_of_range"
+        and detail.get("reach") == 128
+        and math.isclose(detail.get("distance", 0), 128.7, abs_tol=1e-6)
+        and all(
+            text in hint for text in ("detail.reach", "128", "straight line", "intermediate points")
+        ),
+        json.dumps(value),
+    )
+    record(
+        "rejected distant move keeps position",
+        bridge.call("get_agent_status")["result"]["position"] == current,
+    )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
