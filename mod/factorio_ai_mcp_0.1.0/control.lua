@@ -860,6 +860,7 @@ local function do_observe(state, params)
     return a.name < b.name
   end)
   local output = {}
+  local current_research = character.force.current_research
   state.last_observation = {position = {x = character.position.x, y = character.position.y},
                             surface = character.surface.name, tick = game.tick, radius = radius}
   state.recent_observations[#state.recent_observations + 1] = state.last_observation
@@ -881,6 +882,19 @@ local function do_observe(state, params)
     if observed.owned and roles then
       local inventory_roles = sorted_keys(roles)
       if #inventory_roles > 0 then observed.inventory_roles = inventory_roles end
+    end
+    if observed.owned and entity.type == "lab" and current_research then
+      local input = entity.get_inventory(defines.inventory.lab_input)
+      if input and input.valid then
+        local missing = {}
+        for _, ingredient in pairs(current_research.research_unit_ingredients) do
+          if input.get_item_count(ingredient.name) == 0 then
+            missing[#missing + 1] = ingredient.name
+          end
+        end
+        table.sort(missing)
+        if #missing > 0 then observed.missing_science = missing end
+      end
     end
     if entity.supports_direction then observed.direction = entity.direction end
     local entity_status = entity.status
@@ -1145,8 +1159,29 @@ local function do_start_research(state, params)
   if type(params.technology) ~= "string" then return nil, "invalid_input" end
   local force = character.force
   local technology = force.technologies[params.technology]
-  if not technology or not research_available(technology) then return nil, "invalid_target" end
-  if not force.add_research(params.technology) then return nil, "blocked" end
+  local detail = {technology = params.technology}
+  if not technology then
+    detail.reason = "unknown"
+  elseif technology.researched then
+    detail.reason = "researched"
+  elseif not technology.enabled then
+    detail.reason = "not_enabled"
+  else
+    local missing = {}
+    for name, prerequisite in pairs(technology.prerequisites) do
+      if not prerequisite.researched then missing[#missing + 1] = name end
+    end
+    if #missing > 0 then
+      table.sort(missing)
+      detail.reason = "missing_prerequisites"
+      detail.missing_prerequisites = missing
+    end
+  end
+  if detail.reason then return nil, "invalid_target", detail end
+  if not force.add_research(params.technology) then
+    detail.reason = "queue_rejected"
+    return nil, "invalid_target", detail
+  end
   return {technology = technology.name,
           current = force.current_research and force.current_research.name or nil,
           queue = research_queue(force)}
@@ -1655,7 +1690,9 @@ local function do_batch(state, params, handler)
       results[index] = {index = index, ok = false, error = err, detail = detail}
     end
   end
-  return {results = results, succeeded = succeeded, failed = count - succeeded}
+  -- Preserve single-operation hints when get_request_result recovers this batch.
+  return {results = results, succeeded = succeeded, failed = count - succeeded,
+          operation = handler == do_transfer and "transfer_item" or "place_entity"}
 end
 
 local function running_action_slot(state, action_id)

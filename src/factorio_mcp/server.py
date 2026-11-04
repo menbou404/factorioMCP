@@ -109,12 +109,11 @@ HINTS = {
         "within 8 tiles of the requested position. They may be out of reach; "
         "move closer and check again with check_placement."
     ),
-    "invalid_target": (
-        "Check the entity, valid_roles, and role_aliases in detail. "
-        "Furnaces and assemblers accept input -> source and output -> result; "
-        "labs accept source -> input."
+    "invalid_target": "Check the target, detail, and the tool's supported targets before retrying.",
+    "out_of_range": (
+        "Use a target on the character's current surface. "
+        "Move within detail.reach of the target, then observe_nearby again."
     ),
-    "out_of_range": "Move closer to the target, then observe_nearby again.",
     "missing_materials": (
         "Gather the missing items before retrying. "
         "For crafting, detail.missing_raw lists raw items such as plates that are short "
@@ -122,6 +121,43 @@ HINTS = {
         "For transfers, check detail.contents for items in the source inventory."
     ),
 }
+
+
+INVENTORY_TARGET_HINT = (
+    "Choose an owned supported structure; check detail.reason and supported_entities. "
+    "Check the entity, valid_roles, and role_aliases in detail. "
+    "Furnaces and assemblers accept input -> source and output -> result; "
+    "labs accept source -> input."
+)
+
+OPERATION_HINTS = {
+    ("start_research", "invalid_target"): (
+        "Check detail.reason. For missing_prerequisites, research "
+        "detail.missing_prerequisites first; get_research_status lists available technologies."
+    ),
+    ("move_to", "out_of_range"): (
+        "The goal must be on the current surface and within detail.reach (128) tiles "
+        "in a straight line. Walk via intermediate points for farther goals."
+    ),
+    ("transfer_item", "invalid_target"): INVENTORY_TARGET_HINT,
+    ("get_entity_inventory", "invalid_target"): INVENTORY_TARGET_HINT,
+    ("mine_entity", "invalid_target"): (
+        "Choose a minable, selectable target in observe_nearby; "
+        "check detail.reason and avoid structures belonging to another force."
+    ),
+    ("rotate_entity", "invalid_target"): (
+        "Choose an owned rotatable entity in observe_nearby; check detail.reason."
+    ),
+    ("set_recipe", "invalid_target"): "Choose an owned assembling machine in observe_nearby.",
+    ("get_recipe_info", "invalid_target"): (
+        "Check the recipe name; list_craftable_recipes lists unlocked hand crafting recipes."
+    ),
+    ("place_entity", "invalid_target"): "Choose an item supported by place_entity.",
+}
+
+
+def _hint(operation: str | None, code: str | None) -> str | None:
+    return OPERATION_HINTS.get((operation, code), HINTS.get(code))
 
 
 def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
@@ -134,6 +170,7 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
         "tiles",
         "missing",
         "missing_raw",
+        "missing_prerequisites",
         "valid_roles",
         "supported_entities",
         "contents",
@@ -143,21 +180,24 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
     return detail
 
 
-def _normalize_batch_result(result: dict[str, Any]) -> dict[str, Any]:
+def _normalize_batch_result(result: dict[str, Any], operation: str | None = None) -> dict[str, Any]:
+    operation = operation or result.get("operation")
     if not isinstance(result.get("results"), list):
         result["results"] = []
     for entry in result["results"]:
         if entry.get("ok") is False:
             if isinstance(entry.get("detail"), dict):
                 entry["detail"] = _normalize_error_detail(entry["detail"])
-            if entry.get("error") in HINTS:
-                entry["hint"] = HINTS[entry["error"]]
+            hint = _hint(operation, entry.get("error"))
+            if hint is not None:
+                entry["hint"] = hint
     return result
 
 
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     if operation in ("transfer_items", "place_entities"):
-        return _normalize_batch_result(result)
+        single = "transfer_item" if operation == "transfer_items" else "place_entity"
+        return _normalize_batch_result(result, single)
     if operation == "get_request_result":
         original = result.get("original_response")
         if isinstance(original, dict) and isinstance(original.get("result"), dict):
@@ -186,7 +226,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
                 if field in filters and not isinstance(filters[field], list):
                     filters[field] = []
         for entity in result["entities"]:
-            for field in ("belt_items", "fluids", "inventory_roles"):
+            for field in ("belt_items", "fluids", "inventory_roles", "missing_science"):
                 if field in entity and not isinstance(entity[field], list):
                     entity[field] = []
     if operation == "check_placement":
@@ -210,7 +250,7 @@ def _response(value: dict[str, Any], *, error: bool = False) -> CallToolResult:
     )
 
 
-def _error_response(exc: Exception) -> CallToolResult:
+def _error_response(exc: Exception, operation: str | None = None) -> CallToolResult:
     code = exc.code if isinstance(exc, BridgeError) else "internal_error"
     detail = exc.detail if isinstance(exc, BridgeError) else None
     value: dict[str, Any] = {"ok": False, "error": code, "message": str(exc)}
@@ -222,8 +262,9 @@ def _error_response(exc: Exception) -> CallToolResult:
         )
         if public_detail:
             value["detail"] = public_detail
-    if code in HINTS:
-        value["hint"] = HINTS[code]
+    hint = _hint(operation, code)
+    if hint is not None:
+        value["hint"] = hint
     return _response(value, error=True)
 
 
@@ -262,7 +303,8 @@ class _InputErrorServer(MCPServer):
             result = _error_response(
                 BridgeError(
                     "invalid_input", "Tool arguments failed validation.", {"errors": errors}
-                )
+                ),
+                name,
             )
             # Preserve call_tool's exception contract. The SDK's wire handler turns
             # this message into a text tool result with isError=true.
@@ -283,7 +325,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         try:
             return _response(_success_value(operation, await call(operation, params)))
         except Exception as exc:
-            return _error_response(exc)
+            return _error_response(exc, operation)
 
     @server.tool(description="Check the connection to the Factorio AI Mod.")
     async def factorio_ping() -> CallToolResult:
@@ -311,6 +353,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and bounding area. "
             "Target refs and placement observations expire after 60 seconds. "
             "Supported structures in your force include sorted inventory_roles. "
+            "During current research, owned labs include sorted missing_science names "
+            "for required science packs absent from their input inventory; "
+            "omitted when nothing is missing or there is no current research. "
             "Owned fluid structures include fluid_connections with port position, target_position, "
             "direction, flow, fluidbox_index, connected, "
             "and connection_type (normal or underground). "
@@ -440,7 +485,15 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await invoke("set_recipe", {"target_ref": target_ref, "recipe": recipe})
 
     @server.tool(
-        description="Queue an available technology for lab research consuming science packs."
+        description=(
+            "Queue an available technology for lab research consuming science packs. "
+            "On invalid_target, detail.technology and detail.reason explain the rejection: "
+            "unknown, researched, missing_prerequisites, or not_enabled. "
+            "missing_prerequisites includes sorted direct prerequisite names in "
+            "detail.missing_prerequisites; research these first. "
+            "queue_rejected means the engine declined to queue an otherwise available technology. "
+            "get_research_status lists available technologies."
+        )
     )
     async def start_research(technology: RequiredText) -> CallToolResult:
         return await invoke("start_research", {"technology": technology})

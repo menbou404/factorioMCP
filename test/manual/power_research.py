@@ -422,8 +422,17 @@ def main():
 
     recipes.craft_to("automation-science-pack", 10)
     lab = entity_at(observe(), "lab", LAB)
-    transfer(lab, "input", "automation-science-pack", 10)
+    assert "missing_science" not in lab, lab  # No current research yet.
     call("start_research", {"technology": "automation"})
+    assert call("get_research_status")["current"] == "automation"
+    lab = entity_at(observe(), "lab", LAB)
+    assert lab.get("missing_science") == ["automation-science-pack"], lab
+    print("empty lab reports missing science for current research", flush=True)
+    transfer(lab, "input", "automation-science-pack", 10)
+    assert call("get_research_status")["current"] == "automation"
+    lab = entity_at(observe(), "lab", LAB)
+    assert "missing_science" not in lab, lab
+    print("stocked lab omits missing_science while research runs", flush=True)
     server = create_server(bridge)
     deadline = time.monotonic() + 300
     while True:
