@@ -1156,6 +1156,36 @@ local function research_trigger_data(technology)
           count = trigger.count or (trigger.type == "craft-item" and 1 or nil)}
 end
 
+local function do_technology_info(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if type(params.technology) ~= "string" then return nil, "invalid_input" end
+  local technology = character.force.technologies[params.technology]
+  if not technology then
+    return nil, "invalid_target", {technology = params.technology, reason = "unknown"}
+  end
+  local prerequisites, ingredients, unlocks = {}, {}, {}
+  for name, prerequisite in pairs(technology.prerequisites) do
+    prerequisites[#prerequisites + 1] = {name = name, researched = prerequisite.researched}
+  end
+  for _, ingredient in pairs(technology.research_unit_ingredients) do
+    ingredients[#ingredients + 1] = {name = ingredient.name, amount = ingredient.amount}
+  end
+  for _, effect in pairs(technology.prototype.effects or {}) do
+    if effect.type == "unlock-recipe" and effect.recipe then
+      unlocks[#unlocks + 1] = effect.recipe
+    end
+  end
+  table.sort(prerequisites, function(a, b) return a.name < b.name end)
+  table.sort(ingredients, function(a, b) return a.name < b.name end)
+  table.sort(unlocks)
+  return {name = technology.name, researched = technology.researched,
+          available = research_available(technology), enabled = technology.enabled,
+          prerequisites = prerequisites, unit_count = technology.research_unit_count,
+          unit_time = technology.research_unit_energy / 60, ingredients = ingredients,
+          trigger = research_trigger_data(technology), unlocks_recipes = unlocks}
+end
+
 local function record_hand_crafted(state, character, action)
   local recipe = prototypes.recipe[action.recipe]
   if not recipe then return end
@@ -1420,6 +1450,30 @@ local function placement_blocking(state, character, prototype, position, directi
   end
   if #valid_directions > 0 then detail.valid_directions = valid_directions end
   if detail.reason == "placement_rules" then
+    if prototype.type == "mining-drill" then
+      local centre = snapped_position(prototype, position, direction)
+      -- 2.0.77 mining_drill_radius is the square's half-size: burner 0.99
+      -- covers 2x2 resource centres, electric 2.49 covers 5x5.
+      local radius = prototype.mining_drill_radius or 0
+      local categories = prototype.resource_categories or {}
+      local counts, resources = {}, {}
+      for _, resource in pairs(character.surface.find_entities_filtered{
+        area = {{centre.x - radius, centre.y - radius},
+                {centre.x + radius, centre.y + radius}}, type = "resource"
+      }) do
+        -- Area queries include collision-box overlaps; mining uses resource centres.
+        if resource.valid and categories[resource.prototype.resource_category] and
+           math.abs(resource.position.x - centre.x) <= radius and
+           math.abs(resource.position.y - centre.y) <= radius then
+          counts[resource.name] = (counts[resource.name] or 0) + 1
+        end
+      end
+      for _, name in ipairs(sorted_keys(counts)) do
+        resources[#resources + 1] = {name = name, tiles = counts[name]}
+      end
+      detail.mining_area_resources = resources
+      if #resources == 0 then detail.reason_detail = "no_resources_in_mining_area" end
+    end
     local nearby, seen = {}, {}
     for dx = -8, 8 do
       for dy = -8, 8 do
@@ -1556,7 +1610,9 @@ local function do_check_placement(state, params)
           water_direction = water_direction, output_direction = output_direction,
           blocking = blocked.blocking, tiles = blocked.tiles,
           valid_directions = blocked.valid_directions, blocked_reason = blocked.reason,
-          nearby_positions = blocked.nearby_positions}
+          nearby_positions = blocked.nearby_positions,
+          mining_area_resources = blocked.mining_area_resources,
+          reason_detail = blocked.reason_detail}
 end
 
 local function do_place(state, params)
@@ -1858,6 +1914,7 @@ local handlers = {
   list_craftable_recipes = do_list_craftable,
   get_recipe_info = do_recipe_info,
   get_research_status = do_research,
+  get_technology_info = do_technology_info,
   start_research = do_start_research,
   set_recipe = do_set_recipe,
   get_request_result = function(state, params)

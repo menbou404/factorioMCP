@@ -510,12 +510,26 @@ def main():
     lab = entity_at(observe(), "lab", LAB)
     assert lab.get("missing_science") == ["automation-science-pack"], lab
     print("empty lab reports missing science for current research", flush=True)
+    # M16-AF: the powered, empty lab must stop the wait before its 20-second timeout.
+    server = create_server(bridge)
+    waited = asyncio.run(
+        server.call_tool("wait_for_research", {"technology": "automation", "timeout_seconds": 20})
+    )
+    stalled = json.loads(waited.content[0].text)
+    assert not waited.is_error, stalled
+    assert stalled["stalled"] is True and stalled["timed_out"] is False, stalled
+    assert stalled["researching"] is True and stalled["researched"] is False, stalled
+    assert stalled["progress"] == 0 and 10 <= stalled["stalled_seconds"] < 15, stalled
+    assert 10 <= stalled["waited_seconds"] < 20, stalled
+    assert all(
+        text in stalled["hint"] for text in ("missing_science", "observe_nearby", "power", "every")
+    ), stalled
+    print("empty lab stalls research wait", json.dumps(stalled), flush=True)
     transfer(lab, "input", "automation-science-pack", 10)
     assert call("get_research_status")["current"] == "automation"
     lab = entity_at(observe(), "lab", LAB)
     assert "missing_science" not in lab, lab
     print("stocked lab omits missing_science while research runs", flush=True)
-    server = create_server(bridge)
     deadline = time.monotonic() + 300
     while True:
         check_deadline(deadline)
