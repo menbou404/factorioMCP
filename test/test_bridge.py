@@ -94,7 +94,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             )
 
         server = create_server(FactorioBridge(password="test", send=send))
-        self.assertEqual(len(await server.list_tools()), 25)
+        self.assertEqual(len(await server.list_tools()), 26)
         result = await server.call_tool("get_inventory", {})
         self.assertFalse(result.is_error)
         self.assertEqual(json.loads(result.content[0].text), {"ok": True, "tick": 42, "items": []})

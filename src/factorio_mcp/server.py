@@ -185,7 +185,9 @@ def _normalize_batch_result(result: dict[str, Any], operation: str | None = None
     if not isinstance(result.get("results"), list):
         result["results"] = []
     for entry in result["results"]:
-        if entry.get("ok") is False:
+        if entry.get("ok") is True and isinstance(entry.get("result"), dict) and operation:
+            entry["result"] = _normalize_result(operation, entry["result"])
+        elif entry.get("ok") is False:
             if isinstance(entry.get("detail"), dict):
                 entry["detail"] = _normalize_error_detail(entry["detail"])
             hint = _hint(operation, entry.get("error"))
@@ -195,9 +197,13 @@ def _normalize_batch_result(result: dict[str, Any], operation: str | None = None
 
 
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
-    if operation in ("transfer_items", "place_entities"):
-        single = "transfer_item" if operation == "transfer_items" else "place_entity"
-        return _normalize_batch_result(result, single)
+    batch_operations = {
+        "transfer_items": "transfer_item",
+        "place_entities": "place_entity",
+        "get_entity_inventories": "get_entity_inventory",
+    }
+    if operation in batch_operations:
+        return _normalize_batch_result(result, batch_operations[operation])
     if operation == "get_request_result":
         original = result.get("original_response")
         if isinstance(original, dict) and isinstance(original.get("result"), dict):
@@ -233,6 +239,9 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         for field in ("blocking", "tiles"):
             if field in result and not isinstance(result[field], list):
                 result[field] = []
+        coverage = result.get("electric_coverage")
+        if isinstance(coverage, dict) and not isinstance(coverage.get("poles"), list):
+            coverage["poles"] = []
     if operation == "get_research_status":
         for technology in result["available"]:
             if not isinstance(technology.get("ingredients"), list):
@@ -592,6 +601,14 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "within 60 seconds. "
             "Returns the snapped position and preview fluid_connections with port position, "
             "target_position, direction, flow, and fluidbox_index when present. "
+            "For electric consumers, electric_coverage.covered reports whether the placement "
+            "bounding box overlaps a pole's square supply area. For electric poles, "
+            "electric_coverage.connects reports wire reach using the smaller of both poles' "
+            "maximum wire distances. Coverage is included for placeable and blocked results "
+            "whenever the snapped position and bounding box are computed. "
+            "electric_coverage.poles lists up to 3 nearby own-force poles on the same surface, "
+            "nearest first, with x, y, and electric_network_id when present; "
+            "an empty list means no coverage/connection. Coverage does not guarantee power. "
             "For offshore-pump, the water_direction side must face water; pipes/boilers "
             "connect on the output_direction side. "
             "Blocked results may include blocking, tiles, blocked_reason, "
@@ -632,6 +649,23 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(description="Read accessible inventory sections of a nearby observed structure.")
     async def get_entity_inventory(target_ref: RequiredText) -> CallToolResult:
         return await invoke("get_entity_inventory", {"target_ref": target_ref})
+
+    @server.tool(
+        description=(
+            "Read accessible inventory sections of 1-10 nearby observed structures "
+            "in order in one tick without walking. Read-only; each target follows "
+            "get_entity_inventory rules: targets must be owned, on the same surface, "
+            "and within reach. Target refs expire after 60 seconds. "
+            "Failures do not stop later entries. Returns results with 1-based index, ok, "
+            "and result or error/detail/hint using the same error codes as get_entity_inventory, "
+            "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
+            "even if all entries failed."
+        )
+    )
+    async def get_entity_inventories(
+        target_refs: Annotated[list[RequiredText], Field(min_length=1, max_length=10, strict=True)],
+    ) -> CallToolResult:
+        return await invoke("get_entity_inventories", {"target_refs": target_refs})
 
     @server.tool(description=TRANSFER_DESCRIPTION)
     async def transfer_item(
