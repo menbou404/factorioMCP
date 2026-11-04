@@ -15,6 +15,8 @@ local PLACEABLE_ITEMS = {
   ["wooden-chest"] = true, ["iron-chest"] = true,
   ["stone-furnace"] = true,
   ["burner-mining-drill"] = true, ["transport-belt"] = true,
+  ["underground-belt"] = true, ["splitter"] = true,
+  ["long-handed-inserter"] = true, ["pipe-to-ground"] = true,
   ["inserter"] = true, ["burner-inserter"] = true, ["small-electric-pole"] = true,
   ["assembling-machine-1"] = true, ["electric-mining-drill"] = true,
   ["pipe"] = true, ["offshore-pump"] = true, ["boiler"] = true,
@@ -546,7 +548,7 @@ local function placed_fluid_connections(entity)
   if not fluidbox then return nil end
   for index = 1, #fluidbox do
     for _, connection in ipairs(fluidbox.get_pipe_connections(index)) do
-      if connection.connection_type == "normal" then
+      if connection.connection_type == "normal" or connection.connection_type == "underground" then
         local position, target = connection.position, connection.target_position
         local dx, dy = target.x - position.x, target.y - position.y
         local direction
@@ -558,7 +560,7 @@ local function placed_fluid_connections(entity)
           position = {x = position.x, y = position.y},
           target_position = {x = target.x, y = target.y},
           direction = direction, flow = connection.flow_direction, fluidbox_index = index,
-          connected = connection.target ~= nil
+          connected = connection.target ~= nil, connection_type = connection.connection_type
         }
       end
     end
@@ -915,10 +917,18 @@ local function do_observe(state, params)
       local ok, network_id = pcall(function() return entity.electric_network_id end)
       if ok and network_id ~= nil then observed.electric_network_id = network_id end
     end
-    if entity.type == "transport-belt" then
+    if entity.type == "underground-belt" then
+      observed.underground_type = entity.belt_to_ground_type
+      local neighbour = entity.neighbours
+      if neighbour and neighbour.valid then
+        observed.neighbour = {x = neighbour.position.x, y = neighbour.position.y}
+      end
+    end
+    if entity.type == "transport-belt" or entity.type == "underground-belt" or
+       entity.type == "splitter" then
       local merged = {}
       local items = {}
-      for line = 1, 2 do
+      for line = 1, entity.get_max_transport_line_index() do
         for _, item in pairs(entity.get_transport_line(line).get_contents()) do
           merged[item.name] = merged[item.name] or {}
           local entry = merged[item.name][item.quality]
@@ -1225,8 +1235,12 @@ local function placement_bounding_box(prototype, position, direction)
   local box = prototype.collision_box
   local left, top = box.left_top.x, box.left_top.y
   local right, bottom = box.right_bottom.x, box.right_bottom.y
-  if direction == 4 or direction == 12 then
+  if direction == 4 then
     left, top, right, bottom = -bottom, left, -top, right
+  elseif direction == 8 then
+    left, top, right, bottom = -right, -bottom, -left, -top
+  elseif direction == 12 then
+    left, top, right, bottom = top, -right, bottom, -left
   end
   return {left_top = {x = position.x + left, y = position.y + top},
           right_bottom = {x = position.x + right, y = position.y + bottom}}
@@ -1322,7 +1336,14 @@ local function placement_blocking(state, character, prototype, position, directi
   return detail
 end
 
+local function valid_underground_type(params)
+  return params.underground_type == nil or
+         (params.item == "underground-belt" and
+          (params.underground_type == "input" or params.underground_type == "output"))
+end
+
 local function validate_placement(state, character, params, require_item)
+  if not valid_underground_type(params) then return nil, "invalid_input" end
   if type(params.item) ~= "string" or not PLACEABLE_ITEMS[params.item] then
     return nil, "invalid_target"
   end
@@ -1364,6 +1385,10 @@ local function validate_placement(state, character, params, require_item)
   if require_item and not has_item then
     return nil, "missing_materials", {item = params.item}
   end
+  -- Neither can_place_entity API accepts type in 2.0.77. Use belt travel direction
+  -- for both ends (output = direction items leave); the collision box is symmetric.
+  -- Base's factoriopedia_underground_belt blueprint uses direction=4 for both ends.
+  -- placement_blocking uses these same checks for valid_directions/nearby_positions.
   if not character.can_place_entity{name = entity_name, position = position,
                                      direction = direction} then
     return nil, "blocked", placement_blocking(state, character, prototype, requested_position, direction)
@@ -1373,12 +1398,15 @@ local function validate_placement(state, character, params, require_item)
     return nil, "blocked", placement_blocking(state, character, prototype, requested_position, direction)
   end
   return {name = entity_name, position = position, direction = direction,
+          underground_type = params.item == "underground-belt" and
+                             (params.underground_type or "input") or nil,
           inventory = inventory}
 end
 
 local function do_check_placement(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
+  if not valid_underground_type(params) then return nil, "invalid_input" end
   local placement, reason, detail = validate_placement(state, character, params, false)
   -- Metadata is useful even when distance, visibility, or collision checks fail.
   local item_proto = type(params.item) == "string" and prototypes.item[params.item] or nil
@@ -1421,6 +1449,7 @@ local function do_place(state, params)
   if removed ~= 1 then return nil, "missing_materials", {item = params.item} end
   local created = character.surface.create_entity{
     name = placement.name, position = placement.position, direction = placement.direction,
+    type = placement.underground_type,
     force = character.force, quality = "normal", raise_built = true
   }
   if not created or not created.valid then

@@ -232,7 +232,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Target refs and placement observations expire after 60 seconds. "
             "Supported structures in your force include sorted inventory_roles. "
             "Owned fluid structures include fluid_connections with port position, target_position, "
-            "direction, flow, fluidbox_index, and connected. "
+            "direction, flow, fluidbox_index, connected, "
+            "and connection_type (normal or underground). "
+            "Transport belts, underground-belt, and splitter include belt_items as "
+            "{name, quality, count} entries merged across all transport lines. "
+            "Underground belts include underground_type and, when paired, neighbour = {x, y}. "
+            "Inserters, including long-handed-inserter, include pickup_position and drop_position. "
             "Use check_placement for snapped position and valid_directions before building. "
             "Follow offsets for additional pages."
             " Each call also records fully observed 8x8 cells for get_explored_map, "
@@ -407,6 +412,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Place a supported entity within build reach, consuming one real inventory item."
+            " Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground."
+            " underground_type is only valid for underground-belt: input or output"
+            " (default input). direction is belt travel direction for both ends;"
+            " for output it is the direction items leave."
             " The placement area must be covered by any of the last 8 observations"
             " within 60 seconds."
             " Returns the snapped position and actual fluid_connections with port position,"
@@ -430,15 +439,26 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         x: Coordinate,
         y: Coordinate,
         direction: Literal[0, 4, 8, 12] = 0,
+        underground_type: Literal["input", "output"] | None = None,
     ) -> CallToolResult:
-        return await invoke(
-            "place_entity",
-            {"item": item, "surface": surface, "x": x, "y": y, "direction": direction},
-        )
+        params = {"item": item, "surface": surface, "x": x, "y": y, "direction": direction}
+        if underground_type is not None:
+            if item != "underground-belt":
+                return _error_response(
+                    BridgeError(
+                        "invalid_input", "underground_type is only valid for underground-belt."
+                    )
+                )
+            params["underground_type"] = underground_type
+        return await invoke("place_entity", params)
 
     @server.tool(
         description=(
             "Check placement within build reach without consuming items or building. "
+            "Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground. "
+            "underground_type is only valid for underground-belt: input or output "
+            "(default input). direction is belt travel direction for both ends; "
+            "for output it is the direction items leave. "
             "The placement area must be covered by any of the last 8 observations "
             "within 60 seconds. "
             "Returns the snapped position and preview fluid_connections with port position, "
@@ -463,11 +483,18 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         x: Coordinate,
         y: Coordinate,
         direction: Literal[0, 4, 8, 12] = 0,
+        underground_type: Literal["input", "output"] | None = None,
     ) -> CallToolResult:
-        return await invoke(
-            "check_placement",
-            {"item": item, "surface": surface, "x": x, "y": y, "direction": direction},
-        )
+        params = {"item": item, "surface": surface, "x": x, "y": y, "direction": direction}
+        if underground_type is not None:
+            if item != "underground-belt":
+                return _error_response(
+                    BridgeError(
+                        "invalid_input", "underground_type is only valid for underground-belt."
+                    )
+                )
+            params["underground_type"] = underground_type
+        return await invoke("check_placement", params)
 
     @server.tool(description="Rotate an owned observed entity within reach by 90 degrees.")
     async def rotate_entity(target_ref: RequiredText, reverse: bool = False) -> CallToolResult:

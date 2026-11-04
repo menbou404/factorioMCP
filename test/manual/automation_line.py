@@ -1,10 +1,12 @@
 """Automated red science on the disposable RCON 27277 save, after power_research.py.
 
-Uses only existing tools and equipment. Science packs are never hand crafted or
+Uses only normal tools for items and equipment. Science packs are never hand crafted or
 transferred: the assembler and inserters must supply every pack to the M4 lab.
+The M14-U smoke checks may unlock logistics with a research-only test fixture.
 """
 
 import json
+import math
 import time
 
 import power_research as power
@@ -29,6 +31,10 @@ from power_research import (
     transfer,
     walk,
 )
+from rcon.source import Client
+
+from factorio_mcp.bridge import RCON_FRAG_THRESHOLD, BridgeError
+from production_line import action, password
 
 ASSEMBLER = (23.5, -19.5)
 OUTPUT_INSERTER = (23.5, -21.5)
@@ -36,6 +42,12 @@ INPUT_INSERTER = (23.5, -17.5)
 CHEST = (23.5, -16.5)
 POLE = (21.5, -18.5)
 SCIENCE = "automation-science-pack"
+PLACEABLE_EQUIPMENT = {
+    "underground-belt": 2,
+    "splitter": 1,
+    "long-handed-inserter": 1,
+    "pipe-to-ground": 2,
+}
 
 
 def restore_pairs():
@@ -89,6 +101,147 @@ def planned_box(name, position):
     return checked["bounding_box"]
 
 
+def check_new_placeables(recipes):
+    research = call("get_research_status")
+    if "logistics" not in (research["researched"] or []):
+        # Test-only research fixture, like the existing resource/tile fixtures.
+        # Another 20 packs/300 lab seconds would test research again; no items
+        # are granted. All equipment below is crafted from gathered materials.
+        fixture = (
+            '/c game.forces.player.technologies["logistics"].researched = true;'
+            'rcon.print("m14u-logistics:"..tostring('
+            'game.forces.player.technologies["logistics"].researched))'
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            result = client.run(fixture)
+            if "m14u-logistics:true" not in result:
+                result = client.run(fixture)
+        assert "m14u-logistics:true" in result, result
+        print("M14-U test-only logistics research fixture used", flush=True)
+    assert "logistics" in (call("get_research_status")["researched"] or [])
+    for name, count in PLACEABLE_EQUIPMENT.items():
+        info = recipes.info(name, refresh=True)
+        assert info["enabled"] and info["hand_craftable"], info
+        print("M14-U recipe", name, json.dumps(info), flush=True)
+        recipes.craft_to(name, count)
+
+    before = {name: amount(items(), name) for name in PLACEABLE_EQUIPMENT}
+    placed = []
+
+    def put(name, position, direction=0, underground_type=None):
+        walk((position[0] - 1.5, position[1] + 1.5))
+        observe()
+        params = {
+            "item": name,
+            "surface": "nauvis",
+            "x": position[0],
+            "y": position[1],
+            "direction": direction,
+        }
+        if underground_type is not None:
+            params["underground_type"] = underground_type
+        stock = amount(items(), name)
+        checked = call("check_placement", params)
+        assert checked["placeable"] and checked["has_item"], checked
+        assert amount(items(), name) == stock, checked
+        result = call("place_entity", params)
+        placed.append((name, position))
+        assert checked["position"] == {"x": result["position"]["x"], "y": result["position"]["y"]}
+        assert amount(items(), name) == stock - 1, result
+        entity = entity_at(observe(), name, position)
+        assert checked["bounding_box"] == entity["bounding_box"], (checked, entity)
+        assert not entity.get("inventory_roles"), entity
+        return entity
+
+    try:
+        # Base's bundled Factoriopedia blueprint uses the same direction for
+        # input and output; output direction is where items leave, here east.
+        inlet, outlet = (25.5, -10.5), (28.5, -10.5)
+        unpaired = put("underground-belt", inlet, 4)  # Default type is input.
+        assert unpaired["underground_type"] == "input" and "neighbour" not in unpaired, unpaired
+        put("underground-belt", outlet, 4, "output")
+        observed = observe()
+        for position, paired, underground_type in (
+            (inlet, outlet, "input"),
+            (outlet, inlet, "output"),
+        ):
+            entity = entity_at(observed, "underground-belt", position)
+            assert entity["direction"] == 4 and entity["underground_type"] == underground_type, (
+                entity
+            )
+            assert entity["neighbour"] == {"x": paired[0], "y": paired[1]}, entity
+            assert not entity.get("belt_items", []), entity
+        # Exercise the Mod's validation directly as well as MCP's unit tests.
+        for operation in ("check_placement", "place_entity"):
+            for item, underground_type in (
+                ("transport-belt", "input"),
+                ("transport-belt", "invalid"),
+                ("underground-belt", "invalid"),
+            ):
+                try:
+                    bridge.call(
+                        operation,
+                        {
+                            "item": item,
+                            "surface": "nauvis",
+                            "x": 27.5,
+                            "y": -9.5,
+                            "underground_type": underground_type,
+                        },
+                    )
+                except BridgeError as error:
+                    assert error.code == "invalid_input", error
+                else:
+                    raise AssertionError(f"{operation} accepted {item}/{underground_type}")
+        print("underground belt pair connects", flush=True)
+
+        splitter = put("splitter", (27, -7.5))
+        assert splitter["type"] == "splitter", splitter
+        assert not splitter.get("belt_items", []), splitter
+        position = (26.5, -4.5)
+        inserter = put("long-handed-inserter", position)
+        assert inserter["type"] == "inserter", inserter
+        assert inserter["pickup_position"] == {"x": position[0], "y": position[1] - 2}, inserter
+        # Base 2.0.77 insert_position is (0, 2.2): the addressed tile is two
+        # tiles away, even though its drop coordinate is offset by 2.2.
+        assert tile_center(inserter["drop_position"]) == (position[0], position[1] + 2), inserter
+        assert math.isclose(inserter["drop_position"]["y"] - position[1], 2.2, abs_tol=0.01), (
+            inserter
+        )
+        print("splitter and long-handed inserter placed", flush=True)
+
+        pipes = ((25.5, -1.5), (28.5, -1.5))
+        # The base prototype's underground port faces south when direction=0;
+        # rotate it west/east so the underground ports point toward each other.
+        put("pipe-to-ground", pipes[0], 12)
+        put("pipe-to-ground", pipes[1], 4)
+        observed = observe()
+        for position in pipes:
+            pipe = entity_at(observed, "pipe-to-ground", position)
+            connections = pipe.get("fluid_connections", [])
+            assert any(
+                c["connection_type"] == "underground" and c["connected"] is True
+                for c in connections
+            ), pipe
+            assert any(c["connection_type"] == "normal" for c in connections), pipe
+        print("pipe-to-ground pair connects", flush=True)
+    finally:
+        for name, position in reversed(placed):
+            walk((position[0] - 1.5, position[1] + 1.5))
+            target = entity_at(observe(), name, position)
+            stock = amount(items(), name)
+            action("mine_entity", {"target_ref": target["target_ref"], "count": 1})
+            assert amount(items(), name) == stock + 1, (name, items())
+            assert not any(
+                e["name"] == name and (e["x"], e["y"]) == position for e in observe()["entities"]
+            ), (name, position)
+        assert {name: amount(items(), name) for name in before} == before, items()
+        walk((20, -18))
+    print("M14-U placed equipment recovered to inventory", flush=True)
+
+
 def main():
     power.run_deadline = time.monotonic() + 885  # Leave room before CI's 900 s timeout.
     research = call("get_research_status")
@@ -103,14 +256,17 @@ def main():
         "iron-chest": 1,
         "small-electric-pole": 2,  # One installed, one spare (the recipe yields two).
     }
-    needs = recipes.raw_needs({**equipment, "copper-plate": packs, "iron-gear-wheel": packs})
+    needs = recipes.raw_needs(
+        {**equipment, **PLACEABLE_EQUIPMENT, "copper-plate": packs, "iron-gear-wheel": packs}
+    )
     # Reserve fuel for the lab, assembler, and two inserters throughout polling;
     # gather also mines more coal as servicing the inherited smelters consumes it.
     needs["coal"] += 40
     print("computed needs", json.dumps(dict(needs)), flush=True)
     restore_pairs()
     try:
-        gather(needs, time.monotonic() + 240)
+        # Include smelting time for the additional M14-U equipment reserves.
+        gather(needs, time.monotonic() + 300)
     except TimeoutError as error:
         raise TimeoutError(
             f"M5 material gathering timed out; needs={dict(needs)}: {error}"
@@ -224,6 +380,7 @@ def main():
         if technology["name"] in (research["researched"] or []):
             assert network_seen, f"Shared electric network never observed: {last}"
             assert working_seen, f"Assembler working status never observed: {last}"
+            check_new_placeables(recipes)
             print("AUTOMATION_LINE_SUCCEEDED", technology["name"], flush=True)
             return
         time.sleep(2)
