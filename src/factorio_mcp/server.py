@@ -56,7 +56,11 @@ HINTS = {
         "within 8 tiles of the requested position. They may be out of reach; "
         "move closer and check again with check_placement."
     ),
-    "invalid_target": "Check the entity and valid_roles in detail, then choose a supported target.",
+    "invalid_target": (
+        "Check the entity, valid_roles, and role_aliases in detail. "
+        "Furnaces and assemblers accept input -> source and output -> result; "
+        "labs accept source -> input."
+    ),
     "out_of_range": "Move closer to the target, then observe_nearby again.",
     "missing_materials": (
         "Gather the missing items before retrying. "
@@ -68,6 +72,8 @@ HINTS = {
 
 
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
+    if "role_aliases" in result and not isinstance(result["role_aliases"], dict):
+        result["role_aliases"] = {}
     array_fields = {
         "observe_nearby": ("entities", "blocked_tiles", "resources"),
         "get_explored_map": ("resources", "water", "trees", "rocks"),
@@ -120,6 +126,8 @@ def _error_response(exc: Exception) -> CallToolResult:
         if detail.get("request_id") is not None:
             value["request_id"] = detail["request_id"]
         public_detail = {key: item for key, item in detail.items() if key != "request_id"}
+        if "role_aliases" in public_detail and not isinstance(public_detail["role_aliases"], dict):
+            public_detail["role_aliases"] = {}
         # Factorio serializes empty Lua arrays as objects.
         for field in (
             "blocking",
@@ -372,6 +380,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         description=(
             "Mine an observed entity within reach over normal game time. Returns an action ID. "
             "count is 1-100. "
+            "When computable, estimated_seconds in the start result and running detail is an "
+            "estimate that can change if mining is interrupted or the target is depleted. "
+            "Use it to pick wait_for_action timeout_seconds (maximum 50). "
             "Crafting runs alongside mining. Only one walk/mine at a time. "
             "While mining runs, place_entity, transfer_item, rotate_entity, and set_recipe "
             "return action_conflict."
@@ -400,6 +411,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " within 60 seconds."
             " Returns the snapped position and actual fluid_connections with port position,"
             " target_position, direction, flow, fluidbox_index, and connected when present."
+            " For offshore-pump, the water_direction side must face water; pipes/boilers"
+            " connect on the output_direction side (see check_placement or observe_nearby)."
             " Blocked errors may include valid_directions for another orientation."
             " Each detail.blocking entry includes a target_ref usable with mine_entity"
             " for 60 seconds, subject to reach and force checks."
@@ -430,6 +443,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "within 60 seconds. "
             "Returns the snapped position and preview fluid_connections with port position, "
             "target_position, direction, flow, and fluidbox_index when present. "
+            "For offshore-pump, the water_direction side must face water; pipes/boilers "
+            "connect on the output_direction side. "
             "Blocked results may include blocking, tiles, blocked_reason, "
             "and valid_directions for another orientation. "
             "Each blocking entry includes a target_ref usable with mine_entity for 60 seconds, "
@@ -467,6 +482,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Move a real item between the AI character and a nearby observed structure. "
             "count is 1-100. "
             "Choose inventory_role from the structure's inventory_roles in observe_nearby. "
+            "Role aliases: stone-furnace and assembling-machine-1 accept input -> source "
+            "and output -> result; lab accepts source -> input. Returned roles stay canonical. "
             "missing_materials detail includes item, requested, available (0), and contents "
             "of the source inventory (up to 10 items sorted by name, omitted when empty). "
             "inventory_role is included when taking items from the structure."
@@ -494,6 +511,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         description=(
             "Get the status of a walking, mining, or crafting action. "
             "Running mining reports detail.gained and detail.count; "
+            "detail.estimated_seconds estimates the remaining mining time when computable; "
             "running crafting reports detail.count and detail.remaining."
         )
     )
@@ -506,6 +524,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "get_action_status. A timeout returns the last running status "
             "and leaves the action running. Running mining reports detail.gained and detail.count; "
             "running crafting reports detail.count and detail.remaining. "
+            "When computable, mining detail.estimated_seconds is an estimate that can change "
+            "if mining is interrupted or the target is depleted; use it to pick timeout_seconds. "
             "The maximum wait is 50 seconds to keep it under "
             "common 60-second client tool timeouts."
         )

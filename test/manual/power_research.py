@@ -437,7 +437,25 @@ def main():
         research = json.loads(waited.content[0].text)
         assert not waited.is_error, research
         if research["researched"] is True:
-            power_snapshot()
+            observed = power_snapshot()
+            # M13-S: compare prototype preview with the real, connected output port.
+            pump = entity_at(observed, "offshore-pump", PUMP)
+            output = next(port for port in pump["fluid_connections"] if port["flow"] == "output")
+            checked = call(
+                "check_placement",
+                {
+                    "item": "offshore-pump",
+                    "surface": "nauvis",
+                    "x": PUMP[0],
+                    "y": PUMP[1],
+                    "direction": pump["direction"],
+                },
+            )
+            assert pump["output_direction"] == output["direction"] == (pump["direction"] + 8) % 16
+            assert pump["water_direction"] == (output["direction"] + 8) % 16
+            for field in ("water_direction", "output_direction"):
+                assert checked[field] == pump[field], (checked, pump)
+            print("observed offshore pump sides match actual output connection", flush=True)
             print("POWER_RESEARCH_SUCCEEDED", flush=True)
             return
         assert research["researching"] is True and research["timed_out"] is True, research
