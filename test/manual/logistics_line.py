@@ -11,7 +11,7 @@ import time
 from helpers import position_in_tile_footprint
 from rcon.source import Client
 
-from factorio_mcp.bridge import RCON_FRAG_THRESHOLD
+from factorio_mcp.bridge import RCON_FRAG_THRESHOLD, BridgeError, parse_bridge_response
 from production_line import action, amount, bridge, call, password, reference
 
 
@@ -62,6 +62,125 @@ def place(item, position, direction=0):
         raise
 
 
+def held_items():
+    return {item["name"]: item["count"] for item in bridge.call("get_inventory")["result"]["items"]}
+
+
+def replay_batch(operation, entries):
+    request_id = f"m14v-{operation}-{time.time_ns()}"
+    command = "/ai_mcp " + json.dumps(
+        {
+            "protocol_version": 1,
+            "request_id": request_id,
+            "agent_id": "agent-1",
+            "operation": operation,
+            "params": {"items": entries},
+        },
+        separators=(",", ":"),
+    )
+
+    def send():
+        raw = bridge.send(bridge.host, bridge.port, bridge.password, command)
+        return parse_bridge_response(raw, request_id)
+
+    first = send()
+    after = held_items()
+    assert send() == first, f"{operation} duplicate request did not return cached response"
+    assert held_items() == after, f"{operation} duplicate request changed held items"
+    cached = bridge.call("get_request_result", {"request_id": request_id})["result"]
+    assert cached["original_response"] == first, f"{operation} result was not cached"
+    return first["result"]
+
+
+def batch_checks():
+    # These items were acquired normally above. Recover every temporary placement
+    # before building the logistics line, leaving its fuel and materials intact.
+    before = held_items()
+    assert before.get("coal", 0) >= 2 and before.get("transport-belt", 0) >= 2, before
+    furnace_position = (1, 6)
+    furnace = place("stone-furnace", furnace_position)
+    params = {
+        "target_ref": furnace["target_ref"],
+        "inventory_role": "fuel",
+        "item": "coal",
+        "count": 2,
+    }
+    try:
+        target = {"target_ref": furnace["target_ref"]}
+        empty = bridge.call("get_entity_inventory", target)["result"]["inventories"]
+        held_before = held_items()
+        transfers = [
+            {**params, "direction": "to_entity"},
+            {
+                **params,
+                "direction": "from_entity",
+                "inventory_role": "result",
+                "item": "iron-plate",
+            },
+            {**params, "direction": "from_entity"},
+        ]
+        moved = replay_batch("transfer_items", transfers)
+        assert moved["succeeded"] == 2 and moved["failed"] == 1, moved
+        assert [entry["index"] for entry in moved["results"]] == [1, 2, 3], moved
+        assert [entry["ok"] for entry in moved["results"]] == [True, False, True], moved
+        assert moved["results"][1]["error"] == "missing_materials", moved
+        for index in (0, 2):
+            assert moved["results"][index]["result"]["moved"] == 2, moved
+        assert held_items() == held_before, "Batch transfers changed held items"
+        assert bridge.call("get_entity_inventory", target)["result"]["inventories"] == empty
+        print("PASS batch transfer runs entries in order and continues after a failure", flush=True)
+
+        # The first entry would mutate inventory if validation ran lazily.
+        placement = {
+            "item": "transport-belt",
+            "surface": "nauvis",
+            "x": 1.5,
+            "y": 3.5,
+            "direction": 4,
+        }
+        for operation, entry in (("transfer_items", transfers[0]), ("place_entities", placement)):
+            for invalid in (None, {}, [], {"first": entry}, [entry] * 11, [entry, False]):
+                try:
+                    bridge.call(operation, {"items": invalid})
+                except BridgeError as error:
+                    assert error.code == "invalid_input", (operation, invalid, error)
+                else:
+                    raise AssertionError(f"{operation} accepted malformed batch: {invalid}")
+                assert held_items() == held_before, f"{operation} malformed batch changed items"
+                assert bridge.call("get_entity_inventory", target)["result"]["inventories"] == empty
+                checked = call("check_placement", placement)
+                assert checked["placeable"], f"{operation} malformed batch placed an entity"
+        print(
+            "PASS batch rejects more than 10 entries and malformed lists without changes",
+            flush=True,
+        )
+    finally:
+        action("mine_entity", {"target_ref": furnace["target_ref"], "count": 1})
+    assert held_items() == before, "Batch transfer checks changed materials"
+
+    placements = [placement, placement, {**placement, "x": 2.5}]
+    placed = replay_batch("place_entities", placements)
+    try:
+        assert placed["succeeded"] == 2 and placed["failed"] == 1, placed
+        assert [entry["index"] for entry in placed["results"]] == [1, 2, 3], placed
+        assert [entry["ok"] for entry in placed["results"]] == [True, False, True], placed
+        assert placed["results"][1]["error"] == "blocked", placed
+        assert held_items().get("transport-belt", 0) == before["transport-belt"] - 2
+        observed = observe()
+        for entry, position in zip(
+            (placed["results"][0], placed["results"][2]), ((1.5, 3.5), (2.5, 3.5)), strict=True
+        ):
+            entity = entity_at(observed, "transport-belt", position)
+            assert entry["result"]["name"] == entity["name"], entry
+            assert entry["result"]["direction"] == entity["direction"] == 4, entry
+    finally:
+        for position in ((1.5, 3.5), (2.5, 3.5)):
+            entity = entity_at(observe(), "transport-belt", position)
+            action("mine_entity", {"target_ref": entity["target_ref"], "count": 1})
+    assert held_items() == before, "Batch placements did not return held items"
+    print("PASS batch placement places several entities and recovers their items", flush=True)
+
+
 def main():
     action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
     before = bridge.call("get_inventory")["result"]["items"]
@@ -107,6 +226,8 @@ def main():
         action("craft", {"recipe": "iron-gear-wheel", "count": gears_needed})
     action("craft", {"recipe": "transport-belt", "count": 1})
     action("craft", {"recipe": "burner-inserter", "count": 1})
+
+    batch_checks()
 
     action("move_to", {"surface": "nauvis", "x": -9, "y": 13})
     drill_position = (-12, 11)

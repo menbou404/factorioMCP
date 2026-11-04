@@ -1623,6 +1623,41 @@ local function do_transfer(state, params)
           inventory_role = role}
 end
 
+local function do_batch(state, params, handler)
+  local items = params.items
+  if type(items) ~= "table" then return nil, "invalid_input" end
+  -- Validate the entire list before invoking any mutating handler. Reject maps,
+  -- sparse lists, and non-table entries rather than silently skipping them.
+  local count = 0
+  for index, entry in pairs(items) do
+    if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > 10 or
+       type(entry) ~= "table" then
+      return nil, "invalid_input"
+    end
+    count = count + 1
+  end
+  if count < 1 or count > 10 then return nil, "invalid_input" end
+  for index = 1, count do
+    if items[index] == nil then return nil, "invalid_input" end
+  end
+  local results, succeeded = {}, 0
+  for index = 1, count do
+    -- Both single and batch operations use the same validation and mutations.
+    local ok, result, err, detail = pcall(handler, state, items[index])
+    if not ok then
+      log("AI MCP batch handler error: " .. tostring(result))
+      err = "internal_error"
+    end
+    if err == nil then
+      succeeded = succeeded + 1
+      results[index] = {index = index, ok = true, result = result}
+    else
+      results[index] = {index = index, ok = false, error = err, detail = detail}
+    end
+  end
+  return {results = results, succeeded = succeeded, failed = count - succeeded}
+end
+
 local function running_action_slot(state, action_id)
   if state.action and state.action.id == action_id then return "action" end
   if state.craft_action and state.craft_action.id == action_id then return "craft_action" end
@@ -1705,9 +1740,11 @@ local handlers = {
   mine_entity = do_mine,
   craft = do_craft,
   place_entity = do_place,
+  place_entities = function(state, params) return do_batch(state, params, do_place) end,
   check_placement = do_check_placement,
   rotate_entity = do_rotate,
   transfer_item = do_transfer,
+  transfer_items = function(state, params) return do_batch(state, params, do_transfer) end,
   get_action_status = do_action_status,
   cancel_action = do_cancel
 }
@@ -1756,6 +1793,7 @@ commands.add_command("ai_mcp", "AI MCP bridge (RCON only)", function(command)
   if request.operation == "move_to" or request.operation == "mine_entity" or
      request.operation == "cancel_action" or request.operation == "craft" or
      request.operation == "place_entity" or request.operation == "transfer_item" or
+     request.operation == "place_entities" or request.operation == "transfer_items" or
      request.operation == "rotate_entity" or request.operation == "set_recipe" or
      request.operation == "start_research" then
     state.processed[request_id] = response

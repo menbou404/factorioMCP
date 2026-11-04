@@ -13,7 +13,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import CallToolResult, InputRequiredResult, TextContent
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from .bridge import BridgeError, FactorioBridge
 
@@ -26,6 +26,59 @@ FilterNames = Annotated[
     list[Annotated[str, Field(min_length=1, max_length=200, strict=True)]],
     Field(max_length=32, strict=True),
 ]
+
+
+PLACE_DESCRIPTION = (
+    "Place a supported entity within build reach, consuming one real inventory item."
+    " Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground."
+    " underground_type is only valid for underground-belt: input or output"
+    " (default input). direction is belt travel direction for both ends;"
+    " for output it is the direction items leave."
+    " The placement area must be covered by any of the last 8 observations"
+    " within 60 seconds."
+    " Returns the snapped position and actual fluid_connections with port position,"
+    " target_position, direction, flow, fluidbox_index, and connected when present."
+    " For offshore-pump, the water_direction side must face water; pipes/boilers"
+    " connect on the output_direction side (see check_placement or observe_nearby)."
+    " Blocked errors may include valid_directions for another orientation."
+    " Each detail.blocking entry includes a target_ref usable with mine_entity"
+    " for 60 seconds, subject to reach and force checks."
+    " detail.reason is character_in_the_way when the character blocks placement"
+    " (move the character away first), or placement_rules when no blocking entities,"
+    " tiles, or character explain the failure."
+    " For placement_rules, detail.nearby_positions lists up to 3 placeable centres"
+    " and directions within 8 tiles of the requested position."
+    " They may be out of reach; move closer and check again with check_placement."
+)
+
+TRANSFER_DESCRIPTION = (
+    "Move a real item between the AI character and a nearby observed structure. "
+    "count is 1-100. "
+    "Choose inventory_role from the structure's inventory_roles in observe_nearby. "
+    "Role aliases: stone-furnace and assembling-machine-1 accept input -> source "
+    "and output -> result; lab accepts source -> input. Returned roles stay canonical. "
+    "missing_materials detail includes item, requested, available (0), and contents "
+    "of the source inventory (up to 10 items sorted by name, omitted when empty). "
+    "inventory_role is included when taking items from the structure."
+)
+
+
+class TransferEntry(BaseModel):
+    target_ref: RequiredText
+    direction: Literal["to_entity", "from_entity"]
+    inventory_role: RequiredText
+    item: RequiredText
+    count: Count
+
+
+class PlaceEntry(BaseModel):
+    item: RequiredText
+    surface: RequiredText
+    x: Coordinate
+    y: Coordinate
+    direction: Literal[0, 4, 8, 12] = 0
+    underground_type: Literal["input", "output"] | None = None
+
 
 HINTS = {
     "invalid_input": (
@@ -71,7 +124,46 @@ HINTS = {
 }
 
 
+def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    detail = detail.copy()
+    if "role_aliases" in detail and not isinstance(detail["role_aliases"], dict):
+        detail["role_aliases"] = {}
+    # Factorio serializes empty Lua arrays as objects.
+    for field in (
+        "blocking",
+        "tiles",
+        "missing",
+        "missing_raw",
+        "valid_roles",
+        "supported_entities",
+        "contents",
+    ):
+        if field in detail and not isinstance(detail[field], list):
+            detail[field] = []
+    return detail
+
+
+def _normalize_batch_result(result: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(result.get("results"), list):
+        result["results"] = []
+    for entry in result["results"]:
+        if entry.get("ok") is False:
+            if isinstance(entry.get("detail"), dict):
+                entry["detail"] = _normalize_error_detail(entry["detail"])
+            if entry.get("error") in HINTS:
+                entry["hint"] = HINTS[entry["error"]]
+    return result
+
+
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
+    if operation in ("transfer_items", "place_entities"):
+        return _normalize_batch_result(result)
+    if operation == "get_request_result":
+        original = result.get("original_response")
+        if isinstance(original, dict) and isinstance(original.get("result"), dict):
+            cached = original["result"]
+            if "results" in cached and "succeeded" in cached and "failed" in cached:
+                _normalize_batch_result(cached)
     if "role_aliases" in result and not isinstance(result["role_aliases"], dict):
         result["role_aliases"] = {}
     array_fields = {
@@ -125,21 +217,9 @@ def _error_response(exc: Exception) -> CallToolResult:
     if isinstance(detail, dict):
         if detail.get("request_id") is not None:
             value["request_id"] = detail["request_id"]
-        public_detail = {key: item for key, item in detail.items() if key != "request_id"}
-        if "role_aliases" in public_detail and not isinstance(public_detail["role_aliases"], dict):
-            public_detail["role_aliases"] = {}
-        # Factorio serializes empty Lua arrays as objects.
-        for field in (
-            "blocking",
-            "tiles",
-            "missing",
-            "missing_raw",
-            "valid_roles",
-            "supported_entities",
-            "contents",
-        ):
-            if field in public_detail and not isinstance(public_detail[field], list):
-                public_detail[field] = []
+        public_detail = _normalize_error_detail(
+            {key: item for key, item in detail.items() if key != "request_id"}
+        )
         if public_detail:
             value["detail"] = public_detail
     if code in HINTS:
@@ -409,30 +489,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     async def craft(recipe: RequiredText, count: Count) -> CallToolResult:
         return await invoke("craft", {"recipe": recipe, "count": count})
 
-    @server.tool(
-        description=(
-            "Place a supported entity within build reach, consuming one real inventory item."
-            " Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground."
-            " underground_type is only valid for underground-belt: input or output"
-            " (default input). direction is belt travel direction for both ends;"
-            " for output it is the direction items leave."
-            " The placement area must be covered by any of the last 8 observations"
-            " within 60 seconds."
-            " Returns the snapped position and actual fluid_connections with port position,"
-            " target_position, direction, flow, fluidbox_index, and connected when present."
-            " For offshore-pump, the water_direction side must face water; pipes/boilers"
-            " connect on the output_direction side (see check_placement or observe_nearby)."
-            " Blocked errors may include valid_directions for another orientation."
-            " Each detail.blocking entry includes a target_ref usable with mine_entity"
-            " for 60 seconds, subject to reach and force checks."
-            " detail.reason is character_in_the_way when the character blocks placement"
-            " (move the character away first), or placement_rules when no blocking entities,"
-            " tiles, or character explain the failure."
-            " For placement_rules, detail.nearby_positions lists up to 3 placeable centres"
-            " and directions within 8 tiles of the requested position."
-            " They may be out of reach; move closer and check again with check_placement."
-        )
-    )
+    @server.tool(description=PLACE_DESCRIPTION)
     async def place_entity(
         item: RequiredText,
         surface: RequiredText,
@@ -451,6 +508,25 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                 )
             params["underground_type"] = underground_type
         return await invoke("place_entity", params)
+
+    @server.tool(
+        description=(
+            "Place 1-10 entities in order in one tick without walking. "
+            "Each entry follows place_entity rules: "
+            + PLACE_DESCRIPTION
+            + " Walking or mining causes action_conflict for each entry; crafting is allowed. "
+            "Failures do not stop later entries. Returns results with 1-based index, ok, "
+            "and result or error/detail/hint using the same error codes as place_entity, "
+            "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
+            "even if all entries failed."
+        )
+    )
+    async def place_entities(
+        items: Annotated[list[PlaceEntry], Field(min_length=1, max_length=10, strict=True)],
+    ) -> CallToolResult:
+        return await invoke(
+            "place_entities", {"items": [entry.model_dump(exclude_none=True) for entry in items]}
+        )
 
     @server.tool(
         description=(
@@ -504,18 +580,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     async def get_entity_inventory(target_ref: RequiredText) -> CallToolResult:
         return await invoke("get_entity_inventory", {"target_ref": target_ref})
 
-    @server.tool(
-        description=(
-            "Move a real item between the AI character and a nearby observed structure. "
-            "count is 1-100. "
-            "Choose inventory_role from the structure's inventory_roles in observe_nearby. "
-            "Role aliases: stone-furnace and assembling-machine-1 accept input -> source "
-            "and output -> result; lab accepts source -> input. Returned roles stay canonical. "
-            "missing_materials detail includes item, requested, available (0), and contents "
-            "of the source inventory (up to 10 items sorted by name, omitted when empty). "
-            "inventory_role is included when taking items from the structure."
-        )
-    )
+    @server.tool(description=TRANSFER_DESCRIPTION)
     async def transfer_item(
         target_ref: RequiredText,
         direction: Literal["to_entity", "from_entity"],
@@ -533,6 +598,24 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                 "count": count,
             },
         )
+
+    @server.tool(
+        description=(
+            "Transfer 1-10 items in order in one tick without walking. "
+            "Each entry follows transfer_item rules: "
+            + TRANSFER_DESCRIPTION
+            + " Target refs expire after 60 seconds; targets must be owned and within reach. "
+            "Walking or mining causes action_conflict for each entry; crafting is allowed. "
+            "Failures do not stop later entries. Returns results with 1-based index, ok, "
+            "and result or error/detail/hint using the same error codes as transfer_item, "
+            "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
+            "even if all entries failed."
+        )
+    )
+    async def transfer_items(
+        items: Annotated[list[TransferEntry], Field(min_length=1, max_length=10, strict=True)],
+    ) -> CallToolResult:
+        return await invoke("transfer_items", {"items": [entry.model_dump() for entry in items]})
 
     @server.tool(
         description=(
