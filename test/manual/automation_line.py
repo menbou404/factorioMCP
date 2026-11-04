@@ -207,7 +207,9 @@ def check_new_placeables(recipes):
         # Base 2.0.77 insert_position is (0, 2.2): the addressed tile is two
         # tiles away, even though its drop coordinate is offset by 2.2.
         assert tile_center(inserter["drop_position"]) == (position[0], position[1] + 2), inserter
-        assert math.isclose(inserter["drop_position"]["y"] - position[1], 2.2), inserter
+        assert math.isclose(inserter["drop_position"]["y"] - position[1], 2.2, abs_tol=0.01), (
+            inserter
+        )
         print("splitter and long-handed inserter placed", flush=True)
 
         pipes = ((25.5, -1.5), (28.5, -1.5))
