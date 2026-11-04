@@ -1140,6 +1140,51 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(text=text):
                 self.assertIn(text, description)
 
+    async def test_move_within_schema_and_forwarding(self):
+        bridge = Mock()
+        bridge.call.return_value = {"result": {"action_id": "1", "status": "running"}}
+        server = create_server(bridge)
+        tools = {tool.name: tool for tool in await server.list_tools()}
+        schema = tools["move_to"].input_schema
+        self.assertEqual(set(schema["required"]), {"surface", "x", "y"})
+        within = schema["properties"]["within"]
+        self.assertIsNone(within["default"])
+        number = next(option for option in within["anyOf"] if option["type"] == "number")
+        self.assertEqual(number["minimum"], 0.5)
+        self.assertEqual(number["maximum"], 10)
+        params = {"surface": "nauvis", "x": 6, "y": 4}
+        for optional in ({}, {"within": None}, {"within": 0.5}, {"within": 2.75}, {"within": 10}):
+            with self.subTest(optional=optional):
+                result = await server.call_tool("move_to", {**params, **optional})
+                self.assertFalse(result.is_error)
+                expected = params if optional.get("within") is None else {**params, **optional}
+                bridge.call.assert_called_with("move_to", expected)
+
+    async def test_invalid_move_within_is_rejected_before_bridge(self):
+        bridge = Mock()
+        server = create_server(bridge)
+        for within in (0, 0.49, 10.01, float("nan"), float("inf"), -float("inf"), True, "3", []):
+            with self.subTest(within=within), self.assertRaises(ToolError):
+                await server.call_tool(
+                    "move_to", {"surface": "nauvis", "x": 6, "y": 4, "within": within}
+                )
+        bridge.call.assert_not_called()
+
+    async def test_observe_and_move_descriptions_explain_order_and_within(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for text in ("nearest first", "x, y, then name", "entity_offset pages follow this order"):
+            self.assertIn(text, tools["observe_nearby"].description)
+        for text in (
+            "within (0.5-10 tiles)",
+            "character centre",
+            "Euclidean distance",
+            "pathfinder uses the same radius",
+            "reach.interact from observe_nearby",
+            "structure surrounded by other buildings",
+            "completion detail includes within and the final distance",
+        ):
+            self.assertIn(text, tools["move_to"].description)
+
     async def test_move_tool_description_explains_path_not_found_detail(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
         description = tools["move_to"].description
@@ -1179,9 +1224,29 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             "nearby_free_position",
             "standable spot to try with move_to",
             "no path guarantee",
+            "structure among buildings",
+            "within set to the interaction reach",
+            "reach.interact from observe_nearby",
         ):
             with self.subTest(text=text):
                 self.assertIn(text, value["hint"])
+
+    async def test_move_within_failure_preserves_distance_and_obstacle_detail(self):
+        bridge = Mock()
+        detail = {
+            "goal": {"x": 6, "y": 4},
+            "within": 3,
+            "distance": 6,
+            "goal_entities": [{"name": "stone-furnace", "type": "furnace", "x": 6, "y": 4}],
+            "nearby_free_position": {"x": 4, "y": 4},
+        }
+        bridge.call.side_effect = BridgeError("path_not_found", detail=detail)
+        result = await create_server(bridge).call_tool(
+            "move_to", {"surface": "nauvis", "x": 6, "y": 4, "within": 3}
+        )
+        self.assertTrue(result.is_error)
+        self.assertEqual(payload(result)["detail"], detail)
+        self.assertIn("within set to the interaction reach", payload(result)["hint"])
 
     async def test_placement_tool_descriptions_explain_preview_metadata(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}

@@ -1159,6 +1159,120 @@ def main():
         bridge.call("get_agent_status")["result"]["position"] == current,
     )
 
+    # M16-AB/AD: keep the original furnace and drill intact for logistics_line.py.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    pending_move = None
+    try:
+        for within in (0.49, 10.01, True, "3"):
+            expect_error(
+                f"move_to rejects invalid within {within!r}",
+                "move_to",
+                {**return_position, "within": within},
+                {"invalid_input"},
+            )
+        expect_error(
+            "move_to within keeps the 128-tile goal limit",
+            "move_to",
+            {**return_position, "x": return_position["x"] + 128.7, "within": 10},
+            {"out_of_range"},
+        )
+        action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+        observed = bridge.call("observe_nearby")["result"]
+        entities = observed["entities"]
+        distances = [entity["distance"] for entity in entities]
+        order = [
+            (entity["distance"], entity["x"], entity["y"], entity["name"]) for entity in entities
+        ]
+        record(
+            "observation lists nearest entities first",
+            len(entities) >= 2 and distances == sorted(distances) and order == sorted(order),
+            json.dumps(order),
+        )
+        page = bridge.call("observe_nearby", {"entity_offset": 1})["result"]
+        record(
+            "observation paging follows nearest-first order",
+            [
+                (entity["distance"], entity["x"], entity["y"], entity["name"])
+                for entity in page["entities"]
+            ]
+            == order[1:],
+        )
+        goal = {"surface": "nauvis", "x": 6, "y": 4}
+        record(
+            "within goal is occupied by the original furnace",
+            any(
+                entity["name"] == "stone-furnace" and entity["x"] == 6 and entity["y"] == 4
+                for entity in entities
+            ),
+        )
+        start = {"surface": "nauvis", "x": 0, "y": 4}
+        action("move_to", start)
+        try:
+            pending_move = bridge.call("move_to", goal)["result"]["action_id"]
+            waited = asyncio.run(
+                server.call_tool(
+                    "wait_for_action", {"action_id": pending_move, "timeout_seconds": 15}
+                )
+            )
+            plain = json.loads(waited.content[0].text)
+        except BridgeError as error:
+            plain = {"status": "failed", "error": error.code, "detail": error.detail}
+        record(
+            "plain move_to cannot stand at enclosed goal",
+            (plain.get("status") == "failed" and plain.get("error") == "path_not_found")
+            or (
+                plain.get("status") == "succeeded"
+                and (plain.get("detail") or {}).get("goal_blocked") is True
+            ),
+            json.dumps(plain),
+        )
+        if plain.get("status") == "running":
+            bridge.call("cancel_action", {"action_id": pending_move})
+        pending_move = None
+        action("move_to", start)
+        before_move = bridge.call("get_agent_status")["result"]["position"]
+        initial_distance = math.hypot(before_move["x"] - goal["x"], before_move["y"] - goal["y"])
+        pending_move = bridge.call("move_to", {**goal, "within": 3})["result"]["action_id"]
+        waited = asyncio.run(
+            server.call_tool("wait_for_action", {"action_id": pending_move, "timeout_seconds": 15})
+        )
+        value = json.loads(waited.content[0].text)
+        detail = value.get("detail") or {}
+        final_position = bridge.call("get_agent_status")["result"]["position"]
+        final_distance = math.hypot(
+            final_position["x"] - goal["x"], final_position["y"] - goal["y"]
+        )
+        record(
+            "move_to within stops near an enclosed goal",
+            not waited.is_error
+            and value.get("status") == "succeeded"
+            and initial_distance > 3
+            and final_distance <= 3
+            and detail.get("within") == 3
+            and math.isclose(detail.get("distance", -1), final_distance, abs_tol=1e-6)
+            and "goal_blocked" not in detail,
+            json.dumps({"plain": plain, "within": value, "final_distance": final_distance}),
+        )
+        time.sleep(0.25)
+        record(
+            "move_to within stops walking after arrival",
+            bridge.call("get_agent_status")["result"]["position"] == final_position,
+        )
+        # Already in radius: complete without needing a path into the furnace.
+        arrived = action("move_to", {**goal, "within": 3})
+        record(
+            "move_to within succeeds when already near the goal",
+            arrived.get("detail", {}).get("within") == 3
+            and arrived["detail"]["distance"] <= 3
+            and bridge.call("get_agent_status")["result"]["position"] == final_position,
+        )
+    finally:
+        if pending_move is not None:
+            current_move = bridge.call("get_action_status", {"action_id": pending_move})["result"]
+            if current_move.get("status") == "running":
+                bridge.call("cancel_action", {"action_id": pending_move})
+        action("move_to", return_position)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
