@@ -975,6 +975,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 "researching": False,
                 "progress": None,
                 "timed_out": False,
+                "stalled": False,
             },
         )
         bridge.call.assert_called_once_with("get_research_status", None)
@@ -1071,6 +1072,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                         "researching": True,
                         "progress": progress,
                         "timed_out": True,
+                        "stalled": False,
                         "waited_seconds": 1,
                     },
                 )

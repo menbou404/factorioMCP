@@ -1273,6 +1273,84 @@ def main():
                 bridge.call("cancel_action", {"action_id": pending_move})
         action("move_to", return_position)
 
+    # M16-AC: this observed land is clear of ore and needs no drill item.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    try:
+        action("move_to", {**land, "y": -2})
+        observed = bridge.call("observe_nearby")["result"]
+        record(
+            "drill diagnostic fixture has no ore",
+            not any(
+                entity["type"] == "resource"
+                and abs(entity["x"] - land["x"]) <= 1
+                and abs(entity["y"] - land["y"]) <= 1
+                for entity in observed["entities"]
+            ),
+        )
+        for direction in (0, 4, 8, 12):
+            result = asyncio.run(
+                server.call_tool(
+                    "check_placement",
+                    {"item": "burner-mining-drill", **land, "direction": direction},
+                )
+            )
+            checked = json.loads(result.content[0].text)
+            record(
+                f"drill on bare ground explains missing resources direction {direction}",
+                not result.is_error
+                and checked.get("placeable") is False
+                and checked.get("reason") == "blocked"
+                and checked.get("blocked_reason") == "placement_rules"
+                and checked.get("reason_detail") == "no_resources_in_mining_area"
+                and checked.get("mining_area_resources") == [],
+                json.dumps(checked),
+            )
+    finally:
+        action("move_to", return_position)
+
+    # M16-AE: force knowledge includes technologies whose prerequisites are still locked.
+    research_before = bridge.call("get_research_status")["result"]
+    result = asyncio.run(server.call_tool("get_technology_info", {"technology": "military-2"}))
+    info = json.loads(result.content[0].text)
+    researched = set(research_before["researched"] or [])
+    record(
+        "locked technology exposes prerequisites costs and recipes",
+        not result.is_error
+        and info.get("name") == "military-2"
+        and info.get("researched") == ("military-2" in researched)
+        and info.get("enabled") is True
+        and info.get("available") == all(name in researched for name in prerequisites)
+        and info.get("prerequisites")
+        == [{"name": name, "researched": name in researched} for name in prerequisites]
+        and {item["name"] for item in info.get("ingredients", [])}
+        == {"automation-science-pack", "logistic-science-pack"}
+        and all(item["amount"] > 0 for item in info.get("ingredients", []))
+        and info.get("unit_count", 0) > 0
+        and info.get("unit_time", 0) > 0
+        and isinstance(info.get("unlocks_recipes"), list)
+        and len(info["unlocks_recipes"]) > 0,
+        json.dumps(info),
+    )
+    unknown = "m16-unknown-technology"
+    result = asyncio.run(server.call_tool("get_technology_info", {"technology": unknown}))
+    info = json.loads(result.content[0].text)
+    record(
+        "unknown technology info explains unknown name",
+        result.is_error
+        and info.get("error") == "invalid_target"
+        and info.get("detail") == {"technology": unknown, "reason": "unknown"}
+        and "detail.technology" in info.get("hint", ""),
+        json.dumps(info),
+    )
+    research_after = bridge.call("get_research_status")["result"]
+    record(
+        "reading technology info preserves research state",
+        all(
+            research_after.get(key) == research_before.get(key)
+            for key in ("researched", "queue", "current")
+        ),
+    )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

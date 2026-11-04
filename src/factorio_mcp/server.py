@@ -50,6 +50,9 @@ PLACE_DESCRIPTION = (
     " For placement_rules, detail.nearby_positions lists up to 3 placeable centres"
     " and directions within 8 tiles of the requested position."
     " They may be out of reach; move closer and check again with check_placement."
+    " For mining drills, detail.mining_area_resources lists mineable resources as {name, tiles}"
+    " in the snapped mining area, sorted by name; an empty list also sets"
+    " detail.reason_detail to no_resources_in_mining_area."
 )
 
 TRANSFER_DESCRIPTION = (
@@ -110,6 +113,8 @@ HINTS = {
         "For placement_rules, nearby_positions lists up to 3 placeable centres and directions "
         "within 8 tiles of the requested position. They may be out of reach; "
         "move closer and check again with check_placement."
+        " For mining drills, mining_area_resources lists mineable resources as {name, tiles};"
+        " reason_detail=no_resources_in_mining_area means move the drill onto suitable ore."
     ),
     "invalid_target": "Check the target, detail, and the tool's supported targets before retrying.",
     "out_of_range": (
@@ -133,6 +138,10 @@ INVENTORY_TARGET_HINT = (
 )
 
 OPERATION_HINTS = {
+    ("get_technology_info", "invalid_target"): (
+        "Check detail.technology: detail.reason=unknown means that internal technology name "
+        "does not exist in the character's force. Use a technology name from get_research_status."
+    ),
     ("start_research", "invalid_target"): (
         "Check detail.reason. For missing_prerequisites, research "
         "detail.missing_prerequisites first; get_research_status lists available technologies."
@@ -176,6 +185,7 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
         "valid_roles",
         "supported_entities",
         "contents",
+        "mining_area_resources",
     ):
         if field in detail and not isinstance(detail[field], list):
             detail[field] = []
@@ -221,6 +231,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         "get_agent_status": ("inventory",),
         "list_craftable_recipes": ("recipes",),
         "get_research_status": ("researched", "queue", "available"),
+        "get_technology_info": ("prerequisites", "ingredients", "unlocks_recipes"),
         "start_research": ("queue",),
         "get_recipe_info": ("ingredients", "products"),
     }
@@ -238,7 +249,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
                 if field in entity and not isinstance(entity[field], list):
                     entity[field] = []
     if operation == "check_placement":
-        for field in ("blocking", "tiles"):
+        for field in ("blocking", "tiles", "mining_area_resources"):
             if field in result and not isinstance(result[field], list):
                 result[field] = []
         coverage = result.get("electric_coverage")
@@ -450,9 +461,26 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
 
     @server.tool(
         description=(
+            "Read a technology in the AI character's force, even before it is available. "
+            "Returns name, researched, available, enabled, prerequisites with researched flags, "
+            "unit_count, unit_time in seconds, ingredients as {name, amount}, unlocks_recipes, "
+            "and trigger metadata when present (same shape as get_research_status). "
+            "available requires enabled, unresearched, and all prerequisites researched. "
+            "Read-only; unknown names return invalid_target with detail.reason=unknown."
+        )
+    )
+    async def get_technology_info(technology: RequiredText) -> CallToolResult:
+        return await invoke("get_technology_info", {"technology": technology})
+
+    @server.tool(
+        description=(
             "Wait for a technology to finish research. Returns early if it is not queued. "
             "Prefer this over polling get_research_status. The maximum wait is 50 seconds "
             "to keep it under common 60-second client tool timeouts."
+            " Returns early with stalled=true, stalled_seconds, progress, and timed_out=false "
+            "when this technology is current and its progress has not changed for 10 seconds "
+            "of waiting. Otherwise stalled=false. On a stall, check labs' missing_science in "
+            "observe_nearby, lab power, and that labs hold every required science pack."
         )
     )
     async def wait_for_research(
@@ -460,6 +488,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         timeout_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] = 20,
     ) -> CallToolResult:
         started = time.monotonic()
+        unchanged_since = None
+        last_progress = None
         try:
             while True:
                 response = await call("get_research_status")
@@ -467,20 +497,38 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                 researched = technology in value["researched"]
                 current = value.get("current") == technology
                 researching = current or technology in value["queue"]
-                waited = time.monotonic() - started
-                if researched or not researching or waited >= timeout_seconds:
-                    return _response(
-                        {
-                            "technology": technology,
-                            "researched": researched,
-                            "researching": researching,
-                            "progress": value.get("progress") if current else None,
-                            "timed_out": not researched
-                            and researching
-                            and waited >= timeout_seconds,
-                            "waited_seconds": waited,
-                        }
-                    )
+                now = time.monotonic()
+                waited = now - started
+                progress = value.get("progress") if current else None
+                if current and progress is not None and not researched:
+                    if unchanged_since is None or progress != last_progress:
+                        unchanged_since = now
+                    last_progress = progress
+                else:
+                    unchanged_since = None
+                    last_progress = None
+                stalled_seconds = now - unchanged_since if unchanged_since is not None else 0
+                stalled = stalled_seconds >= 10
+                if researched or not researching or stalled or waited >= timeout_seconds:
+                    result = {
+                        "technology": technology,
+                        "researched": researched,
+                        "researching": researching,
+                        "progress": progress,
+                        "stalled": stalled,
+                        "timed_out": not researched
+                        and researching
+                        and not stalled
+                        and waited >= timeout_seconds,
+                        "waited_seconds": waited,
+                    }
+                    if stalled:
+                        result["stalled_seconds"] = stalled_seconds
+                        result["hint"] = (
+                            "Check labs' missing_science in observe_nearby, lab power, "
+                            "and that labs hold every required science pack."
+                        )
+                    return _response(result)
                 await asyncio.sleep(min(0.25, timeout_seconds - waited))
         except Exception as exc:
             return _error_response(exc)
@@ -635,6 +683,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "For placement_rules, nearby_positions lists up to 3 placeable centres and "
             "directions within 8 tiles of the requested position. "
             "They may be out of reach; move closer and check again with check_placement."
+            " For mining drills, mining_area_resources lists mineable resources as {name, tiles} "
+            "in the snapped mining area, sorted by name; an empty list also sets "
+            "reason_detail to no_resources_in_mining_area."
         )
     )
     async def check_placement(
