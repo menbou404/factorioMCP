@@ -318,6 +318,87 @@ def power_snapshot():
     return observed
 
 
+async def check_power_previews_and_inventories():
+    """Read-only M15 checks before fuelling the boiler or stocking the lab."""
+    server = create_server(bridge)
+
+    async def invoke(operation, params):
+        response = await server.call_tool(operation, params)
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    before = items()
+    observed = observe()
+    pole = entity_at(observed, "small-electric-pole", POLES[1])
+
+    async def preview(item, position):
+        return await invoke(
+            "check_placement",
+            {"item": item, "surface": "nauvis", "x": position[0], "y": position[1]},
+        )
+
+    covered = await preview("inserter", (20.5, -23.5))
+    assert covered["placeable"], covered
+    coverage = covered["electric_coverage"]
+    assert coverage["covered"] is True and 1 <= len(coverage["poles"]) <= 3, covered
+    assert any(
+        (p["x"], p["y"], p.get("electric_network_id"))
+        == (pole["x"], pole["y"], pole.get("electric_network_id"))
+        for p in coverage["poles"]
+    ), covered
+    distances = [math.hypot(p["x"] - 20.5, p["y"] + 23.5) for p in coverage["poles"]]
+    assert distances == sorted(distances), covered
+    uncovered = await preview("inserter", (24.5, -18.5))
+    assert uncovered["placeable"], uncovered
+    assert uncovered["electric_coverage"] == {"covered": False, "poles": []}, uncovered
+
+    # A large box can overlap although its centre is outside the supply square.
+    edge = await preview("assembling-machine-1", (24.5, -23.5))
+    assert edge["electric_coverage"]["covered"] is True, edge
+    outside = await preview("assembling-machine-1", (25.5, -23.5))
+    assert outside["electric_coverage"] == {"covered": False, "poles": []}, outside
+    blocked = await preview("lab", LAB)
+    assert not blocked["placeable"] and blocked["electric_coverage"]["covered"], blocked
+
+    connected = await preview("small-electric-pole", (21.5, -20.5))
+    assert connected["placeable"] and connected["electric_coverage"]["connects"] is True, connected
+    assert any((p["x"], p["y"]) == POLES[1] for p in connected["electric_coverage"]["poles"]), (
+        connected
+    )
+    non_electric = await preview("stone-furnace", (24.5, -18.5))
+    assert "electric_coverage" not in non_electric, non_electric
+
+    # Both inventories are stable: no boiler fuel and no science in the lab yet.
+    refs = [
+        entity_at(observed, name, pos)["target_ref"]
+        for name, pos in (("lab", LAB), ("boiler", BOILER))
+    ]
+    singles = [await invoke("get_entity_inventory", {"target_ref": ref}) for ref in refs]
+    invalid = await server.call_tool("get_entity_inventory", {"target_ref": "m15-invalid-ref"})
+    assert invalid.is_error, invalid
+    invalid_value = json.loads(invalid.content[0].text)
+    batch = await invoke(
+        "get_entity_inventories", {"target_refs": [refs[0], "m15-invalid-ref", refs[1]]}
+    )
+    assert (batch["succeeded"], batch["failed"]) == (2, 1), batch
+    assert [entry["index"] for entry in batch["results"]] == [1, 2, 3], batch
+    for entry, single in zip((batch["results"][0], batch["results"][2]), singles, strict=True):
+        assert entry["ok"] is True, batch
+        assert entry["result"] == {k: v for k, v in single.items() if k not in ("ok", "tick")}, (
+            batch
+        )
+        assert all(
+            isinstance(contents, list) for contents in entry["result"]["inventories"].values()
+        ), batch
+    failed = batch["results"][1]
+    assert failed["ok"] is False, batch
+    for key in ("error", "detail", "hint"):
+        assert failed.get(key) == invalid_value.get(key), (batch, invalid_value)
+    assert items() == before, "Read-only checks changed held items"
+    print("electric coverage previews and mixed batch inventory reads match singles", flush=True)
+
+
 def main():
     global run_deadline
     run_deadline = time.monotonic() + 840
@@ -399,6 +480,7 @@ def main():
     assert all(math.dist(a, b) <= 7 for a, b in zip(POLES, POLES[1:], strict=False)), POLES
     for position in POLES:
         place("small-electric-pole", position)
+    asyncio.run(check_power_previews_and_inventories())
     boiler = entity_at(observe(), "boiler", BOILER)
     transfer(boiler, "fuel", "coal", 10)
 

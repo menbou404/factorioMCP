@@ -1281,6 +1281,59 @@ local function placement_bounding_box(prototype, position, direction)
           right_bottom = {x = position.x + right, y = position.y + bottom}}
 end
 
+local function placement_electric_coverage(character, prototype, position, box)
+  local is_pole = prototype.type == "electric-pole"
+  if not is_pole and prototype.electric_energy_source_prototype == nil then return nil end
+  local radius
+  if is_pole then
+    -- A connection is limited by BOTH poles, so the new pole bounds the search.
+    radius = prototype.get_max_wire_distance()
+  else
+    local max_supply = 0
+    for _, pole in pairs(prototypes.get_entity_filtered{{filter = "type", type = "electric-pole"}}) do
+      max_supply = math.max(max_supply, pole.get_supply_area_distance())
+    end
+    -- Supply squares can overlap a rotated box even beyond the centre's radius.
+    local dx = math.max(position.x - box.left_top.x, box.right_bottom.x - position.x)
+    local dy = math.max(position.y - box.left_top.y, box.right_bottom.y - position.y)
+    radius = math.sqrt((max_supply + dx) ^ 2 + (max_supply + dy) ^ 2)
+  end
+  local poles = {}
+  for _, pole in pairs(character.surface.find_entities_filtered{
+    position = position, radius = radius, type = "electric-pole", force = character.force
+  }) do
+    if pole.valid then
+      local overlaps
+      if is_pole then
+        local reach = math.min(radius, pole.prototype.get_max_wire_distance())
+        overlaps = distance_squared(pole.position, position) <= reach * reach
+      else
+        -- 2.0.77 ElectricPolePrototype: supply_area_distance is the square's
+        -- half-size (base small pole = 2.5, hence 5x5). Require positive overlap;
+        -- merely touching an edge does not cover the placement collision box.
+        local supply = pole.prototype.get_supply_area_distance()
+        overlaps = box.left_top.x < pole.position.x + supply and
+                   box.right_bottom.x > pole.position.x - supply and
+                   box.left_top.y < pole.position.y + supply and
+                   box.right_bottom.y > pole.position.y - supply
+      end
+      if overlaps then
+        poles[#poles + 1] = {x = pole.position.x, y = pole.position.y,
+                             electric_network_id = pole.electric_network_id}
+      end
+    end
+  end
+  table.sort(poles, function(a, b)
+    local da, db = distance_squared(a, position), distance_squared(b, position)
+    if da ~= db then return da < db end
+    if a.x ~= b.x then return a.x < b.x end
+    return a.y < b.y
+  end)
+  while #poles > 3 do table.remove(poles) end
+  if is_pole then return {connects = #poles > 0, poles = poles} end
+  return {covered = #poles > 0, poles = poles}
+end
+
 local function placement_blocking(state, character, prototype, position, direction)
   -- Keep the requested position so every alternative direction snaps independently.
   local area = placement_bounding_box(prototype, snapped_position(prototype, position, direction),
@@ -1450,7 +1503,7 @@ local function do_check_placement(state, params)
   local has_item = item_proto ~= nil and inventory ~= nil and
     inventory.get_item_count({name = params.item, quality = "normal"}) >= 1
   local direction = params.direction or defines.direction.north
-  local position, box, fluid_connections
+  local position, box, fluid_connections, electric_coverage
   if prototype and PLACEABLE_ITEMS[params.item] and params.surface == character.surface.name and
      (direction == 0 or direction == 4 or direction == 8 or direction == 12) and
      type(params.x) == "number" and type(params.y) == "number" and
@@ -1459,6 +1512,7 @@ local function do_check_placement(state, params)
     position = snapped_position(prototype, {x = params.x, y = params.y}, direction)
     box = placement_bounding_box(prototype, position, direction)
     fluid_connections = preview_fluid_connections(prototype, position, direction)
+    electric_coverage = placement_electric_coverage(character, prototype, position, box)
   end
   local blocked = reason == "blocked" and detail or {}
   local water_direction, output_direction = offshore_pump_directions(
@@ -1466,6 +1520,7 @@ local function do_check_placement(state, params)
   return {placeable = placement ~= nil, reason = reason,
           entity = prototype and prototype.name or nil, has_item = has_item,
           position = position, bounding_box = box, fluid_connections = fluid_connections,
+          electric_coverage = electric_coverage,
           water_direction = water_direction, output_direction = output_direction,
           blocking = blocked.blocking, tiles = blocked.tiles,
           valid_directions = blocked.valid_directions, blocked_reason = blocked.reason,
@@ -1659,14 +1714,17 @@ local function do_transfer(state, params)
 end
 
 local function do_batch(state, params, handler)
-  local items = params.items
+  local inventory_read = handler == do_entity_inventory
+  local items
+  if inventory_read then items = params.target_refs else items = params.items end
   if type(items) ~= "table" then return nil, "invalid_input" end
   -- Validate the entire list before invoking any mutating handler. Reject maps,
-  -- sparse lists, and non-table entries rather than silently skipping them.
+  -- sparse lists, and invalid entry types rather than silently skipping them.
   local count = 0
   for index, entry in pairs(items) do
     if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > 10 or
-       type(entry) ~= "table" then
+       (inventory_read and (type(entry) ~= "string" or #entry == 0)) or
+       (not inventory_read and type(entry) ~= "table") then
       return nil, "invalid_input"
     end
     count = count + 1
@@ -1677,8 +1735,9 @@ local function do_batch(state, params, handler)
   end
   local results, succeeded = {}, 0
   for index = 1, count do
-    -- Both single and batch operations use the same validation and mutations.
-    local ok, result, err, detail = pcall(handler, state, items[index])
+    -- Single and batch operations share all reach, observation and force checks.
+    local entry = inventory_read and {target_ref = items[index]} or items[index]
+    local ok, result, err, detail = pcall(handler, state, entry)
     if not ok then
       log("AI MCP batch handler error: " .. tostring(result))
       err = "internal_error"
@@ -1692,7 +1751,8 @@ local function do_batch(state, params, handler)
   end
   -- Preserve single-operation hints when get_request_result recovers this batch.
   return {results = results, succeeded = succeeded, failed = count - succeeded,
-          operation = handler == do_transfer and "transfer_item" or "place_entity"}
+          operation = inventory_read and "get_entity_inventory" or
+                      (handler == do_transfer and "transfer_item" or "place_entity")}
 end
 
 local function running_action_slot(state, action_id)
@@ -1760,6 +1820,9 @@ local handlers = {
     return {agent_id = AGENT_ID, items = inventory_contents(character)}
   end,
   get_entity_inventory = do_entity_inventory,
+  get_entity_inventories = function(state, params)
+    return do_batch(state, params, do_entity_inventory)
+  end,
   list_craftable_recipes = do_list_craftable,
   get_recipe_info = do_recipe_info,
   get_research_status = do_research,
