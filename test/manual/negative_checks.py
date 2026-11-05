@@ -1671,8 +1671,9 @@ def main():
     pending_move = None
 
     def contact_walking(walking):
+        # storage belongs to the mod's Lua state, not the default level state.
         command = (
-            "/c local c=storage.ai_mcp.character;"
+            "/c __factorio_ai_mcp__ local c=storage.ai_mcp.character;"
             f"c.walking_state={{walking={str(walking).lower()},direction=defines.direction.east}};"
             'rcon.print("m19ar_contact:"..helpers.table_to_json({box=c.bounding_box}))'
         )
@@ -1683,7 +1684,7 @@ def main():
             if "m19ar_contact:" not in raw:
                 raw = client.run(command)
         if "m19ar_contact:" not in raw:
-            raise RuntimeError("Missing M19-AR contact response: " + raw)
+            raise RuntimeError(f"Missing M19-AR contact response: {raw!r}")
         return json.loads(raw.split("m19ar_contact:", 1)[1].strip())["box"]
 
     try:
@@ -1701,16 +1702,14 @@ def main():
         initial_x = previous["x"]
         stable = 0
         contact_walking(True)
-        try:
-            for _ in range(50):
-                time.sleep(0.1)
-                current = bridge.call("get_agent_status")["result"]["position"]
-                stable = stable + 1 if current == previous else 0
-                previous = current
-                if stable >= 3 and current["x"] - initial_x > 0.5:
-                    break
-        finally:
-            character_box = contact_walking(False)
+        for _ in range(50):
+            time.sleep(0.1)
+            current = bridge.call("get_agent_status")["result"]["position"]
+            stable = stable + 1 if current == previous else 0
+            previous = current
+            if stable >= 3 and current["x"] - initial_x > 0.5:
+                break
+        character_box = contact_walking(False)
         gap = furnace_box["left_top"]["x"] - character_box["right_bottom"]["x"]
         touching = (
             stable >= 3
@@ -1732,21 +1731,28 @@ def main():
             json.dumps(escaped),
         )
     finally:
-        contact_walking(False)
-        if pending_move is not None:
-            current = bridge.call("get_action_status", {"action_id": pending_move})["result"]
-            if current.get("status") == "running":
-                bridge.call("cancel_action", {"action_id": pending_move})
-        if contact_placed:
-            observed = bridge.call("observe_nearby", {"names": ["stone-furnace"]})["result"]
-            contact_target = next(
-                entity["target_ref"]
-                for entity in observed["entities"]
-                if entity["x"] == checked["position"]["x"]
-                and entity["y"] == checked["position"]["y"]
-            )
-            action("mine_entity", {"target_ref": contact_target, "count": 1})
-        action("move_to", return_position)
+        # Log cleanup failures without replacing an exception from the fixture.
+        try:
+            contact_walking(False)
+        except Exception as error:
+            record("M19-AR walking cleanup", False, repr(error))
+        try:
+            if pending_move is not None:
+                current = bridge.call("get_action_status", {"action_id": pending_move})["result"]
+                if current.get("status") == "running":
+                    bridge.call("cancel_action", {"action_id": pending_move})
+            if contact_placed:
+                observed = bridge.call("observe_nearby", {"names": ["stone-furnace"]})["result"]
+                contact_target = next(
+                    entity["target_ref"]
+                    for entity in observed["entities"]
+                    if entity["x"] == checked["position"]["x"]
+                    and entity["y"] == checked["position"]["y"]
+                )
+                action("mine_entity", {"target_ref": contact_target, "count": 1})
+            action("move_to", return_position)
+        except Exception as error:
+            record("M19-AR fixture cleanup", False, repr(error))
     record("obstacle contact check restores all held items", items() == before_contact)
 
     failed = [label for label, passed, _ in results if not passed]
