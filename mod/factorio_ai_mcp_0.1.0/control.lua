@@ -418,8 +418,12 @@ local function reset_move_progress(action)
   action.final_progress_tick = nil
 end
 
-local function path_not_found_detail(character, goal)
+local function path_not_found_detail(character, goal, action)
   local detail = {goal = {x = goal.x, y = goal.y}}
+  if action and action.path_start_adjusted then
+    local start = action.path_start_adjusted
+    detail.start_adjusted = {x = start.x, y = start.y}
+  end
   -- A path response can arrive after the character has been removed.
   if not character or not character.valid then return detail end
   detail.distance = math.sqrt(distance_squared(character.position, goal))
@@ -463,6 +467,37 @@ local function path_not_found_detail(character, goal)
   return detail
 end
 
+local function path_start_blocked(character)
+  -- Include touching edges and fixed-point rounding, not just strict overlaps.
+  local box = character.bounding_box
+  local epsilon = 0.01
+  local area = {left_top = {x = box.left_top.x - epsilon, y = box.left_top.y - epsilon},
+                right_bottom = {x = box.right_bottom.x + epsilon,
+                                y = box.right_bottom.y + epsilon}}
+  local surface = character.surface
+  local layers = character.prototype.collision_mask.layers
+  for _, entity in pairs(surface.find_entities_filtered{area = area}) do
+    if entity.valid and entity ~= character then
+      local entity_box = entity.bounding_box
+      if entity_box.left_top.x < area.right_bottom.x and
+         entity_box.right_bottom.x > area.left_top.x and
+         entity_box.left_top.y < area.right_bottom.y and
+         entity_box.right_bottom.y > area.left_top.y then
+        local entity_layers = entity.prototype.collision_mask.layers
+        for layer in pairs(layers) do
+          if entity_layers[layer] then return true end
+        end
+      end
+    end
+  end
+  for _, tile in pairs(surface.find_tiles_filtered{area = area}) do
+    for layer in pairs(layers) do
+      if tile.collides_with(layer) then return true end
+    end
+  end
+  return false
+end
+
 local function request_path(state, character, goal)
   local action = state.action
   action.path = nil
@@ -470,10 +505,20 @@ local function request_path(state, character, goal)
   action.stuck_ticks = 0
   action.last_x, action.last_y = character.position.x, character.position.y
   reset_move_progress(action)
+  local start = character.position
+  action.path_start_adjusted = nil
+  if path_start_blocked(character) then
+    -- Bound the search to 1.5 tiles, with 0.1-tile steps for narrow corridors.
+    local free = character.surface.find_non_colliding_position("character", start, 1.5, 0.1)
+    if free and distance_squared(start, free) > 0 then
+      start = free
+      action.path_start_adjusted = {x = start.x, y = start.y}
+    end
+  end
   local id = character.surface.request_path{
     bounding_box = character.prototype.collision_box,
     collision_mask = character.prototype.collision_mask,
-    start = character.position,
+    start = start,
     goal = goal,
     force = character.force,
     radius = action.within, -- double; nil preserves the API's default radius of 1.
@@ -515,7 +560,7 @@ local function do_move(state, params)
   end
   local ok = pcall(request_path, state, character, goal)
   if not ok then
-    local detail = path_not_found_detail(character, goal)
+    local detail = path_not_found_detail(character, goal, state.action)
     finish_action(state, "action", "failed", "path_not_found", detail)
     return nil, "path_not_found", detail
   end
@@ -2306,7 +2351,7 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
     state.action.retries = state.action.retries + 1
     if state.action.retries > 3 then
       finish_action(state, "action", "failed", "path_not_found",
-        path_not_found_detail(state.character, state.action.goal))
+        path_not_found_detail(state.character, state.action.goal, state.action))
     else
       request_path(state, state.character, state.action.goal)
     end
@@ -2314,7 +2359,7 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
   end
   if not event.path or #event.path == 0 then
     finish_action(state, "action", "failed", "path_not_found",
-      path_not_found_detail(state.character, state.action.goal))
+      path_not_found_detail(state.character, state.action.goal, state.action))
     return
   end
   state.action.path = event.path
@@ -2376,6 +2421,8 @@ local function tick_action(state, slot)
         return
       end
     end
+    -- An adjusted path start can be up to 1.5 tiles away: walk to its first
+    -- waypoint as usual. The progress timers and shared retry cap still apply.
     local destination = waypoint and waypoint.position or action.goal
     local dx = destination.x - character.position.x
     local dy = destination.y - character.position.y
