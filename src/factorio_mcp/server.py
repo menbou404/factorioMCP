@@ -60,6 +60,7 @@ PLACE_DESCRIPTION = (
     " Returns target_ref for the placed entity, the snapped position and actual"
     " fluid_connections with port position,"
     " target_position, direction, flow, fluidbox_index, and connected when present."
+    " Inserters include actual pickup_position and drop_position as absolute map coordinates."
     " For offshore-pump, the water_direction side must face water; pipes/boilers"
     " connect on the output_direction side (see check_placement or observe_nearby)."
     " Blocked errors may include valid_directions for another orientation."
@@ -124,6 +125,8 @@ MACHINE_BUFFER_DESCRIPTION = (
 INVENTORY_RECIPE_DESCRIPTION = (
     " Assemblers and furnaces include recipe when available;"
     " idle furnaces use their previous recipe. Omitted when no recipe is available."
+    " They also include products_finished (lifetime crafts), recipe_products (item names),"
+    " and recipe_product_amounts (amount per craft by item, ignoring probability)."
 )
 
 RESEARCH_STALLED_HINT = (
@@ -325,6 +328,7 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
         "collected_items",
         "items",
         "ingredients",
+        "recipe_products",
     ):
         if field in detail and not isinstance(detail[field], list):
             detail[field] = []
@@ -368,7 +372,13 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
                     _normalize_result("", cached)
     if "role_aliases" in result and not isinstance(result["role_aliases"], dict):
         result["role_aliases"] = {}
-    for field in ("collected_items", "ground_items", "returned_items", "spilled_items"):
+    for field in (
+        "collected_items",
+        "ground_items",
+        "returned_items",
+        "spilled_items",
+        "recipe_products",
+    ):
         if field in result and not isinstance(result[field], list):
             result[field] = []
     array_fields = {
@@ -891,6 +901,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Item-entity blocking entries include stack={name, quality, count}. "
             "Returns the snapped position and preview fluid_connections with port position, "
             "target_position, direction, flow, and fluidbox_index when present. "
+            "Inserters include preview pickup_position and drop_position as absolute map "
+            "coordinates for the snapped position and direction, even when not placeable. "
             "For electric consumers, electric_coverage.covered reports whether the placement "
             "bounding box overlaps a pole's square supply area. For electric poles, "
             "electric_coverage.connects reports wire reach using the smaller of both poles' "
@@ -959,6 +971,13 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "inventory read errors are returned with the same hints. "
             "count is 1-10000; timeout_seconds is 1-50 (default 20). "
             "Counts all qualities across all inventory roles, or only inventory_role if given. "
+            "Use produced=true when an output inserter removes products so inventory counts "
+            "would not grow. Only assemblers and furnaces support produced (default false). "
+            "item must be a product of the current recipe (or an idle furnace's previous recipe); "
+            "otherwise invalid_input lists recipe_products. In produced mode, current is the "
+            "increase in products_finished since the first read, multiplied by the recipe's "
+            "amount of item per craft, ignoring probability; inventory_role does not filter "
+            "production. Results include produced=true. "
             "Accepts transfer_item role aliases: stone-furnace and assembling-machine-1 "
             "input -> source, output -> result; lab source -> input. Returned roles are canonical. "
             "Unknown roles return invalid_input with detail.valid_roles. "
@@ -979,10 +998,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         count: Annotated[int, Field(ge=1, le=10000, strict=True)],
         inventory_role: RequiredText | None = None,
         timeout_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] = 20,
+        produced: Annotated[bool, Field(strict=True)] = False,
     ) -> CallToolResult:
         started = time.monotonic()
         unchanged_since = None
         last_count = None
+        initial_products_finished = None
         try:
             while True:
                 response = await call("get_entity_inventory", {"target_ref": target_ref})
@@ -1002,13 +1023,39 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                             },
                         )
                     )
-                contents = [inventories[role]] if role is not None else inventories.values()
-                current = sum(
-                    stack["count"]
-                    for stacks in contents
-                    for stack in stacks
-                    if stack["name"] == item
-                )
+                if produced:
+                    if value.get("type") not in {"assembling-machine", "furnace"}:
+                        raise BridgeError(
+                            "invalid_input",
+                            "produced=true requires an assembling machine or furnace.",
+                            {"entity": value["name"]},
+                        )
+                    recipe_products = value.get("recipe_products", [])
+                    if item not in recipe_products:
+                        raise BridgeError(
+                            "invalid_input",
+                            "item must be a product of the machine's current recipe "
+                            "(or the furnace's previous recipe).",
+                            {
+                                "item": item,
+                                "recipe_products": recipe_products,
+                                "recipe": value.get("recipe"),
+                            },
+                        )
+                    finished = value["products_finished"]
+                    if initial_products_finished is None:
+                        initial_products_finished = finished
+                    current = (finished - initial_products_finished) * value[
+                        "recipe_product_amounts"
+                    ][item]
+                else:
+                    contents = [inventories[role]] if role is not None else inventories.values()
+                    current = sum(
+                        stack["count"]
+                        for stacks in contents
+                        for stack in stacks
+                        if stack["name"] == item
+                    )
                 status = value.get("status")
                 reached = current >= count
                 now = time.monotonic()
@@ -1034,6 +1081,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                     }
                     if status is not None:
                         result["status"] = status
+                    if produced:
+                        result["produced"] = True
                     if role is not None:
                         result["inventory_role"] = role
                     if stalled:
@@ -1042,6 +1091,18 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                     return _response(result)
                 await asyncio.sleep(min(0.5, timeout_seconds - waited))
         except Exception as exc:
+            if (
+                produced
+                and isinstance(exc, BridgeError)
+                and exc.code == "invalid_target"
+                and isinstance(exc.detail, dict)
+                and exc.detail.get("reason") == "unsupported_entity"
+            ):
+                exc = BridgeError(
+                    "invalid_input",
+                    "produced=true requires an assembling machine or furnace.",
+                    exc.detail,
+                )
             return _error_response(exc, "get_entity_inventory")
 
     @server.tool(

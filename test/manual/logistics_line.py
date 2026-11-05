@@ -50,9 +50,23 @@ def place(item, position, direction=0):
         assert checked["placeable"], f"Cannot place {item} at {position}: {checked}"
         assert checked["has_item"], f"Missing {item} at {position}: {checked}"
         step = "place_entity"
-        call("place_entity", params)
+        placed = call("place_entity", params)
         step = "verify_placement"
-        return entity_at(observe(), item, position)
+        entity = entity_at(observe(), item, position)
+        if "pickup_position" in entity:
+            # The occupied footprint must still return the same preview.
+            blocked = call("check_placement", params)
+            assert not blocked["placeable"], blocked
+            for field in ("pickup_position", "drop_position"):
+                for axis in ("x", "y"):
+                    for result in (placed, entity, blocked):
+                        assert abs(checked[field][axis] - result[field][axis]) <= 0.01, (
+                            params,
+                            checked,
+                            result,
+                        )
+            print("PASS M21-AV inserter preview, placement and observation", direction, flush=True)
+        return entity
     except Exception as error:
         print(
             f"placement failed: step={step}, item={item}, position={position}, "
@@ -237,7 +251,25 @@ def main():
     place("transport-belt", belt1_position, 4)
     place("transport-belt", belt2_position, 4)
     inserter_position = (belt2_position[0] + 1, belt2_position[1])
-    inserter = place("burner-inserter", inserter_position)
+    inserter = place("burner-inserter", inserter_position, 12)
+    # Preview all inserter prototypes, including ones outside the build allowlist.
+    fast_preview = call(
+        "check_placement",
+        {
+            "item": "fast-inserter",
+            "surface": "nauvis",
+            "x": inserter_position[0],
+            "y": inserter_position[1],
+            "direction": 12,
+        },
+    )
+    assert not fast_preview["placeable"] and fast_preview["reason"] == "invalid_target", (
+        fast_preview
+    )
+    # Base fast and burner inserters share the same pickup/drop vectors.
+    for field in ("pickup_position", "drop_position"):
+        for axis in ("x", "y"):
+            assert abs(fast_preview[field][axis] - inserter[field][axis]) <= 0.01, fast_preview
     for _ in range(3):
         if tile_center(inserter["pickup_position"]) == belt2_position:
             break
@@ -288,6 +320,9 @@ def main():
         result = bridge.call("get_entity_inventory", {"target_ref": furnace["target_ref"]})[
             "result"
         ]
+        if result["products_finished"] > 0:
+            assert "iron-plate" in result["recipe_products"], result
+            assert result["recipe_product_amounts"]["iron-plate"] == 1, result
         plates = amount(result["inventories"]["result"], "iron-plate")
         now = time.monotonic()
         if now >= next_report:
