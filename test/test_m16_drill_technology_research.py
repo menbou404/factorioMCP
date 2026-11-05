@@ -199,18 +199,34 @@ class ResearchStallTests(unittest.IsolatedAsyncioTestCase):
         for progress in (0, 0.8):
             with self.subTest(progress=progress):
                 value, elapsed, sleeps = await self.wait_with_clock(
-                    lambda _, progress=progress: {"current": "automation", "progress": progress}
+                    lambda _, progress=progress: {
+                        "current": "automation",
+                        "progress": progress,
+                        "remaining_units": 10 * (1 - progress),
+                    }
                 )
                 self.assertTrue(value["stalled"])
                 self.assertFalse(value["timed_out"])
                 self.assertFalse(value["researched"])
                 self.assertTrue(value["researching"])
                 self.assertEqual(value["progress"], progress)
+                self.assertEqual(value["remaining_units"], 10 * (1 - progress))
                 self.assertEqual(value["stalled_seconds"], 10)
                 self.assertEqual(value["waited_seconds"], elapsed)
                 self.assertEqual(elapsed, 10)
                 self.assertEqual(sleeps, 40)
-                for text in ("missing_science", "observe_nearby", "power", "every required"):
+                for text in (
+                    "missing_science",
+                    "observe_nearby",
+                    "power",
+                    "every required",
+                    "every lab with packs",
+                    "For each ingredient",
+                    "sum of science_units",
+                    "exceeds remaining_units",
+                    "Partly used packs stay in the lab",
+                    "labs working in parallel each need a pack of every ingredient",
+                ):
                     self.assertIn(text, value["hint"])
 
     async def test_progress_change_resets_stall_timer(self):
@@ -260,15 +276,41 @@ class ResearchStallTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(value["stalled"])
                 self.assertFalse(value["timed_out"])
                 self.assertEqual(value["researched"], bool(final))
+                self.assertNotIn("remaining_units", value)
                 self.assertEqual(elapsed, 10)
 
     async def test_short_timeout_returns_without_stall(self):
         value, elapsed, _ = await self.wait_with_clock(
-            lambda _: {"current": "automation", "progress": 0.8}, timeout=5
+            lambda t: {
+                "current": "automation",
+                "progress": 0.8 + t / 100,
+                "remaining_units": 2 - t / 10,
+            },
+            timeout=5,
         )
         self.assertTrue(value["timed_out"])
         self.assertFalse(value["stalled"])
         self.assertEqual(elapsed, 5)
+        self.assertEqual(value["remaining_units"], 1.5)
+
+    async def test_other_current_research_does_not_supply_remaining_units(self):
+        value, _, _ = await self.wait_with_clock(
+            lambda _: {
+                "current": "other",
+                "progress": 0.8,
+                "remaining_units": 2,
+                "queue": ["automation"],
+            },
+            timeout=1,
+        )
+        self.assertTrue(value["timed_out"])
+        self.assertNotIn("remaining_units", value)
+
+    async def test_zero_remaining_units_is_forwarded(self):
+        value, _, _ = await self.wait_with_clock(
+            lambda _: {"current": "automation", "progress": 1, "remaining_units": 0}, timeout=1
+        )
+        self.assertEqual(value["remaining_units"], 0)
 
     async def test_description_explains_stall_detection_and_diagnostics(self):
         tools = {tool.name: tool for tool in await create_server(None).list_tools()}
@@ -280,6 +322,9 @@ class ResearchStallTests(unittest.IsolatedAsyncioTestCase):
             "missing_science",
             "power",
             "every required science pack",
+            "remaining_units",
+            "sum of science_units",
+            "exceeds remaining_units",
         ):
             self.assertIn(text, tools["wait_for_research"].description)
 
