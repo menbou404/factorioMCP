@@ -498,23 +498,26 @@ local function path_start_blocked(character)
   return false
 end
 
-local function request_path(state, character, goal)
+local function request_path(state, character, goal, explicit_start)
   local action = state.action
   action.path = nil
   action.path_index = 1
   action.stuck_ticks = 0
   action.last_x, action.last_y = character.position.x, character.position.y
   reset_move_progress(action)
-  local start = character.position
+  local start = explicit_start or character.position
   action.path_start_adjusted = nil
-  if path_start_blocked(character) then
+  if not explicit_start and path_start_blocked(character) then
     -- Bound the search to 1.5 tiles, with 0.1-tile steps for narrow corridors.
     local free = character.surface.find_non_colliding_position("character", start, 1.5, 0.1)
     if free and distance_squared(start, free) > 0 then
       start = free
-      action.path_start_adjusted = {x = start.x, y = start.y}
     end
   end
+  if distance_squared(character.position, start) > 0 then
+    action.path_start_adjusted = {x = start.x, y = start.y}
+  end
+  action.path_start_used = {x = start.x, y = start.y}
   local id = character.surface.request_path{
     bounding_box = character.prototype.collision_box,
     collision_mask = character.prototype.collision_mask,
@@ -527,6 +530,23 @@ local function request_path(state, character, goal)
   }
   state.path_request_id = id
   return id
+end
+
+local function try_escape_path(state)
+  local action = state.action
+  if not action or action.escape_tried or not valid_character(state) then return false end
+  local character = state.character
+  local used_start = action.path_start_used or action.path_start_adjusted or character.position
+  local free = character.surface.find_non_colliding_position(
+    "character", character.position, 2, 0.5, true)
+  if not free or distance_squared(character.position, free) == 0 or
+     distance_squared(used_start, free) == 0 then
+    return false
+  end
+  -- This belongs to the move action: busy retries and stuck repaths must not reset it.
+  action.escape_tried = true
+  request_path(state, character, action.goal, free)
+  return true
 end
 
 local function do_move(state, params)
@@ -2398,17 +2418,25 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
   if event.try_again_later then
     state.action.retries = state.action.retries + 1
     if state.action.retries > 3 then
+      if try_escape_path(state) then return end
       finish_action(state, "action", "failed", "path_not_found",
         path_not_found_detail(state.character, state.action.goal, state.action))
     else
-      request_path(state, state.character, state.action.goal)
+      -- Keep the same start, including an escape start, while the pathfinder is busy.
+      request_path(state, state.character, state.action.goal, state.action.path_start_used)
     end
     return
   end
   if not event.path or #event.path == 0 then
+    if try_escape_path(state) then return end
     finish_action(state, "action", "failed", "path_not_found",
       path_not_found_detail(state.character, state.action.goal, state.action))
     return
+  end
+  local start = state.action.path_start_adjusted
+  if start and distance_squared(start, event.path[1].position) > 0 then
+    -- Always walk to the adjusted start before following the returned route.
+    table.insert(event.path, 1, {position = {x = start.x, y = start.y}})
   end
   state.action.path = event.path
   state.action.path_index = 1
@@ -2469,7 +2497,7 @@ local function tick_action(state, slot)
         return
       end
     end
-    -- An adjusted path start can be up to 1.5 tiles away: walk to its first
+    -- An adjusted path start can be up to 2 tiles away: walk to its first
     -- waypoint as usual. The progress timers and shared retry cap still apply.
     local destination = waypoint and waypoint.position or action.goal
     local dx = destination.x - character.position.x
