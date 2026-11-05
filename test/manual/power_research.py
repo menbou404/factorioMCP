@@ -538,6 +538,21 @@ def main():
         )
     ), stalled
     print("empty lab stalls research wait", json.dumps(stalled), flush=True)
+    # M21-AX: reuse the deterministic empty-lab stall above, then restore
+    # packs below so the original automation research still completes.
+    diagnosis = next(entry for entry in stalled["labs"] if entry["target_ref"] == lab["target_ref"])
+    assert (diagnosis["x"], diagnosis["y"]) == LAB, diagnosis
+    assert diagnosis["status"] == "missing_science_packs", diagnosis
+    assert diagnosis["science_units"] == [], diagnosis
+    assert diagnosis["missing"] == ["automation-science-pack"], diagnosis
+    assert diagnosis["blocking"] is False, diagnosis
+    assert stalled["short_science"] == [
+        {"name": "automation-science-pack", "available_units": 0, "remaining_units": unit_count}
+    ], stalled
+    assert "labs_error" not in stalled, stalled
+    print(
+        "PASS M21-AX stalled research diagnoses empty nearby lab", json.dumps(stalled), flush=True
+    )
     transfer(lab, "input", "automation-science-pack", 10)
     assert call("get_research_status")["current"] == "automation"
     lab = entity_at(observe(), "lab", LAB)
