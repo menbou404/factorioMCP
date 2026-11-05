@@ -1351,6 +1351,126 @@ def main():
         ),
     )
 
+    # M17-AG: only the disposable-save harness creates these three iron plates.
+    # Keep the original furnace/drill untouched for later integration scripts.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    held = items()
+    ground_item = next(
+        (name for name in ("stone-furnace", "wooden-chest") if held.get(name, 0) > 0),
+        None,
+    )
+    if ground_item is None:
+        raise RuntimeError("M17-AG requires a held stone furnace or wooden chest")
+    placed_ground_entity = False
+    ground_box = None
+
+    def ground_fixture(body):
+        command = "/c local s=game.surfaces.nauvis;" + body
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+            if "m17ag_fixture:" not in raw:
+                raw = client.run(command)
+        if "m17ag_fixture:" not in raw:
+            raise RuntimeError("Missing M17-AG fixture response: " + raw)
+        return json.loads(raw.split("m17ag_fixture:", 1)[1].strip())
+
+    def create_ground_fixture(position):
+        # The storage reference makes retries idempotent; never create a second stack.
+        fixture = ground_fixture(
+            "local e=storage.m17ag_ground_fixture;"
+            "if not e or not e.valid then "
+            'e=s.create_entity{name="item-on-ground",'
+            f"position={{x={position['x']},y={position['y']}}},"
+            'stack={name="iron-plate",quality="normal",count=3}};'
+            "storage.m17ag_ground_fixture=e end;"
+            'rcon.print("m17ag_fixture:"..helpers.table_to_json({'
+            "created=e~=nil and e.valid,count=e and e.valid and e.stack.count or 0}))"
+        )
+        record(
+            "test harness created ground stack of three iron plates",
+            fixture == {"created": True, "count": 3},
+            json.dumps(fixture),
+        )
+
+    def remove_ground_fixture():
+        ground_fixture(
+            "local e=storage.m17ag_ground_fixture;"
+            "if e and e.valid then e.destroy() end;storage.m17ag_ground_fixture=nil;"
+            "rcon.print('m17ag_fixture:{\"removed\":true}')"
+        )
+
+    try:
+        action("move_to", {**land, "y": -1})
+        bridge.call("observe_nearby")
+        params = {"item": ground_item, **land}
+        checked = bridge.call("check_placement", params)["result"]
+        if not checked.get("placeable"):
+            raise RuntimeError("M17-AG requires observed bare ground: " + json.dumps(checked))
+        params.update(checked["position"])
+        ground_box = checked["bounding_box"]
+        expected_stacks = [{"name": "iron-plate", "quality": "normal", "count": 3}]
+        before_ground = items()
+        create_ground_fixture(params)
+        checked = bridge.call("check_placement", params)["result"]
+        record(
+            "ground-only placement preview reports collectable stacks without collecting",
+            checked.get("placeable") is True
+            and checked.get("ground_items") == expected_stacks
+            and items() == before_ground,
+            json.dumps(checked),
+        )
+        placed = bridge.call("place_entity", params)["result"]
+        placed_ground_entity = True
+        record(
+            "placement collects ground items and consumes its real building item",
+            placed.get("collected_items") == expected_stacks
+            and items().get("iron-plate", 0) == before_ground.get("iron-plate", 0) + 3
+            and items().get(ground_item, 0) == before_ground[ground_item] - 1,
+            json.dumps(placed),
+        )
+        left, right = ground_box["left_top"], ground_box["right_bottom"]
+        remaining = ground_fixture(
+            'local es=s.find_entities_filtered{type="item-entity",area={'
+            f"{{{left['x']},{left['y']}}},{{{right['x']},{right['y']}}}"
+            "}};"
+            'rcon.print("m17ag_fixture:"..helpers.table_to_json({remaining=#es}))'
+        )
+        record("placement leaves no ground items in its footprint", remaining == {"remaining": 0})
+
+        # A forced test-only drop under the placed entity gives two blocker types.
+        create_ground_fixture(params)
+        before_mixed = items()
+        checked = bridge.call("check_placement", params)["result"]
+        blockers = checked.get("blocking") or []
+        record(
+            "mixed blockers expose the ground stack and prevent collection",
+            checked.get("placeable") is False
+            and checked.get("reason") == "blocked"
+            and any(entry.get("stack") == expected_stacks[0] for entry in blockers)
+            and any(entry.get("type") != "item-entity" for entry in blockers)
+            and items() == before_mixed,
+            json.dumps(checked),
+        )
+    finally:
+        remove_ground_fixture()
+        if placed_ground_entity:
+            observed = bridge.call("observe_nearby")["result"]
+            target = next(
+                entity
+                for entity in observed["entities"]
+                if entity["name"] == ground_item
+                and entity["x"] == params["x"]
+                and entity["y"] == params["y"]
+            )
+            action("mine_entity", {"target_ref": target["target_ref"], "count": 1})
+            record(
+                "ground placement fixture restores the held building item",
+                items().get(ground_item, 0) == held[ground_item],
+            )
+        action("move_to", return_position)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

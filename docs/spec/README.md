@@ -35,6 +35,7 @@
 | [22-green-science.md](22-green-science.md) | 緑サイエンスの自動化（M14） |
 | [23-trial9-fixes.md](23-trial9-fixes.md) | 9 回目の試行で見つかった問題の修正（M15） |
 | [24-trial10-fixes.md](24-trial10-fixes.md) | 10 回目の試行で見つかった問題の修正（M16） |
+| [25-trial11-fixes.md](25-trial11-fixes.md) | 11 回目の試行で見つかった問題の修正（M17） |
 
 ## 共通の不変条件
 
