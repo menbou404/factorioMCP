@@ -359,6 +359,27 @@ def check_wait_for_items():
     print("PASS M18-AL wait_for_items reached current+1", json.dumps(result), flush=True)
 
 
+def check_wait_seconds():
+    """M19-AQ: start and finish a short walk and cheap craft through MCP."""
+    assert amount(items(), "iron-plate") >= 2, "Reserve two plates for the AQ craft"
+
+    async def check():
+        server = create_server(bridge)
+        for operation, params in (
+            # Open land just west of WATCH, outside the assembler block.
+            ("move_to", {"surface": "nauvis", "x": WATCH[0] - 2, "y": WATCH[1]}),
+            ("craft", {"recipe": "iron-gear-wheel", "count": 1}),
+        ):
+            waited = await server.call_tool(operation, {**params, "wait_seconds": 10})
+            result = json.loads(waited.content[0].text)
+            assert not waited.is_error, result
+            assert result["status"] == "succeeded" and result["timed_out"] is False, result
+            assert result["action_id"], result
+            print("PASS M19-AQ", operation, json.dumps(result), flush=True)
+
+    asyncio.run(check())
+
+
 def wait_for_science(held_components):
     deadline = min(time.monotonic() + 360, power.run_deadline)
     next_report = next_fuel = 0
@@ -429,6 +450,7 @@ def wait_for_science(held_components):
                 "PASS green inputs came from inserter/belt assemblers", held_components, flush=True
             )
             check_wait_for_items()
+            check_wait_seconds()
             print("GREEN_SCIENCE_LINE_SUCCEEDED", count, flush=True)
             return
         time.sleep(2)
@@ -459,7 +481,7 @@ def main():
     stock = items()
     missing = {name: max(0, count - amount(stock, name)) for name, count in equipment.items()}
     needs = recipes.raw_needs(missing)
-    needs["iron-plate"] += PLATE_STOCK + BELT_PLATES
+    needs["iron-plate"] += PLATE_STOCK + BELT_PLATES + 2  # Reserve one M19-AQ gear craft.
     needs["coal"] += 60  # Smelter servicing plus boiler reserve throughout the bounded wait.
     print("green science material needs", json.dumps(dict(needs)), flush=True)
     if amount(stock, "wood") < needs["wood"]:
