@@ -70,7 +70,23 @@ TRANSFER_DESCRIPTION = (
     "and output -> result; lab accepts source -> input. Returned roles stay canonical. "
     "missing_materials detail includes item, requested, available (0), and contents "
     "of the source inventory (up to 10 items sorted by name, omitted when empty). "
-    "inventory_role is included when taking items from the structure."
+    "inventory_role is included when taking items from the structure. "
+    "inventory_full detail describes the destination inventory: item, requested, "
+    "destination (entity or character), inventory_role (entity only), "
+    "contents (up to 10 {name, quality, count} entries sorted by name then quality), "
+    "slots, empty_slots, and insertable count for the item."
+)
+
+MACHINE_STATUS_DESCRIPTION = (
+    " status uses the same names as observe_nearby and is omitted when the entity has no status."
+    " full_output means the result inventory is full and the machine stopped;"
+    " take products out (transfer from result) or add an output inserter."
+    " waiting_for_space_in_destination for inserters means their target is full."
+)
+
+INVENTORY_RECIPE_DESCRIPTION = (
+    " Assemblers and furnaces include recipe when available;"
+    " idle furnaces use their previous recipe. Omitted when no recipe is available."
 )
 
 
@@ -159,6 +175,13 @@ OPERATION_HINTS = {
         "in a straight line. Walk via intermediate points for farther goals."
     ),
     ("transfer_item", "invalid_target"): INVENTORY_TARGET_HINT,
+    ("transfer_item", "inventory_full"): (
+        "detail describes the destination inventory; check destination, inventory_role, "
+        "contents, slots, empty_slots, and insertable. "
+        "When a fuel/input slot holds a different item, take it out with direction "
+        "from_entity first (or use another target). "
+        "When the character is full, free inventory space."
+    ),
     ("get_entity_inventory", "invalid_target"): INVENTORY_TARGET_HINT,
     ("mine_entity", "invalid_target"): (
         "Choose a minable, selectable target in observe_nearby; "
@@ -408,7 +431,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Use check_placement for snapped position and valid_directions before building. "
             "Follow offsets for additional pages."
             " Each call also records fully observed 8x8 cells for get_explored_map, "
-            "independent of filters and paging."
+            "independent of filters and paging." + MACHINE_STATUS_DESCRIPTION
         )
     )
     async def observe_nearby(
@@ -736,7 +759,13 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     async def rotate_entity(target_ref: RequiredText, reverse: bool = False) -> CallToolResult:
         return await invoke("rotate_entity", {"target_ref": target_ref, "reverse": reverse})
 
-    @server.tool(description="Read accessible inventory sections of a nearby observed structure.")
+    @server.tool(
+        description=(
+            "Read accessible inventory sections of a nearby observed structure."
+            + MACHINE_STATUS_DESCRIPTION
+            + INVENTORY_RECIPE_DESCRIPTION
+        )
+    )
     async def get_entity_inventory(target_ref: RequiredText) -> CallToolResult:
         return await invoke("get_entity_inventory", {"target_ref": target_ref})
 
@@ -750,6 +779,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and result or error/detail/hint using the same error codes as get_entity_inventory, "
             "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
             "even if all entries failed."
+            + MACHINE_STATUS_DESCRIPTION
+            + INVENTORY_RECIPE_DESCRIPTION
         )
     )
     async def get_entity_inventories(

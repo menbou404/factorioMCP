@@ -263,7 +263,12 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(entries[3]["detail"], {"contents": []})
                 self.assertNotIn("detail", entries[4])
-                self.assertNotIn("hint", entries[5])
+                if operation == "transfer_items":
+                    self.assertEqual(
+                        entries[5]["hint"], OPERATION_HINTS["transfer_item", "inventory_full"]
+                    )
+                else:
+                    self.assertNotIn("hint", entries[5])
                 self.assertEqual(entries[6]["detail"], raw["results"][6]["detail"])
                 for entry in entries[1:]:
                     if entry["error"] in HINTS:
