@@ -1202,6 +1202,8 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             "nearby_free_position",
             "standable spot",
             "no path guarantee",
+            "start_adjusted",
+            "character still moves by walking",
         ):
             with self.subTest(text=text):
                 self.assertIn(text, description)
@@ -1214,6 +1216,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             "goal_tiles": ["water"],
             "goal_entities": [{"name": "stone-wall", "type": "wall", "x": -10, "y": -10}],
             "nearby_free_position": {"x": -7, "y": -10},
+            "start_adjusted": {"x": 1.2, "y": 0.5},
         }
         bridge.call.side_effect = BridgeError("path_not_found", detail=detail)
         result = await create_server(bridge).call_tool(
@@ -1230,6 +1233,8 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             "explaining the failure",
             "nearby_free_position",
             "standable spot to try with move_to",
+            "detail.start_adjusted",
+            "character still moves by walking",
             "no path guarantee",
             "structure among buildings",
             "within set to the interaction reach",
