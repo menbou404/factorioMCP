@@ -166,6 +166,8 @@ HINTS = {
     ),
     "path_not_found": (
         "Check detail.goal_tiles and detail.goal_entities for obstacles explaining the failure. "
+        "detail.start_adjusted, when present, is the nearby pathfinding start used because "
+        "the character was touching an obstacle; the character still moves by walking. "
         "If present, detail.nearby_free_position is a standable spot to try with move_to; "
         "there is no path guarantee. To reach a structure among buildings, retry with "
         "within set to the interaction reach (reach.interact from observe_nearby)."
@@ -668,6 +670,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and detail.distance. Blocked or timeout failures include detail.distance and "
             "detail.goal. path_not_found includes goal details and may include goal_tiles, "
             "goal_entities, and nearby_free_position (a standable spot with no path guarantee). "
+            "start_adjusted, when present, is the nearby pathfinding start used when touching "
+            "an obstacle; the character still moves by walking. "
             "Crafting runs alongside walking. Only one walk/mine at a time. "
             "Returns an action ID for polling."
         )
