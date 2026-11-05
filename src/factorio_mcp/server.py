@@ -37,6 +37,13 @@ PLACE_DESCRIPTION = (
     " for output it is the direction items leave."
     " The placement area must be covered by any of the last 8 observations"
     " within 60 seconds."
+    " Items on the ground inside the footprint are picked up into the main inventory"
+    " in the same tick before building when they are the only blockers and all fit."
+    " collected_items lists the picked-up stacks as {name, quality, count}, sorted by name."
+    " If they do not all fit, nothing is collected: detail.reason is"
+    " ground_items_inventory_full and detail.ground_items lists the stacks; free inventory space."
+    " Item-entity blocking entries include stack={name, quality, count}."
+    " If placement fails after collection, detail.collected_items reports the items kept."
     " Returns the snapped position and actual fluid_connections with port position,"
     " target_position, direction, flow, fluidbox_index, and connected when present."
     " For offshore-pump, the water_direction side must face water; pipes/boilers"
@@ -110,6 +117,7 @@ HINTS = {
         "Check valid_directions for another orientation, mine or recover blocking entities, "
         "or find another position with check_placement. "
         "If reason is character_in_the_way, move the character away first. "
+        "For ground_items_inventory_full, free inventory space for ground_items and retry. "
         "For placement_rules, nearby_positions lists up to 3 placeable centres and directions "
         "within 8 tiles of the requested position. They may be out of reach; "
         "move closer and check again with check_placement."
@@ -186,6 +194,8 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
         "supported_entities",
         "contents",
         "mining_area_resources",
+        "ground_items",
+        "collected_items",
     ):
         if field in detail and not isinstance(detail[field], list):
             detail[field] = []
@@ -218,12 +228,20 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         return _normalize_batch_result(result, batch_operations[operation])
     if operation == "get_request_result":
         original = result.get("original_response")
-        if isinstance(original, dict) and isinstance(original.get("result"), dict):
-            cached = original["result"]
-            if "results" in cached and "succeeded" in cached and "failed" in cached:
-                _normalize_batch_result(cached)
+        if isinstance(original, dict):
+            if isinstance(original.get("detail"), dict):
+                original["detail"] = _normalize_error_detail(original["detail"])
+            if isinstance(original.get("result"), dict):
+                cached = original["result"]
+                if "results" in cached and "succeeded" in cached and "failed" in cached:
+                    _normalize_batch_result(cached)
+                else:
+                    _normalize_result("", cached)
     if "role_aliases" in result and not isinstance(result["role_aliases"], dict):
         result["role_aliases"] = {}
+    for field in ("collected_items", "ground_items"):
+        if field in result and not isinstance(result[field], list):
+            result[field] = []
     array_fields = {
         "observe_nearby": ("entities", "blocked_tiles", "resources"),
         "get_explored_map": ("resources", "water", "trees", "rocks"),
@@ -661,6 +679,13 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "for output it is the direction items leave. "
             "The placement area must be covered by any of the last 8 observations "
             "within 60 seconds. "
+            "Items on the ground inside the footprint are picked up into the main inventory "
+            "by placement when they are the only blockers and all fit. This check collects "
+            "nothing: placeable=true with ground_items lists what placement would collect "
+            "as {name, quality, count}, sorted by name. If they do not all fit, "
+            "placeable=false, reason=blocked, blocked_reason=ground_items_inventory_full, "
+            "and ground_items lists the stacks; free inventory space. "
+            "Item-entity blocking entries include stack={name, quality, count}. "
             "Returns the snapped position and preview fluid_connections with port position, "
             "target_position, direction, flow, and fluidbox_index when present. "
             "For electric consumers, electric_coverage.covered reports whether the placement "

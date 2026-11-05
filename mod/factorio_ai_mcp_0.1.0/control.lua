@@ -1396,6 +1396,13 @@ local function placement_electric_coverage(character, prototype, position, box)
   return {covered = #poles > 0, poles = poles}
 end
 
+local function ground_stack(entity)
+  if not entity.valid or entity.type ~= "item-entity" then return nil end
+  local stack = entity.stack
+  if not stack or not stack.valid or not stack.valid_for_read then return nil end
+  return {name = stack.name, quality = stack.quality.name, count = stack.count}
+end
+
 local function placement_blocking(state, character, prototype, position, direction)
   -- Keep the requested position so every alternative direction snaps independently.
   local area = placement_bounding_box(prototype, snapped_position(prototype, position, direction),
@@ -1415,13 +1422,22 @@ local function placement_blocking(state, character, prototype, position, directi
   end
   -- Check separately so the blocking list's cap cannot hide the character.
   local character_in_the_way = overlaps_and_collides(character)
-  local blocking = {}
+  local blocking, ground_entities = {}, {}
+  local only_ground_items = true
   for _, entity in pairs(character.surface.find_entities_filtered{area = area}) do
     if entity ~= character and overlaps_and_collides(entity) then
-      blocking[#blocking + 1] = {target_ref = register_target(state, entity),
-                                name = entity.name, type = entity.type,
-                                x = entity.position.x, y = entity.position.y}
-      if #blocking == 10 then break end
+      local stack = ground_stack(entity)
+      if stack then
+        ground_entities[#ground_entities + 1] = entity
+      else
+        only_ground_items = false
+      end
+      -- Inspect every collider: a blocker beyond the response cap must prevent collection.
+      if #blocking < 10 then
+        blocking[#blocking + 1] = {target_ref = register_target(state, entity),
+                                  name = entity.name, type = entity.type,
+                                  x = entity.position.x, y = entity.position.y, stack = stack}
+      end
     end
   end
   local tiles = {}
@@ -1507,7 +1523,65 @@ local function placement_blocking(state, character, prototype, position, directi
     while #nearby > 3 do table.remove(nearby) end
     if #nearby > 0 then detail.nearby_positions = nearby end
   end
+  if only_ground_items and #ground_entities > 0 and not character_in_the_way and
+     #tile_names == 0 then
+    return detail, ground_entities
+  end
   return detail
+end
+
+local function placement_ground_items(inventory, entities)
+  local counts, items = {}, {}
+  for _, entity in ipairs(entities) do
+    local stack = ground_stack(entity)
+    if not stack then return nil, false end
+    counts[stack.name] = counts[stack.name] or {}
+    local by_quality = counts[stack.name]
+    by_quality[stack.quality] = (by_quality[stack.quality] or 0) + stack.count
+  end
+  for _, name in ipairs(sorted_keys(counts)) do
+    for _, quality in ipairs(sorted_keys(counts[name])) do
+      items[#items + 1] = {name = name, quality = quality, count = counts[name][quality]}
+    end
+  end
+  if not inventory then return items, false end
+  local empty_slots = inventory.count_empty_stacks(false, false)
+  local needed_slots = 0
+  for _, item in ipairs(items) do
+    local capacity = inventory.get_insertable_count{name = item.name, quality = item.quality}
+    if capacity < item.count then return items, false end
+    -- Different names/qualities compete for the same unfiltered empty slots.
+    -- The remaining capacity belongs to existing stacks or dedicated filtered slots.
+    local stack_size = prototypes.item[item.name].stack_size
+    local dedicated_capacity = math.max(0, capacity - empty_slots * stack_size)
+    needed_slots = needed_slots + math.ceil(math.max(0, item.count - dedicated_capacity) / stack_size)
+  end
+  return items, needed_slots <= empty_slots
+end
+
+local function collect_placement_ground_items(inventory, entities)
+  -- get_insertable_count is an estimate for items with durability/health. Retain
+  -- the ground stacks until *all* inserts succeed, and undo any partial inserts.
+  local original_counts = {}
+  for i = 1, #inventory do
+    local stack = inventory[i]
+    original_counts[i] = stack.valid_for_read and stack.count or 0
+  end
+  for _, entity in ipairs(entities) do
+    local stack = ground_stack(entity)
+    if not stack or inventory.insert(entity.stack) ~= stack.count then
+      for i = 1, #inventory do
+        local slot = inventory[i]
+        if slot.valid_for_read and slot.count > original_counts[i] then
+          local count = original_counts[i]
+          if count == 0 then slot.clear() else slot.count = count end
+        end
+      end
+      return false
+    end
+  end
+  for _, entity in ipairs(entities) do entity.destroy() end
+  return true
 end
 
 local function valid_underground_type(params)
@@ -1563,18 +1637,33 @@ local function validate_placement(state, character, params, require_item)
   -- for both ends (output = direction items leave); the collision box is symmetric.
   -- Base's factoriopedia_underground_belt blueprint uses direction=4 for both ends.
   -- placement_blocking uses these same checks for valid_directions/nearby_positions.
-  if not character.can_place_entity{name = entity_name, position = position,
-                                     direction = direction} then
-    return nil, "blocked", placement_blocking(state, character, prototype, requested_position, direction)
-  end
-  if not character.surface.can_place_entity{name = entity_name, position = position,
-                                             direction = direction, force = character.force} then
-    return nil, "blocked", placement_blocking(state, character, prototype, requested_position, direction)
+  local ground_entities, ground_items
+  if not character.can_place_entity{name = entity_name, position = position, direction = direction} or
+     not character.surface.can_place_entity{name = entity_name, position = position,
+                                            direction = direction, force = character.force} then
+    local detail, entities = placement_blocking(state, character, prototype, requested_position,
+                                                direction)
+    -- Manual building permits picking up ground items; still check terrain and
+    -- prototype-specific rules (e.g. a drill must have ore) before collecting.
+    if not entities or not character.surface.can_place_entity{
+      name = entity_name, position = position, direction = direction, force = character.force,
+      build_check_type = defines.build_check_type.manual
+    } then
+      return nil, "blocked", detail
+    end
+    local fits
+    ground_items, fits = placement_ground_items(inventory, entities)
+    if not fits then
+      detail.reason = "ground_items_inventory_full"
+      detail.ground_items = ground_items
+      return nil, "blocked", detail
+    end
+    ground_entities = entities
   end
   return {name = entity_name, position = position, direction = direction,
           underground_type = params.item == "underground-belt" and
                              (params.underground_type or "input") or nil,
-          inventory = inventory}
+          inventory = inventory, ground_entities = ground_entities, ground_items = ground_items}
 end
 
 local function do_check_placement(state, params)
@@ -1611,6 +1700,7 @@ local function do_check_placement(state, params)
           blocking = blocked.blocking, tiles = blocked.tiles,
           valid_directions = blocked.valid_directions, blocked_reason = blocked.reason,
           nearby_positions = blocked.nearby_positions,
+          ground_items = placement and placement.ground_items or blocked.ground_items,
           mining_area_resources = blocked.mining_area_resources,
           reason_detail = blocked.reason_detail}
 end
@@ -1622,9 +1712,28 @@ local function do_place(state, params)
   local placement, reason, detail = validate_placement(state, character, params, true)
   if not placement then return nil, reason, detail end
   local inventory = placement.inventory
+  local collected_items = placement.ground_items
+  if placement.ground_entities then
+    if not collect_placement_ground_items(inventory, placement.ground_entities) then
+      local blocked = placement_blocking(state, character, prototypes.entity[placement.name],
+                                         {x = params.x, y = params.y}, placement.direction)
+      blocked.reason = "ground_items_inventory_full"
+      blocked.ground_items = placement.ground_items
+      return nil, "blocked", blocked
+    end
+    -- Re-run all existing checks in this tick, after the items have been moved.
+    placement, reason, detail = validate_placement(state, character, params, true)
+    if not placement then
+      detail = detail or {}
+      detail.collected_items = collected_items
+      return nil, reason, detail
+    end
+  end
   local item = {name = params.item, quality = "normal", count = 1}
   local removed = inventory.remove(item)
-  if removed ~= 1 then return nil, "missing_materials", {item = params.item} end
+  if removed ~= 1 then
+    return nil, "missing_materials", {item = params.item, collected_items = collected_items}
+  end
   local created = character.surface.create_entity{
     name = placement.name, position = placement.position, direction = placement.direction,
     type = placement.underground_type,
@@ -1632,12 +1741,14 @@ local function do_place(state, params)
   }
   if not created or not created.valid then
     inventory.insert(item)
-    return nil, "blocked", placement_blocking(state, character, prototypes.entity[placement.name],
-                                              {x = params.x, y = params.y}, placement.direction)
+    local blocked = placement_blocking(state, character, prototypes.entity[placement.name],
+                                       {x = params.x, y = params.y}, placement.direction)
+    blocked.collected_items = collected_items
+    return nil, "blocked", blocked
   end
   return {name = created.name, position = position_data(created),
           direction = created.direction, consumed_item = params.item,
-          fluid_connections = placed_fluid_connections(created)}
+          fluid_connections = placed_fluid_connections(created), collected_items = collected_items}
 end
 
 local function do_rotate(state, params)
