@@ -36,15 +36,21 @@ TARGET_REF_DESCRIPTION = (
 )
 
 
+PLACEMENT_VISIBILITY_DESCRIPTION = (
+    " The character's current surroundings (within 16 tiles) count as observed for placement."
+    " Otherwise, the placement area must be covered by any of the last 8 observations"
+    " within 60 seconds."
+)
+
+
 PLACE_DESCRIPTION = (
     "Place a supported entity within build reach, consuming one real inventory item."
     " Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground."
     " underground_type is only valid for underground-belt: input or output"
     " (default input). direction is belt travel direction for both ends;"
     " for output it is the direction items leave."
-    " The placement area must be covered by any of the last 8 observations"
-    " within 60 seconds."
-    " Items on the ground inside the footprint are picked up into the main inventory"
+    + PLACEMENT_VISIBILITY_DESCRIPTION
+    + " Items on the ground inside the footprint are picked up into the main inventory"
     " in the same tick before building when they are the only blockers and all fit."
     " collected_items lists the picked-up stacks as {name, quality, count}, sorted by name."
     " If they do not all fit, nothing is collected: detail.reason is"
@@ -102,9 +108,17 @@ TRANSFER_DESCRIPTION = (
 
 MACHINE_STATUS_DESCRIPTION = (
     " status uses the same names as observe_nearby and is omitted when the entity has no status."
-    " full_output means the result inventory is full and the machine stopped;"
+    " full_output means the output buffer limit was reached and the machine stopped;"
     " take products out (transfer from result) or add an output inserter."
     " waiting_for_space_in_destination for inserters means their target is full."
+)
+
+MACHINE_BUFFER_DESCRIPTION = (
+    " Assemblers and furnaces stop with full_output once the result slot holds a"
+    " recipe-dependent amount. Inserters fill machine and lab inputs only up to a small buffer"
+    " (a few crafts or research units), so labs may hold only about 2 packs of a type"
+    " from inserters."
+    " To stock more, insert by hand with transfer_item."
 )
 
 INVENTORY_RECIPE_DESCRIPTION = (
@@ -178,8 +192,8 @@ HINTS = {
         "the entity was removed or destroyed."
     ),
     "not_visible": (
-        "Observe the placement area before placing."
-        " Any of the last 8 observations within 60 seconds counts."
+        "Move closer or observe the placement area with observe_nearby before placing."
+        + PLACEMENT_VISIBILITY_DESCRIPTION
     ),
     "action_conflict": (
         "Wait for detail.running_action with wait_for_action, or stop it with cancel_action. "
@@ -549,8 +563,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "resources summary still returns per-resource tile count, total amount, "
             "and bounding area. "
             + TARGET_REF_DESCRIPTION
-            + " Placement observations expire after 60 seconds. "
-            "Supported structures in your force include sorted inventory_roles. "
+            + PLACEMENT_VISIBILITY_DESCRIPTION
+            + " Supported structures in your force include sorted inventory_roles. "
             "During current research, owned labs include sorted missing_science names "
             "for required science packs absent from their input inventory; "
             "omitted when nothing is missing or there is no current research. "
@@ -866,10 +880,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground. "
             "underground_type is only valid for underground-belt: input or output "
             "(default input). direction is belt travel direction for both ends; "
-            "for output it is the direction items leave. "
-            "The placement area must be covered by any of the last 8 observations "
-            "within 60 seconds. "
-            "Items on the ground inside the footprint are picked up into the main inventory "
+            "for output it is the direction items leave."
+            + PLACEMENT_VISIBILITY_DESCRIPTION
+            + " Items on the ground inside the footprint are picked up into the main inventory "
             "by placement when they are the only blockers and all fit. This check collects "
             "nothing: placeable=true with ground_items lists what placement would collect "
             "as {name, quality, count}, sorted by name. If they do not all fit, "
@@ -931,6 +944,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         description=(
             "Read accessible inventory sections of a nearby observed structure."
             + MACHINE_STATUS_DESCRIPTION
+            + MACHINE_BUFFER_DESCRIPTION
             + INVENTORY_RECIPE_DESCRIPTION
         )
     )
@@ -956,6 +970,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             + ". Working states and containers without status never stall. "
             "For full_output, take products out or add an output inserter; "
             "for ingredient shortages, supply materials; for no_fuel/no_power, supply fuel/power."
+            + MACHINE_BUFFER_DESCRIPTION
         )
     )
     async def wait_for_items(
@@ -1040,6 +1055,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
             "even if all entries failed."
             + MACHINE_STATUS_DESCRIPTION
+            + MACHINE_BUFFER_DESCRIPTION
             + INVENTORY_RECIPE_DESCRIPTION
         )
     )

@@ -132,7 +132,7 @@ class InventoryStatusTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(name=name):
                 for text in (
                     "status",
-                    "full_output means the result inventory is full and the machine stopped",
+                    "full_output means the output buffer limit was reached and the machine stopped",
                     "transfer from result",
                     "add an output inserter",
                     "waiting_for_space_in_destination for inserters means their target is full",

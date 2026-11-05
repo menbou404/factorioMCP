@@ -1752,7 +1752,8 @@ local function validate_placement(state, character, params, require_item)
      character.build_distance * character.build_distance then
     return nil, "out_of_range", range_detail(character, position, character.build_distance)
   end
-  local visible = false
+  -- Current surroundings count for placement without recording an observation.
+  local visible = distance_squared(character.position, position) <= OBSERVATION_RADIUS ^ 2
   for _, observation in ipairs(state.recent_observations) do
     if observation.surface == character.surface.name and
        game.tick - observation.tick <= TARGET_TTL_TICKS and

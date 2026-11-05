@@ -74,7 +74,7 @@ def main():
     action("craft", {"recipe": "stone-furnace", "count": 1})
     action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
 
-    # place_entity requires an observation from the last 60 seconds.
+    # Current surroundings also count as observed for placement (M20-AT).
     before = items()
     bridge.call("observe_nearby")
     expect_error(
@@ -141,6 +141,42 @@ def main():
     time.sleep(61)
     expect_error(
         "expired target_ref", "mine_entity", {"target_ref": resource, "count": 1}, {"target_gone"}
+    )
+
+    # M20-AT: reuse the 61-second wait above, without observing again. This cleared
+    # spot is within build reach from (13, 4); explicit observations have expired.
+    before = items()
+    current = bridge.call("get_agent_status")["result"]["position"]
+    nearby_placement = {"item": "stone-furnace", "surface": "nauvis", "x": 13, "y": 8}
+    checked = bridge.call("check_placement", nearby_placement)["result"]
+    record(
+        "current surroundings allow placement after observations expire",
+        checked.get("placeable") is True and checked.get("reason") != "not_visible",
+        json.dumps(checked),
+    )
+    placed = bridge.call("place_entity", nearby_placement)["result"]
+    after = items()
+    record(
+        "place within reach without refreshing expired observations",
+        all(placed["position"][axis] == checked["position"][axis] for axis in ("x", "y"))
+        and after.get("stone-furnace", 0) == before.get("stone-furnace", 0) - 1,
+        json.dumps({"placed": placed, "checked": checked, "before": before, "after": after}),
+    )
+    action("mine_entity", {"target_ref": placed["target_ref"], "count": 1})
+    after = items()
+    recovered_position = bridge.call("get_agent_status")["result"]["position"]
+    record(
+        "expired-observation placement recovery preserves inventory and position",
+        after == before
+        and all(abs(recovered_position[axis] - current[axis]) <= 0.01 for axis in ("x", "y")),
+        json.dumps(
+            {
+                "before": before,
+                "after": after,
+                "position_before": current,
+                "position_after": recovered_position,
+            }
+        ),
     )
 
     # M6 checks are appended so the original checks and their output order stay intact.
