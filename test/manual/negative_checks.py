@@ -1561,6 +1561,107 @@ def main():
         action("move_to", return_position)
     record("full fuel slot checks restore all held items", items() == before_full)
 
+    # M18-AJ: an idle spare furnace provides a stable source for partial transfers.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    before_partial = items()
+    partial_target = None
+    partial_fields = ("partial", "limited_by", "available", "insertable")
+    try:
+        action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+        bridge.call("observe_nearby")
+        bridge.call("place_entity", {"item": "stone-furnace", **spare_position})
+        partial_target = next(
+            entity
+            for entity in bridge.call("observe_nearby", {"names": ["stone-furnace"]})["result"][
+                "entities"
+            ]
+            if entity["x"] == spare_position["x"] and entity["y"] == spare_position["y"]
+        )
+        fuel_params = {
+            "target_ref": partial_target["target_ref"],
+            "direction": "to_entity",
+            "inventory_role": "fuel",
+            "item": "wood",
+            "count": 1,
+        }
+        full = bridge.call("transfer_item", fuel_params)["result"]
+        record(
+            "full transfer returns requested and omits partial fields",
+            full.get("requested") == full.get("moved") == 1
+            and all(field not in full for field in partial_fields),
+            json.dumps(full),
+        )
+        take = {**fuel_params, "direction": "from_entity", "count": 100}
+        partial = bridge.call("transfer_item", take)["result"]
+
+        def source_limited(value):
+            return (
+                value.get("requested") == 100
+                and value.get("moved") == 1
+                and value.get("partial") is True
+                and value.get("limited_by") == "source"
+                and value.get("available") == 1
+                and value.get("insertable", 0) >= 1
+            )
+
+        record(
+            "source-limited transfer explains the shortfall",
+            source_limited(partial),
+            json.dumps(partial),
+        )
+        batch_response = asyncio.run(
+            server.call_tool("transfer_items", {"items": [fuel_params, take]})
+        )
+        batch = json.loads(batch_response.content[0].text)
+        entries = batch.get("results") or []
+        record(
+            "batch transfers keep full and source-limited success details",
+            not batch_response.is_error
+            and batch.get("succeeded") == 2
+            and batch.get("failed") == 0
+            and len(entries) == 2
+            and entries[0].get("ok") is True
+            and entries[1].get("ok") is True
+            and entries[0].get("result", {}).get("requested") == 1
+            and all(field not in entries[0].get("result", {}) for field in partial_fields)
+            and source_limited(entries[1].get("result", {})),
+            json.dumps(batch),
+        )
+        # Optional cheap capacity check: no extra mining or fixture items are needed.
+        if before_partial.get("coal", 0) >= 51:
+            coal = {**fuel_params, "item": "coal", "count": 49}
+            bridge.call("transfer_item", coal)
+            available = items()["coal"]
+            limited = bridge.call("transfer_item", {**coal, "count": 2})["result"]
+            record(
+                "destination-limited transfer reports the remaining fuel capacity",
+                limited.get("requested") == 2
+                and limited.get("moved") == 1
+                and limited.get("partial") is True
+                and limited.get("limited_by") == "destination"
+                and limited.get("available") == available
+                and limited.get("insertable") == 1,
+                json.dumps(limited),
+            )
+    finally:
+        if partial_target is not None:
+            fuel = bridge.call(
+                "get_entity_inventory", {"target_ref": partial_target["target_ref"]}
+            )["result"]["inventories"]["fuel"]
+            for stack in fuel or []:
+                bridge.call(
+                    "transfer_item",
+                    {
+                        **fuel_params,
+                        "direction": "from_entity",
+                        "item": stack["name"],
+                        "count": stack["count"],
+                    },
+                )
+            action("mine_entity", {"target_ref": partial_target["target_ref"], "count": 1})
+        action("move_to", return_position)
+    record("partial transfer checks restore all held items", items() == before_partial)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

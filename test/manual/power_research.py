@@ -505,6 +505,7 @@ def main():
     recipes.craft_to("automation-science-pack", 10)
     lab = entity_at(observe(), "lab", LAB)
     assert "missing_science" not in lab, lab  # No current research yet.
+    assert "science_units" not in lab, lab
     call("start_research", {"technology": "automation"})
     assert call("get_research_status")["current"] == "automation"
     lab = entity_at(observe(), "lab", LAB)
@@ -520,9 +521,21 @@ def main():
     assert stalled["stalled"] is True and stalled["timed_out"] is False, stalled
     assert stalled["researching"] is True and stalled["researched"] is False, stalled
     assert stalled["progress"] == 0 and 10 <= stalled["stalled_seconds"] < 15, stalled
+    unit_count = call("get_technology_info", {"technology": "automation"})["unit_count"]
+    assert stalled["remaining_units"] == unit_count, stalled
     assert 10 <= stalled["waited_seconds"] < 20, stalled
     assert all(
-        text in stalled["hint"] for text in ("missing_science", "observe_nearby", "power", "every")
+        text in stalled["hint"]
+        for text in (
+            "missing_science",
+            "observe_nearby",
+            "power",
+            "every",
+            "science_units",
+            "remaining_units",
+            "Partly used packs",
+            "parallel",
+        )
     ), stalled
     print("empty lab stalls research wait", json.dumps(stalled), flush=True)
     transfer(lab, "input", "automation-science-pack", 10)
@@ -530,6 +543,28 @@ def main():
     lab = entity_at(observe(), "lab", LAB)
     assert "missing_science" not in lab, lab
     print("stocked lab omits missing_science while research runs", flush=True)
+    # M18-AK: read counts first so ongoing consumption cannot make the upper bound stale.
+    lab_input = call("get_entity_inventory", {"target_ref": lab["target_ref"]})["inventories"][
+        "input"
+    ]
+    pack_counts = {stack["name"]: stack["count"] for stack in lab_input}
+    lab = entity_at(observe(), "lab", LAB)
+    units = lab.get("science_units", [])
+    assert units and [entry["name"] for entry in units] == sorted(pack_counts), lab
+    assert all(0 < entry["units"] <= pack_counts[entry["name"]] for entry in units), lab
+    status = call("get_research_status")
+    assert status["current"] == "automation" and 0 < status["remaining_units"] <= unit_count, status
+    assert math.isclose(status["remaining_units"], unit_count * (1 - status["progress"])), status
+    print(
+        "research remaining units and lab science units",
+        json.dumps(
+            {
+                "remaining_units": status["remaining_units"],
+                "science_units": units,
+            }
+        ),
+        flush=True,
+    )
     deadline = time.monotonic() + 300
     while True:
         check_deadline(deadline)
@@ -541,6 +576,8 @@ def main():
         )
         research = json.loads(waited.content[0].text)
         assert not waited.is_error, research
+        if research["researching"]:
+            assert 0 <= research["remaining_units"] <= unit_count, research
         if research["researched"] is True:
             observed = power_snapshot()
             # M13-S: compare prototype preview with the real, connected output port.

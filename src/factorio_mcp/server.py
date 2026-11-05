@@ -65,6 +65,10 @@ PLACE_DESCRIPTION = (
 TRANSFER_DESCRIPTION = (
     "Move a real item between the AI character and a nearby observed structure. "
     "count is 1-100. "
+    "Success returns moved and requested (= count). If moved < requested, partial=true, "
+    "limited_by (source or destination), available (source count before the move), and "
+    "insertable (destination capacity before the move) explain the shortfall; "
+    "equal binding limits prefer source. Full transfers omit these four partial fields. "
     "Choose inventory_role from the structure's inventory_roles in observe_nearby. "
     "Role aliases: stone-furnace and assembling-machine-1 accept input -> source "
     "and output -> result; lab accepts source -> input. Returned roles stay canonical. "
@@ -87,6 +91,13 @@ MACHINE_STATUS_DESCRIPTION = (
 INVENTORY_RECIPE_DESCRIPTION = (
     " Assemblers and furnaces include recipe when available;"
     " idle furnaces use their previous recipe. Omitted when no recipe is available."
+)
+
+RESEARCH_STALLED_HINT = (
+    "Check missing_science in observe_nearby: every lab with packs must hold every required "
+    "science pack. For each ingredient, check that the sum of science_units across labs "
+    "exceeds remaining_units. Partly used packs stay in the lab that started them; "
+    "labs working in parallel each need a pack of every ingredient. Check lab power too."
 )
 
 
@@ -286,7 +297,13 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
                 if field in filters and not isinstance(filters[field], list):
                     filters[field] = []
         for entity in result["entities"]:
-            for field in ("belt_items", "fluids", "inventory_roles", "missing_science"):
+            for field in (
+                "belt_items",
+                "fluids",
+                "inventory_roles",
+                "missing_science",
+                "science_units",
+            ):
                 if field in entity and not isinstance(entity[field], list):
                     entity[field] = []
     if operation == "check_placement":
@@ -421,6 +438,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "During current research, owned labs include sorted missing_science names "
             "for required science packs absent from their input inventory; "
             "omitted when nothing is missing or there is no current research. "
+            "Owned labs with packs also include science_units as {name, units}, sorted by name: "
+            "remaining science per pack type, including partly used packs, rounded to 3 decimals "
+            "(a full pack is 1 unit); omitted when the lab input is empty. "
             "Owned fluid structures include fluid_connections with port position, target_position, "
             "direction, flow, fluidbox_index, connected, "
             "and connection_type (normal or underground). "
@@ -495,7 +515,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await invoke("list_craftable_recipes", {"offset": offset, "limit": limit})
 
     @server.tool(
-        description="Read technologies researched by the AI character’s force and current research."
+        description=(
+            "Read technologies researched by the AI character’s force and current research. "
+            "Current research includes progress and remaining_units = unit_count * (1 - progress), "
+            "using the force technology's current unit count, including count-formula costs. "
+            "remaining_units is omitted when nothing is being researched."
+        )
     )
     async def get_research_status() -> CallToolResult:
         return await invoke("get_research_status")
@@ -520,8 +545,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "to keep it under common 60-second client tool timeouts."
             " Returns early with stalled=true, stalled_seconds, progress, and timed_out=false "
             "when this technology is current and its progress has not changed for 10 seconds "
-            "of waiting. Otherwise stalled=false. On a stall, check labs' missing_science in "
-            "observe_nearby, lab power, and that labs hold every required science pack."
+            "of waiting. Otherwise stalled=false. Includes remaining_units when this technology "
+            "is current, as returned by get_research_status. On a stall: " + RESEARCH_STALLED_HINT
         )
     )
     async def wait_for_research(
@@ -563,12 +588,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                         and waited >= timeout_seconds,
                         "waited_seconds": waited,
                     }
+                    if current and "remaining_units" in value:
+                        result["remaining_units"] = value["remaining_units"]
                     if stalled:
                         result["stalled_seconds"] = stalled_seconds
-                        result["hint"] = (
-                            "Check labs' missing_science in observe_nearby, lab power, "
-                            "and that labs hold every required science pack."
-                        )
+                        result["hint"] = RESEARCH_STALLED_HINT
                     return _response(result)
                 await asyncio.sleep(min(0.25, timeout_seconds - waited))
         except Exception as exc:

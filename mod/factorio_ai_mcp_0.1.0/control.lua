@@ -823,6 +823,25 @@ local function do_get_explored_map(state, params)
   return result
 end
 
+local function lab_science_units(input)
+  local units_by_name = {}
+  for index = 1, #input do
+    local stack = input[index]
+    if stack.valid_for_read and stack.type == "tool" then
+      local maximum = stack.prototype.get_durability(stack.quality)
+      if maximum and maximum > 0 then
+        units_by_name[stack.name] = (units_by_name[stack.name] or 0) +
+                                    stack.count - 1 + stack.durability / maximum
+      end
+    end
+  end
+  local units = {}
+  for _, name in ipairs(sorted_keys(units_by_name)) do
+    units[#units + 1] = {name = name, units = math.floor(units_by_name[name] * 1000 + 0.5) / 1000}
+  end
+  return #units > 0 and units or nil
+end
+
 local function do_observe(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -915,17 +934,20 @@ local function do_observe(state, params)
       local inventory_roles = sorted_keys(roles)
       if #inventory_roles > 0 then observed.inventory_roles = inventory_roles end
     end
-    if observed.owned and entity.type == "lab" and current_research then
+    if observed.owned and entity.type == "lab" then
       local input = entity.get_inventory(defines.inventory.lab_input)
       if input and input.valid then
-        local missing = {}
-        for _, ingredient in pairs(current_research.research_unit_ingredients) do
-          if input.get_item_count(ingredient.name) == 0 then
-            missing[#missing + 1] = ingredient.name
+        observed.science_units = lab_science_units(input)
+        if current_research then
+          local missing = {}
+          for _, ingredient in pairs(current_research.research_unit_ingredients) do
+            if input.get_item_count(ingredient.name) == 0 then
+              missing[#missing + 1] = ingredient.name
+            end
           end
+          table.sort(missing)
+          if #missing > 0 then observed.missing_science = missing end
         end
-        table.sort(missing)
-        if #missing > 0 then observed.missing_science = missing end
       end
     end
     if entity.supports_direction then observed.direction = entity.direction end
@@ -1271,11 +1293,15 @@ local function do_research(state)
   table.sort(researched)
   table.sort(available, function(a, b) return a.name < b.name end)
   while #available > 100 do table.remove(available) end
+  local current = force.current_research
+  local progress = current and force.research_progress or nil
   return {
     researched = researched,
     queue = research_queue(force), available = available,
-    current = force.current_research and force.current_research.name or nil,
-    progress = force.current_research and force.research_progress or nil
+    current = current and current.name or nil,
+    progress = progress,
+    -- Use the force's technology, including its current level's count-formula cost.
+    remaining_units = current and current.research_unit_count * (1 - progress) or nil
   }
 end
 
@@ -1917,10 +1943,11 @@ local function do_transfer(state, params)
   local source = params.direction == "to_entity" and player_inventory or entity_inventory
   local destination = params.direction == "to_entity" and entity_inventory or player_inventory
   local item_id = {name = params.item, quality = "normal"}
-  local count = math.min(params.count, source.get_item_count(item_id),
-                         destination.get_insertable_count(item_id))
+  local available = source.get_item_count(item_id)
+  local insertable = destination.get_insertable_count(item_id)
+  local count = math.min(params.count, available, insertable)
   if count == 0 then
-    if source.get_item_count(item_id) == 0 then
+    if available == 0 then
       return nil, "missing_materials", transfer_shortage_detail(source, params, role)
     end
     return nil, "inventory_full", transfer_full_detail(destination, params, role)
@@ -1938,8 +1965,16 @@ local function do_transfer(state, params)
   if inserted == 0 then
     return nil, "inventory_full", transfer_full_detail(destination, params, role)
   end
-  return {moved = inserted, item = params.item, direction = params.direction,
-          inventory_role = role}
+  local result = {moved = inserted, requested = params.count, item = params.item,
+                  direction = params.direction, inventory_role = role}
+  if inserted < params.count then
+    result.partial = true
+    result.limited_by = available <= insertable and inserted == available and
+                        "source" or "destination"
+    result.available = available
+    result.insertable = insertable
+  end
+  return result
 end
 
 local function do_batch(state, params, handler)
