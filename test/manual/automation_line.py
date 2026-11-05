@@ -293,6 +293,90 @@ def check_machine_inventories():
     print("M17-AI single and batch inventories include status and assembler recipe", flush=True)
 
 
+def check_refs_recipe():
+    """M19-AM/AN: stable placement refs and recipe refunds, then recover the fixture."""
+    walk((25, -3))
+    before = items()
+    position = (26.5, -4.5)  # M14-U's temporary long inserter has been recovered.
+    observe()
+    placed = call(
+        "place_entity",
+        {"item": "assembling-machine-1", "surface": "nauvis", "x": position[0], "y": position[1]},
+    )
+    params = {"target_ref": placed["target_ref"]}
+    try:
+        # Use the placement ref before any subsequent observation.
+        inventory = call("get_entity_inventory", params)
+        assert inventory["name"] == "assembling-machine-1", inventory
+        for _ in range(2):
+            entity = entity_at(observe(), "assembling-machine-1", position)
+            assert entity["target_ref"] == placed["target_ref"], (placed, entity)
+        print("PASS M19-AM placement ref works and survives two observations", flush=True)
+
+        original = "iron-gear-wheel"
+        call("set_recipe", {**params, "recipe": original})
+        loaded = call(
+            "transfer_item",
+            {
+                **params,
+                "direction": "to_entity",
+                "inventory_role": "source",
+                "item": "iron-plate",
+                "count": 3,
+            },
+        )
+        assert loaded["moved"] == 3, loaded
+        contents = call("get_entity_inventory", params)["inventories"]
+        assert amount(contents["source"], "iron-plate") > 0, contents
+        stock = items()
+        same = call("set_recipe", {**params, "recipe": original})
+        assert not same.get("returned_items") and items() == stock, same
+        assert call("get_entity_inventory", params)["inventories"] == contents
+
+        changed = call("set_recipe", {**params, "recipe": "copper-cable"})
+        returned = changed.get("returned_items") or []
+        assert returned and not changed.get("spilled_items"), changed
+        after = items()
+        for item in returned:
+            assert item["quality"] == "normal", item
+            assert amount(after, item["name"]) - amount(stock, item["name"]) == item["count"], (
+                stock,
+                after,
+                changed,
+            )
+        assert amount(returned, "iron-plate") == 3, changed
+        call("set_recipe", {**params, "recipe": original})
+        restored = call("get_entity_inventory", params)
+        assert restored["recipe"] == original and not any(restored["inventories"].values()), (
+            restored
+        )
+        print(
+            "PASS M19-AN nonempty recipe change returns items; same recipe is a no-op", flush=True
+        )
+    finally:
+        action("mine_entity", {**params, "count": 1})
+        observe()  # Exercise cleanup before using the now-invalid owned ref.
+        walk((20, -18))
+    after = items()
+    assert {(item["name"], item["quality"]): item["count"] for item in after} == {
+        (item["name"], item["quality"]): item["count"] for item in before
+    }, (before, after)
+    try:
+        bridge.call("get_entity_inventory", params)
+    except BridgeError as error:
+        assert (
+            error.code == "target_gone" and (error.detail or {}).get("reason") == "entity_gone"
+        ), (
+            error.code,
+            error.detail,
+        )
+    else:
+        raise AssertionError("Removed assembler ref remained usable")
+    print(
+        "PASS M19-AM removed owned entity reports entity_gone after observation cleanup", flush=True
+    )
+
+
 def main():
     power.run_deadline = time.monotonic() + 885  # Leave room before CI's 900 s timeout.
     research = call("get_research_status")
@@ -302,7 +386,7 @@ def main():
 
     recipes = Recipes()
     equipment = {
-        "assembling-machine-1": 1,
+        "assembling-machine-1": 2,  # One line assembler and one recoverable M19 fixture.
         "inserter": 2,
         "iron-chest": 1,
         "small-electric-pole": 2,  # One installed, one spare (the recipe yields two).
@@ -313,6 +397,7 @@ def main():
     # Reserve fuel for the lab, assembler, and two inserters throughout polling;
     # gather also mines more coal as servicing the inherited smelters consumes it.
     needs["coal"] += 40
+    needs["iron-plate"] += 3  # M19 recipe-change fixture; returned intact afterward.
     print("computed needs", json.dumps(dict(needs)), flush=True)
     restore_pairs()
     try:
@@ -433,6 +518,7 @@ def main():
             assert working_seen, f"Assembler working status never observed: {last}"
             check_new_placeables(recipes)
             check_machine_inventories()
+            check_refs_recipe()
             print("AUTOMATION_LINE_SUCCEEDED", technology["name"], flush=True)
             return
         time.sleep(2)

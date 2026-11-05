@@ -170,9 +170,15 @@ def put_batch(station, entries):
         params.append(entry)
     results = successful_batch_results(call("place_entities", {"items": params}), len(params))
     observed = observe()
+    observed_again = observe()
     for entry, result in zip(params, results, strict=True):
         position = (entry["x"], entry["y"])
         entity = entity_at(observed, entry["item"], position)
+        assert (
+            result["target_ref"]
+            == entity["target_ref"]
+            == entity_at(observed_again, entry["item"], position)["target_ref"]
+        ), (entry, result, entity)
         assert result["name"] == entity["name"], (entry, result, entity)
         # Assemblers without recipes, chests and poles may omit direction.
         if "direction" in entity:

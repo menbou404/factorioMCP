@@ -29,6 +29,13 @@ FilterNames = Annotated[
 ]
 
 
+TARGET_REF_DESCRIPTION = (
+    "Owned-structure target refs (your force, with a unit_number) are stable across observations "
+    "and do not expire while the entity exists. Other refs expire after 60 seconds. "
+    "Reach, surface, and force checks still apply."
+)
+
+
 PLACE_DESCRIPTION = (
     "Place a supported entity within build reach, consuming one real inventory item."
     " Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground."
@@ -44,14 +51,15 @@ PLACE_DESCRIPTION = (
     " ground_items_inventory_full and detail.ground_items lists the stacks; free inventory space."
     " Item-entity blocking entries include stack={name, quality, count}."
     " If placement fails after collection, detail.collected_items reports the items kept."
-    " Returns the snapped position and actual fluid_connections with port position,"
+    " Returns target_ref for the placed entity, the snapped position and actual"
+    " fluid_connections with port position,"
     " target_position, direction, flow, fluidbox_index, and connected when present."
     " For offshore-pump, the water_direction side must face water; pipes/boilers"
     " connect on the output_direction side (see check_placement or observe_nearby)."
     " Blocked errors may include valid_directions for another orientation."
-    " Each detail.blocking entry includes a target_ref usable with mine_entity"
-    " for 60 seconds, subject to reach and force checks."
-    " detail.reason is character_in_the_way when the character blocks placement"
+    " Each detail.blocking entry includes a target_ref usable with mine_entity. "
+    + TARGET_REF_DESCRIPTION
+    + " detail.reason is character_in_the_way when the character blocks placement"
     " (move the character away first), or placement_rules when no blocking entities,"
     " tiles, or character explain the failure."
     " For placement_rules, detail.nearby_positions lists up to 3 placeable centres"
@@ -153,7 +161,11 @@ HINTS = {
         "Check the tool's input schema and argument values. "
         "When present, detail.errors lists each invalid field."
     ),
-    "target_gone": "target_ref expires after 60 seconds. Refresh it with observe_nearby.",
+    "target_gone": (
+        TARGET_REF_DESCRIPTION
+        + " For reason=expired, refresh with observe_nearby; reason=entity_gone means "
+        "the entity was removed or destroyed."
+    ),
     "not_visible": (
         "Observe the placement area before placing."
         " Any of the last 8 observations within 60 seconds counts."
@@ -232,6 +244,17 @@ OPERATION_HINTS = {
         "Choose an owned rotatable entity in observe_nearby; check detail.reason."
     ),
     ("set_recipe", "invalid_target"): "Choose an owned assembling machine in observe_nearby.",
+    ("set_recipe", "inventory_full"): (
+        "Free main inventory space for detail.items ({name, quality, count}); "
+        "detail.empty_slots reports available unfiltered slots. Capacity is checked "
+        "conservatively before changing anything. Retry to return inputs, outputs, and "
+        "in-progress ingredients to the character as returned_items."
+    ),
+    ("set_recipe", "not_empty"): (
+        "detail.reason=modules means remove modules first. Inputs, outputs, and an "
+        "in-progress craft do not prevent recipe changes; their items are returned "
+        "to the main inventory as returned_items."
+    ),
     ("get_recipe_info", "invalid_target"): (
         "Check the recipe name; list_craftable_recipes lists unlocked hand crafting recipes."
     ),
@@ -260,6 +283,7 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
         "mining_area_resources",
         "ground_items",
         "collected_items",
+        "items",
     ):
         if field in detail and not isinstance(detail[field], list):
             detail[field] = []
@@ -303,7 +327,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
                     _normalize_result("", cached)
     if "role_aliases" in result and not isinstance(result["role_aliases"], dict):
         result["role_aliases"] = {}
-    for field in ("collected_items", "ground_items"):
+    for field in ("collected_items", "ground_items", "returned_items", "spilled_items"):
         if field in result and not isinstance(result[field], list):
             result[field] = []
     array_fields = {
@@ -463,7 +487,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "With include_resources = false, individual resource entities are omitted but the "
             "resources summary still returns per-resource tile count, total amount, "
             "and bounding area. "
-            "Target refs and placement observations expire after 60 seconds. "
+            + TARGET_REF_DESCRIPTION
+            + " Placement observations expire after 60 seconds. "
             "Supported structures in your force include sorted inventory_roles. "
             "During current research, owned labs include sorted missing_science names "
             "for required science packs absent from their input inventory; "
@@ -635,7 +660,17 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await invoke("get_recipe_info", {"recipe": recipe})
 
     @server.tool(
-        description="Set an enabled recipe on an empty owned assembling machine within reach."
+        description=(
+            "Set an enabled recipe on an owned assembling machine within reach. "
+            "Inputs, outputs, and ingredients of an in-progress craft return to the character's "
+            "main inventory as returned_items ({name, quality, count}). "
+            "A conservative capacity check may require empty unfiltered slots even when "
+            "existing stacks have room. If they do not fit, inventory_full returns detail.items "
+            "and detail.empty_slots without changing the recipe, contents, or craft. "
+            "Items are not spilled normally; spilled_items reports an unexpected insert shortfall. "
+            "Modules still cause not_empty with detail.reason=modules. "
+            "Setting the same recipe is a no-op success."
+        )
     )
     async def set_recipe(target_ref: RequiredText, recipe: RequiredText) -> CallToolResult:
         return await invoke("set_recipe", {"target_ref": target_ref, "recipe": recipe})
@@ -777,8 +812,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "connect on the output_direction side. "
             "Blocked results may include blocking, tiles, blocked_reason, "
             "and valid_directions for another orientation. "
-            "Each blocking entry includes a target_ref usable with mine_entity for 60 seconds, "
-            "subject to reach and force checks. "
+            "Each blocking entry includes a target_ref usable with mine_entity. "
+            + TARGET_REF_DESCRIPTION
+            + " "
             "blocked_reason is character_in_the_way when the character blocks placement "
             "(move the character away first), or placement_rules when no blocking entities, "
             "tiles, or character explain the failure. "
@@ -920,7 +956,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Read accessible inventory sections of 1-10 nearby observed structures "
             "in order in one tick without walking. Read-only; each target follows "
             "get_entity_inventory rules: targets must be owned, on the same surface, "
-            "and within reach. Target refs expire after 60 seconds. "
+            "and within reach. " + TARGET_REF_DESCRIPTION + " "
             "Failures do not stop later entries. Returns results with 1-based index, ok, "
             "and result or error/detail/hint using the same error codes as get_entity_inventory, "
             "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
@@ -958,7 +994,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Transfer 1-10 items in order in one tick without walking. "
             "Each entry follows transfer_item rules: "
             + TRANSFER_DESCRIPTION
-            + " Target refs expire after 60 seconds; targets must be owned and within reach. "
+            + " "
+            + TARGET_REF_DESCRIPTION
+            + " Targets must be owned and within reach. "
             "Walking or mining causes action_conflict for each entry; crafting is allowed. "
             "Failures do not stop later entries. Returns results with 1-based index, ok, "
             "and result or error/detail/hint using the same error codes as transfer_item, "

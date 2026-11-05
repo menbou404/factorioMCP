@@ -57,6 +57,7 @@ local function ensure_storage()
     processed_order = {},
     next_target_id = 1,
     targets = {},
+    owned_refs = {},
     last_observation = nil,
     recent_observations = {},
     explored_map = {},
@@ -65,6 +66,28 @@ local function ensure_storage()
   storage.ai_mcp.next_action_id = storage.ai_mcp.next_action_id or 1
   storage.ai_mcp.next_target_id = storage.ai_mcp.next_target_id or 1
   storage.ai_mcp.targets = storage.ai_mcp.targets or {}
+  if not storage.ai_mcp.owned_refs then
+    -- Upgrade existing saves once. Keep the oldest ref for each owned unit;
+    -- other pre-upgrade refs remain usable until their original TTL expires.
+    local state = storage.ai_mcp
+    state.owned_refs = {}
+    local character = state.character
+    if character and character.valid then
+      for ref, target in pairs(state.targets) do
+        local entity = target.entity
+        if entity and entity.valid and entity.force == character.force and entity.unit_number then
+          local previous = state.owned_refs[entity.unit_number]
+          if not previous or tonumber(ref) < tonumber(previous) then
+            state.owned_refs[entity.unit_number] = ref
+          end
+        end
+      end
+      for unit_number, ref in pairs(state.owned_refs) do
+        state.targets[ref].owned = true
+        state.targets[ref].unit_number = unit_number
+      end
+    end
+  end
   storage.ai_mcp.explored_map = storage.ai_mcp.explored_map or {}
   if not storage.ai_mcp.recent_observations then
     storage.ai_mcp.recent_observations = {}
@@ -321,9 +344,20 @@ local function require_character(state)
 end
 
 local function register_target(state, entity)
+  local character = state.character
+  local owned = character and character.valid and entity.force == character.force and
+                entity.unit_number ~= nil
+  if owned then
+    local previous = state.owned_refs[entity.unit_number]
+    if previous and state.targets[previous] and state.targets[previous].entity == entity then
+      return previous
+    end
+  end
   local target_ref = tostring(state.next_target_id)
   state.next_target_id = state.next_target_id + 1
-  state.targets[target_ref] = {entity = entity, tick = game.tick}
+  state.targets[target_ref] = {entity = entity, tick = game.tick, owned = owned or nil,
+                               unit_number = owned and entity.unit_number or nil}
+  if owned then state.owned_refs[entity.unit_number] = target_ref end
   return target_ref
 end
 
@@ -331,11 +365,15 @@ local function target_entity(character, params, max_distance, mining)
   local state = ensure_storage()
   if type(params.target_ref) == "string" then
     local reference = state.targets[params.target_ref]
-    if not reference or game.tick - reference.tick > TARGET_TTL_TICKS then
+    if not reference or (not reference.owned and game.tick - reference.tick > TARGET_TTL_TICKS) then
       return nil, "target_gone", {reason = "expired"}
     end
     local entity = reference.entity
     if not entity or not entity.valid then
+      if reference.owned and state.owned_refs[reference.unit_number] == params.target_ref then
+        state.owned_refs[reference.unit_number] = nil
+      end
+      state.targets[params.target_ref] = nil
       return nil, "target_gone", {reason = "entity_gone"}
     end
     if entity.surface ~= character.surface then return nil, "out_of_range" end
@@ -1031,7 +1069,17 @@ local function do_observe(state, params)
     }
   end
   for key, reference in pairs(state.targets) do
-    if game.tick - reference.tick > TARGET_TTL_TICKS then state.targets[key] = nil end
+    if reference.owned then
+      if reference.entity and not reference.entity.valid then
+        if state.owned_refs[reference.unit_number] == key then
+          state.owned_refs[reference.unit_number] = nil
+        end
+        -- Keep a tombstone until lookup reports entity_gone, then remove it.
+        reference.entity = nil
+      end
+    elseif game.tick - reference.tick > TARGET_TTL_TICKS then
+      state.targets[key] = nil
+    end
   end
   return {position = position_data(character), radius = radius, filters = filters,
           reach = {build = character.build_distance, interact = character.reach_distance,
@@ -1773,6 +1821,7 @@ local function do_place(state, params)
     return nil, "blocked", blocked
   end
   return {name = created.name, position = position_data(created),
+          target_ref = register_target(state, created),
           direction = created.direction, consumed_item = params.item,
           fluid_connections = placed_fluid_connections(created), collected_items = collected_items}
 end
@@ -1814,28 +1863,70 @@ local function do_set_recipe(state, params)
   if not recipe or not recipe.enabled or not categories or not categories[recipe.category] then
     return nil, "recipe_unavailable"
   end
-  for _, inventory_id in ipairs({defines.inventory.crafter_input, defines.inventory.crafter_output}) do
-    local inventory = target.get_inventory(inventory_id)
-    if inventory and not inventory.is_empty() then return nil, "not_empty" end
-  end
   local modules = target.get_module_inventory()
-  if modules and not modules.is_empty() then return nil, "not_empty" end
-  -- An in-flight craft also holds ingredients outside the input inventory.
-  if target.is_crafting() then return nil, "not_empty" end
-  local returned = target.set_recipe(params.recipe)
+  if modules and not modules.is_empty() then return nil, "not_empty", {reason = "modules"} end
+  local current_recipe, current_quality = target.get_recipe()
+  -- Avoid restarting a craft or returning contents when nothing changes.
+  if current_recipe and current_recipe.name == params.recipe and
+     (not current_quality or current_quality.name == "normal") then
+    return {name = target.name, recipe = params.recipe, position = position_data(target)}
+  end
+  local counts, items = {}, {}
+  local function add_item(name, quality, count)
+    counts[name] = counts[name] or {}
+    counts[name][quality] = (counts[name][quality] or 0) + count
+  end
+  for _, inventory_id in ipairs({defines.inventory.crafter_input, defines.inventory.crafter_output}) do
+    local contents = target.get_inventory(inventory_id)
+    if contents then
+      for _, item in pairs(contents.get_contents()) do
+        add_item(item.name, item.quality, item.count)
+      end
+    end
+  end
+  -- A started (possibly stalled) craft holds one set of ingredients outside
+  -- the input slots. Fluids are not items and do not go into the character.
+  if current_recipe and target.is_crafting() then
+    for _, ingredient in pairs(current_recipe.ingredients) do
+      if ingredient.type == "item" then
+        add_item(ingredient.name, current_quality and current_quality.name or "normal",
+                 ingredient.amount)
+      end
+    end
+  end
+  local needed_slots = 0
+  for _, name in ipairs(sorted_keys(counts)) do
+    for _, quality in ipairs(sorted_keys(counts[name])) do
+      local count = counts[name][quality]
+      items[#items + 1] = {name = name, quality = quality, count = count}
+      needed_slots = needed_slots + math.ceil(count / prototypes.item[name].stack_size)
+    end
+  end
   local inventory = character.get_main_inventory()
+  local empty_slots = inventory and inventory.count_empty_stacks(false, false) or 0
+  -- Conservative upper bound: reserve fresh unfiltered slots for all items,
+  -- even if the new recipe could keep some or existing stacks could hold them.
+  if needed_slots > empty_slots then
+    return nil, "inventory_full", {items = items, empty_slots = empty_slots}
+  end
+  -- The API's returned list is authoritative; never insert the estimate above.
+  local returned = target.set_recipe(params.recipe)
+  local spilled = {}
   for _, item in ipairs(returned) do
     local inserted = inventory and inventory.insert(item) or 0
     if inserted < item.count then
+      local remainder = {name = item.name, quality = item.quality, count = item.count - inserted}
+      spilled[#spilled + 1] = remainder
       character.surface.spill_item_stack{
         position = character.position,
-        stack = {name = item.name, quality = item.quality, count = item.count - inserted},
+        stack = remainder,
         enable_looted = true, allow_belts = false, use_start_position_on_failure = true
       }
     end
   end
   return {name = target.name, recipe = params.recipe, position = position_data(target),
-          returned_items = #returned > 0 and returned or nil}
+          returned_items = #returned > 0 and returned or nil,
+          spilled_items = #spilled > 0 and spilled or nil}
 end
 
 local function get_entity_inventory(character, params)
@@ -2188,6 +2279,7 @@ commands.add_command("ai_mcp_admin", "AI MCP administrator reset (RCON only)",
     state.completed_actions = {}
     state.completed_order = {}
     state.targets = {}
+    state.owned_refs = {}
     state.last_observation = nil
     state.recent_observations = {}
     state.explored_map = {}
