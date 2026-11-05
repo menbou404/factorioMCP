@@ -5,6 +5,7 @@ Only research uses /c. Items come from mining, smelting and normal tool crafting
 Never run against a real save.
 """
 
+import asyncio
 import json
 import math
 import time
@@ -29,6 +30,7 @@ from power_research import (
 from rcon.source import Client
 
 from factorio_mcp.bridge import RCON_FRAG_THRESHOLD, BridgeError
+from factorio_mcp.server import create_server
 from production_line import action as shared_action
 from production_line import password
 
@@ -310,6 +312,47 @@ def build():
         put_batch(station, [("small-electric-pole", position, 0) for position in positions])
 
 
+def check_wait_for_items():
+    """M18-AL: wait for one more assembler-made pack without repeated reads."""
+    target = entity_at(observe(), "assembling-machine-1", ASSEMBLERS[SCIENCE])
+    params = {"target_ref": target["target_ref"]}
+    inventories = call("get_entity_inventory", params)["inventories"]
+    current = amount(inventories["result"], SCIENCE)
+    if current >= 4:
+        # A slow diagnostic pass can leave the result full. Collect existing
+        # products through normal transfer, leaving room for another craft.
+        collected = call(
+            "transfer_item",
+            {
+                **params,
+                "direction": "from_entity",
+                "inventory_role": "result",
+                "item": SCIENCE,
+                "count": current,
+            },
+        )
+        assert collected["moved"] == current, collected
+        current = amount(call("get_entity_inventory", params)["inventories"]["result"], SCIENCE)
+    waited = asyncio.run(
+        create_server(bridge).call_tool(
+            "wait_for_items",
+            {
+                **params,
+                "item": SCIENCE,
+                "count": current + 1,
+                "inventory_role": "output",
+                "timeout_seconds": 30,
+            },
+        )
+    )
+    result = json.loads(waited.content[0].text)
+    assert not waited.is_error, result
+    assert result["reached"] is True and result["current"] >= current + 1, result
+    assert result["stalled"] is False and result["timed_out"] is False, result
+    assert result["inventory_role"] == "result", result
+    print("PASS M18-AL wait_for_items reached current+1", json.dumps(result), flush=True)
+
+
 def wait_for_science(held_components):
     deadline = min(time.monotonic() + 360, power.run_deadline)
     next_report = next_fuel = 0
@@ -379,6 +422,7 @@ def wait_for_science(held_components):
             print(
                 "PASS green inputs came from inserter/belt assemblers", held_components, flush=True
             )
+            check_wait_for_items()
             print("GREEN_SCIENCE_LINE_SUCCEEDED", count, flush=True)
             return
         time.sleep(2)
