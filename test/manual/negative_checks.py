@@ -1471,6 +1471,96 @@ def main():
             )
         action("move_to", return_position)
 
+    # M17-AH: an idle spare furnace keeps wood in its single fuel slot.
+    # Use only held items and recover everything for the later scripts.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    before_full = items()
+    if not all(before_full.get(name, 0) > 0 for name in ("stone-furnace", "wood", "coal")):
+        raise RuntimeError("M17-AH requires a held spare furnace, wood, and coal")
+    full_target = None
+    try:
+        action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+        bridge.call("observe_nearby")
+        bridge.call("place_entity", {"item": "stone-furnace", **spare_position})
+        full_target = next(
+            entity
+            for entity in bridge.call("observe_nearby", {"names": ["stone-furnace"]})["result"][
+                "entities"
+            ]
+            if entity["x"] == spare_position["x"] and entity["y"] == spare_position["y"]
+        )
+        fuel_params = {
+            "target_ref": full_target["target_ref"],
+            "direction": "to_entity",
+            "inventory_role": "fuel",
+            "item": "wood",
+            "count": 1,
+        }
+        stocked = bridge.call("transfer_item", fuel_params)["result"]
+        record("full inventory fixture puts held wood in fuel", stocked.get("moved") == 1)
+        blocked_params = {**fuel_params, "item": "coal"}
+        expected_contents = [{"name": "wood", "quality": "normal", "count": 1}]
+
+        def check_full_detail(value):
+            detail = value.get("detail") or {}
+            return (
+                value.get("error") == "inventory_full"
+                and detail.get("destination") == "entity"
+                and detail.get("inventory_role") == "fuel"
+                and detail.get("item") == "coal"
+                and detail.get("requested") == 1
+                and detail.get("slots") == 1
+                and detail.get("empty_slots") == 0
+                and detail.get("insertable") == 0
+                and detail.get("contents") == expected_contents
+                and "from_entity first" in value.get("hint", "")
+            )
+
+        rejected = asyncio.run(server.call_tool("transfer_item", blocked_params))
+        value = json.loads(rejected.content[0].text)
+        record(
+            "full fuel slot describes occupying wood and destination capacity",
+            rejected.is_error and check_full_detail(value),
+            json.dumps(value),
+        )
+        batch_response = asyncio.run(
+            server.call_tool(
+                "transfer_items",
+                {"items": [blocked_params, {**fuel_params, "direction": "from_entity"}]},
+            )
+        )
+        batch = json.loads(batch_response.content[0].text)
+        entries = batch.get("results") or []
+        record(
+            "batch full fuel slot keeps detail and continues to recover wood",
+            not batch_response.is_error
+            and batch.get("succeeded") == batch.get("failed") == 1
+            and len(entries) == 2
+            and entries[0].get("ok") is False
+            and check_full_detail(entries[0])
+            and entries[1].get("ok") is True
+            and entries[1].get("result", {}).get("moved") == 1,
+            json.dumps(batch),
+        )
+    finally:
+        if full_target is not None:
+            fuel = bridge.call("get_entity_inventory", {"target_ref": full_target["target_ref"]})[
+                "result"
+            ]["inventories"]["fuel"]
+            for stack in fuel or []:
+                bridge.call(
+                    "transfer_item",
+                    {
+                        **fuel_params,
+                        "direction": "from_entity",
+                        "item": stack["name"],
+                        "count": stack["count"],
+                    },
+                )
+            action("mine_entity", {"target_ref": full_target["target_ref"], "count": 1})
+        action("move_to", return_position)
+    record("full fuel slot checks restore all held items", items() == before_full)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

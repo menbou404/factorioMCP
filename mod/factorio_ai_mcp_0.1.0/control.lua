@@ -1839,14 +1839,28 @@ local function do_entity_inventory(state, params)
     local inventory = target.get_inventory(inventory_id)
     if inventory and inventory.valid then inventories[role] = inventory.get_contents() end
   end
+  local status = target.status
+  local recipe_name
+  if target.type == "assembling-machine" or target.type == "furnace" then
+    local recipe = target.get_recipe()
+    if recipe then
+      recipe_name = recipe.name
+    elseif target.type == "furnace" then
+      -- Idle furnaces expose a RecipeIDAndQualityIDPair, not a LuaRecipe.
+      local previous = target.previous_recipe
+      if previous then recipe_name = previous.name end
+    end
+  end
   return {name = target.name, inventories = inventories,
+          status = status ~= nil and ENTITY_STATUS_NAMES[status] or nil,
+          recipe = recipe_name,
           direction = target.direction,
           drop_position = target.name == "burner-mining-drill" and
                           target.drop_position or nil}
 end
 
-local function transfer_shortage_detail(source, params, role)
-  local contents = source.get_contents()
+local function transfer_inventory_contents(inventory)
+  local contents = inventory.get_contents()
   table.sort(contents, function(a, b)
     if a.name ~= b.name then return a.name < b.name end
     return a.quality < b.quality
@@ -1856,9 +1870,23 @@ local function transfer_shortage_detail(source, params, role)
     local item = contents[index]
     preview[#preview + 1] = {name = item.name, count = item.count, quality = item.quality}
   end
+  return preview
+end
+
+local function transfer_shortage_detail(source, params, role)
+  local preview = transfer_inventory_contents(source)
   return {item = params.item, requested = params.count, available = 0,
           inventory_role = params.direction == "from_entity" and role or nil,
           contents = #preview > 0 and preview or nil}
+end
+
+local function transfer_full_detail(destination, params, role)
+  return {item = params.item, requested = params.count,
+          destination = params.direction == "to_entity" and "entity" or "character",
+          inventory_role = params.direction == "to_entity" and role or nil,
+          contents = transfer_inventory_contents(destination), slots = #destination,
+          empty_slots = destination.count_empty_stacks(),
+          insertable = destination.get_insertable_count{name = params.item, quality = "normal"}}
 end
 
 local function do_transfer(state, params)
@@ -1895,7 +1923,7 @@ local function do_transfer(state, params)
     if source.get_item_count(item_id) == 0 then
       return nil, "missing_materials", transfer_shortage_detail(source, params, role)
     end
-    return nil, "inventory_full"
+    return nil, "inventory_full", transfer_full_detail(destination, params, role)
   end
   local removed = source.remove{name = params.item, quality = "normal", count = count}
   if removed == 0 then
@@ -1907,7 +1935,9 @@ local function do_transfer(state, params)
   if inserted < removed then
     source.insert{name = params.item, quality = "normal", count = removed - inserted}
   end
-  if inserted == 0 then return nil, "inventory_full" end
+  if inserted == 0 then
+    return nil, "inventory_full", transfer_full_detail(destination, params, role)
+  end
   return {moved = inserted, item = params.item, direction = params.direction,
           inventory_role = role}
 end

@@ -10,7 +10,11 @@ import math
 import time
 
 import power_research as power
-from helpers import position_in_tile_footprint, select_automation_technology
+from helpers import (
+    position_in_tile_footprint,
+    select_automation_technology,
+    successful_batch_results,
+)
 from power_research import (
     BOILER,
     COPPER_DRILL,
@@ -242,6 +246,53 @@ def check_new_placeables(recipes):
     print("M14-U placed equipment recovered to inventory", flush=True)
 
 
+def check_machine_inventories():
+    """M17-AI: inventory reads include the machine state and configured recipe."""
+    walk((20, -18))
+    observation = bridge.call(
+        "observe_nearby",
+        {
+            "names": ["assembling-machine-1", "lab", "iron-chest"],
+            "include_resources": False,
+            "include_tiles": False,
+        },
+    )
+    targets = [
+        entity_at(observation["result"], name, position)
+        for name, position in (
+            ("assembling-machine-1", ASSEMBLER),
+            ("lab", LAB),
+            ("iron-chest", CHEST),
+        )
+    ]
+    single = [
+        bridge.call("get_entity_inventory", {"target_ref": target["target_ref"]})
+        for target in targets
+    ]
+    batch = bridge.call(
+        "get_entity_inventories", {"target_refs": [target["target_ref"] for target in targets]}
+    )
+    batch_results = successful_batch_results(batch["result"], len(targets))
+    for index, target in enumerate(targets):
+        for tick, result in (
+            (single[index]["tick"], single[index]["result"]),
+            (batch["tick"], batch_results[index]),
+        ):
+            status = result.get("status")
+            if target.get("status") is None:
+                assert "status" not in result, (target, result)
+            else:
+                assert isinstance(status, str) and status, (target, result)
+                if tick == observation["tick"]:
+                    assert status == target["status"], (target, result)
+            if index == 0:
+                assert isinstance(status, str) and status, result
+                assert result.get("recipe") == SCIENCE, result
+            else:
+                assert "recipe" not in result, result
+    print("M17-AI single and batch inventories include status and assembler recipe", flush=True)
+
+
 def main():
     power.run_deadline = time.monotonic() + 885  # Leave room before CI's 900 s timeout.
     research = call("get_research_status")
@@ -381,6 +432,7 @@ def main():
             assert network_seen, f"Shared electric network never observed: {last}"
             assert working_seen, f"Assembler working status never observed: {last}"
             check_new_placeables(recipes)
+            check_machine_inventories()
             print("AUTOMATION_LINE_SUCCEEDED", technology["name"], flush=True)
             return
         time.sleep(2)
