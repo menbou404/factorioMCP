@@ -100,6 +100,36 @@ RESEARCH_STALLED_HINT = (
     "labs working in parallel each need a pack of every ingredient. Check lab power too."
 )
 
+# Keep in sync with ROLE_ALIASES in control.lua; returned roles are canonical.
+ROLE_ALIASES = {
+    "stone-furnace": {"input": "source", "output": "result"},
+    "assembling-machine-1": {"input": "source", "output": "result"},
+    "lab": {"source": "input"},
+}
+
+# Stopped states from Factorio 2.0.77 defines.entity_status. In particular,
+# low_power is not stopped: a machine may still make progress at reduced speed.
+ITEMS_STALLED_HINTS = {
+    "full_output": "Take products out or add an output inserter.",
+    "full_burnt_result_output": "Take spent fuel out of the burnt result inventory.",
+    "no_ingredients": "Supply materials to the machine's input inventory.",
+    "item_ingredient_shortage": "Supply missing materials to the machine's input inventory.",
+    "fluid_ingredient_shortage": "Supply the missing ingredient fluids.",
+    "no_input_fluid": "Supply the required input fluid.",
+    "missing_required_fluid": "Supply the required mining fluid.",
+    "missing_science_packs": "Supply the required science packs to the lab.",
+    "no_fuel": "Supply fuel to the machine's fuel inventory.",
+    "no_power": "Connect the machine to a working power supply.",
+    "no_recipe": "Set a recipe on the assembler.",
+    "no_research_in_progress": "Start research for the lab to work on.",
+    "no_minable_resources": "Place the drill over mineable resources.",
+    "waiting_for_source_items": "Supply materials at the inserter's pickup position.",
+    "waiting_for_space_in_destination": "Free space in the output destination.",
+    "disabled_by_control_behavior": "Check the machine's circuit control conditions.",
+    "disabled_by_script": "Check why the machine was disabled by a script.",
+    "marked_for_deconstruction": "Cancel deconstruction to let the machine work.",
+}
+
 
 class TransferEntry(BaseModel):
     target_ref: RequiredText
@@ -792,6 +822,98 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     )
     async def get_entity_inventory(target_ref: RequiredText) -> CallToolResult:
         return await invoke("get_entity_inventory", {"target_ref": target_ref})
+
+    @server.tool(
+        description=(
+            "Wait for an item count in a nearby observed structure instead of repeated "
+            "get_entity_inventory calls while production runs. Read-only; polls about every "
+            "0.5 seconds. The character must stay within reach throughout the wait; "
+            "inventory read errors are returned with the same hints. "
+            "count is 1-10000; timeout_seconds is 1-50 (default 20). "
+            "Counts all qualities across all inventory roles, or only inventory_role if given. "
+            "Accepts transfer_item role aliases: stone-furnace and assembling-machine-1 "
+            "input -> source, output -> result; lab source -> input. Returned roles are canonical. "
+            "Unknown roles return invalid_input with detail.valid_roles. "
+            "Returns target_ref, item, count, current, reached, status (if present), stalled, "
+            "timed_out, waited_seconds, and inventory_role (if given). "
+            "Returns early with stalled=true, stalled_seconds, and a status hint when the "
+            "count stays unchanged for 10 consecutive seconds in stopped states: "
+            + ", ".join(ITEMS_STALLED_HINTS)
+            + ". Working states and containers without status never stall. "
+            "For full_output, take products out or add an output inserter; "
+            "for ingredient shortages, supply materials; for no_fuel/no_power, supply fuel/power."
+        )
+    )
+    async def wait_for_items(
+        target_ref: RequiredText,
+        item: RequiredText,
+        count: Annotated[int, Field(ge=1, le=10000, strict=True)],
+        inventory_role: RequiredText | None = None,
+        timeout_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] = 20,
+    ) -> CallToolResult:
+        started = time.monotonic()
+        unchanged_since = None
+        last_count = None
+        try:
+            while True:
+                response = await call("get_entity_inventory", {"target_ref": target_ref})
+                value = _success_value("get_entity_inventory", response)
+                inventories = value["inventories"]
+                role = ROLE_ALIASES.get(value["name"], {}).get(inventory_role, inventory_role)
+                if role is not None and role not in inventories:
+                    return _error_response(
+                        BridgeError(
+                            "invalid_input",
+                            "Unknown inventory role for this entity.",
+                            {
+                                "entity": value["name"],
+                                "inventory_role": inventory_role,
+                                "valid_roles": sorted(inventories),
+                                "role_aliases": ROLE_ALIASES.get(value["name"], {}),
+                            },
+                        )
+                    )
+                contents = [inventories[role]] if role is not None else inventories.values()
+                current = sum(
+                    stack["count"]
+                    for stacks in contents
+                    for stack in stacks
+                    if stack["name"] == item
+                )
+                status = value.get("status")
+                reached = current >= count
+                now = time.monotonic()
+                waited = now - started
+                if status in ITEMS_STALLED_HINTS and not reached:
+                    if unchanged_since is None or current != last_count:
+                        unchanged_since = now
+                else:
+                    unchanged_since = None
+                last_count = current
+                stalled_seconds = now - unchanged_since if unchanged_since is not None else 0
+                stalled = stalled_seconds >= 10
+                if reached or stalled or waited >= timeout_seconds:
+                    result = {
+                        "target_ref": target_ref,
+                        "item": item,
+                        "count": count,
+                        "current": current,
+                        "reached": reached,
+                        "stalled": stalled,
+                        "timed_out": not reached and not stalled and waited >= timeout_seconds,
+                        "waited_seconds": waited,
+                    }
+                    if status is not None:
+                        result["status"] = status
+                    if role is not None:
+                        result["inventory_role"] = role
+                    if stalled:
+                        result["stalled_seconds"] = stalled_seconds
+                        result["hint"] = ITEMS_STALLED_HINTS[status]
+                    return _response(result)
+                await asyncio.sleep(min(0.5, timeout_seconds - waited))
+        except Exception as exc:
+            return _error_response(exc, "get_entity_inventory")
 
     @server.tool(
         description=(
