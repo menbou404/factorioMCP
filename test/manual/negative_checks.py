@@ -136,13 +136,21 @@ def main():
     )
     record("out-of-reach mining keeps inventory", items() == before)
 
+    resource = reference("stone")
+    record("resource target_ref changes on reobservation", reference("stone") != resource)
     time.sleep(61)
     expect_error(
-        "expired target_ref", "get_entity_inventory", {"target_ref": furnace}, {"target_gone"}
+        "expired target_ref", "mine_entity", {"target_ref": resource, "count": 1}, {"target_gone"}
     )
 
     # M6 checks are appended so the original checks and their output order stay intact.
     action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+    # M19-AM: this original owned ref survives the same wait as the resource.
+    accessible = bridge.call("get_entity_inventory", {"target_ref": furnace})["result"]
+    record("owned furnace target_ref survives 60 seconds", accessible["name"] == "stone-furnace")
+    record(
+        "owned furnace target_ref is stable on reobservation", reference("stone-furnace") == furnace
+    )
     furnace = reference("stone-furnace")
     try:
         bridge.call(
