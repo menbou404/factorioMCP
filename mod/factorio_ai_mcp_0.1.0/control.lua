@@ -1991,16 +1991,7 @@ local function get_entity_inventory(character, params)
   return target, roles
 end
 
-local function do_entity_inventory(state, params)
-  local character, err = require_character(state)
-  if not character then return nil, err end
-  local target, roles, target_error, detail = get_entity_inventory(character, params)
-  if not target then return nil, target_error, detail end
-  local inventories = {}
-  for role, inventory_id in pairs(roles) do
-    local inventory = target.get_inventory(inventory_id)
-    if inventory and inventory.valid then inventories[role] = inventory.get_contents() end
-  end
+local function inventory_entity_state(target)
   local status = target.status
   local recipe_name
   if target.type == "assembling-machine" or target.type == "furnace" then
@@ -2013,9 +2004,21 @@ local function do_entity_inventory(state, params)
       if previous then recipe_name = previous.name end
     end
   end
-  return {name = target.name, inventories = inventories,
-          status = status ~= nil and ENTITY_STATUS_NAMES[status] or nil,
-          recipe = recipe_name,
+  return status ~= nil and ENTITY_STATUS_NAMES[status] or nil, recipe_name
+end
+
+local function do_entity_inventory(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  local target, roles, target_error, detail = get_entity_inventory(character, params)
+  if not target then return nil, target_error, detail end
+  local inventories = {}
+  for role, inventory_id in pairs(roles) do
+    local inventory = target.get_inventory(inventory_id)
+    if inventory and inventory.valid then inventories[role] = inventory.get_contents() end
+  end
+  local status, recipe = inventory_entity_state(target)
+  return {name = target.name, inventories = inventories, status = status, recipe = recipe,
           direction = target.direction,
           drop_position = target.name == "burner-mining-drill" and
                           target.drop_position or nil}
@@ -2035,20 +2038,60 @@ local function transfer_inventory_contents(inventory)
   return preview
 end
 
-local function transfer_shortage_detail(source, params, role)
+local function transfer_shortage_detail(source, params, role, target)
   local preview = transfer_inventory_contents(source)
+  local status, recipe
+  if params.direction == "from_entity" then
+    status, recipe = inventory_entity_state(target)
+  end
   return {item = params.item, requested = params.count, available = 0,
           inventory_role = params.direction == "from_entity" and role or nil,
+          status = status, recipe = recipe,
           contents = #preview > 0 and preview or nil}
 end
 
-local function transfer_full_detail(destination, params, role)
+local function transfer_full_detail(destination, params, role, insertable)
   return {item = params.item, requested = params.count,
           destination = params.direction == "to_entity" and "entity" or "character",
           inventory_role = params.direction == "to_entity" and role or nil,
           contents = transfer_inventory_contents(destination), slots = #destination,
           empty_slots = destination.count_empty_stacks(),
-          insertable = destination.get_insertable_count{name = params.item, quality = "normal"}}
+          insertable = insertable}
+end
+
+local function transfer_rejection_detail(target, params, role, inventory_id)
+  if params.direction ~= "to_entity" or inventory_id ~= defines.inventory.crafter_input then
+    return nil
+  end
+  local detail = {item = params.item, entity = target.name, inventory_role = role, insertable = 0}
+  if target.type == "assembling-machine" then
+    local recipe = target.get_recipe()
+    if not recipe then
+      detail.reason = "no_recipe"
+      return detail
+    end
+    detail.recipe, detail.ingredients = recipe.name, {}
+    local accepted = false
+    for _, ingredient in pairs(recipe.ingredients) do
+      detail.ingredients[#detail.ingredients + 1] = ingredient.name
+      if ingredient.type == "item" and ingredient.name == params.item then accepted = true end
+    end
+    if accepted then return nil end
+    table.sort(detail.ingredients)
+    return detail
+  elseif target.type == "furnace" then
+    -- Prototype recipes include locked recipes; do not filter on force.enabled.
+    for category in pairs(target.prototype.crafting_categories or {}) do
+      local recipes = prototypes.get_recipe_filtered{{filter = "category", category = category}}
+      for _, recipe in pairs(recipes) do
+        for _, ingredient in pairs(recipe.ingredients) do
+          if ingredient.type == "item" and ingredient.name == params.item then return nil end
+        end
+      end
+    end
+    detail.reason = "no_smelting_recipe"
+    return detail
+  end
 end
 
 local function do_transfer(state, params)
@@ -2076,30 +2119,35 @@ local function do_transfer(state, params)
     return nil, "invalid_target", {entity = target.name, valid_roles = sorted_keys(roles),
                                   role_aliases = aliases}
   end
+  local rejection = transfer_rejection_detail(target, params, role, inventory_id)
+  if rejection then return nil, "item_not_accepted", rejection end
   local source = params.direction == "to_entity" and player_inventory or entity_inventory
   local destination = params.direction == "to_entity" and entity_inventory or player_inventory
   local item_id = {name = params.item, quality = "normal"}
   local available = source.get_item_count(item_id)
+  -- 2.0.77 documents this as a best guess, including for assembler filtered slots.
+  -- Recipe acceptance is checked above; retain its capacity estimate for accepted items.
   local insertable = destination.get_insertable_count(item_id)
   local count = math.min(params.count, available, insertable)
   if count == 0 then
     if available == 0 then
-      return nil, "missing_materials", transfer_shortage_detail(source, params, role)
+      return nil, "missing_materials", transfer_shortage_detail(source, params, role, target)
     end
-    return nil, "inventory_full", transfer_full_detail(destination, params, role)
+    return nil, "inventory_full", transfer_full_detail(destination, params, role, insertable)
   end
   local removed = source.remove{name = params.item, quality = "normal", count = count}
   if removed == 0 then
-    local shortage = source.get_item_count(item_id) == 0 and
-                     transfer_shortage_detail(source, params, role) or nil
-    return nil, "missing_materials", shortage
+    return nil, "missing_materials", transfer_shortage_detail(source, params, role, target)
   end
   local inserted = destination.insert{name = params.item, quality = "normal", count = removed}
   if inserted < removed then
     source.insert{name = params.item, quality = "normal", count = removed - inserted}
   end
   if inserted == 0 then
-    return nil, "inventory_full", transfer_full_detail(destination, params, role)
+    -- A positive estimate followed by zero actual insertion is an acceptance failure.
+    local rejected = transfer_full_detail(destination, params, role, 0)
+    if params.direction == "to_entity" then rejected.entity = target.name end
+    return nil, "item_not_accepted", rejected
   end
   local result = {moved = inserted, requested = params.count, item = params.item,
                   direction = params.direction, inventory_role = role}
