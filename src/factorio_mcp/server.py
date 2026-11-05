@@ -486,6 +486,40 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         except Exception as exc:
             return _error_response(exc, operation)
 
+    async def wait_action(
+        action_id: str, timeout_seconds: float, start_value: dict[str, Any] | None = None
+    ) -> CallToolResult:
+        started = time.monotonic()
+        try:
+            while True:
+                response = await call("get_action_status", {"action_id": action_id})
+                value = _success_value("get_action_status", response)
+                waited = time.monotonic() - started
+                running = value.get("status") == "running"
+                if not running or waited >= timeout_seconds:
+                    return _response(
+                        {
+                            **(start_value or {}),
+                            **value,
+                            "timed_out": running,
+                            "waited_seconds": waited,
+                        }
+                    )
+                await asyncio.sleep(min(0.25, timeout_seconds - waited))
+        except Exception as exc:
+            return _error_response(exc)
+
+    async def start_action(
+        operation: str, params: dict[str, Any], wait_seconds: float | None
+    ) -> CallToolResult:
+        try:
+            value = _success_value(operation, await call(operation, params))
+        except Exception as exc:
+            return _error_response(exc, operation)
+        if wait_seconds is None or value.get("status") in {"succeeded", "failed", "cancelled"}:
+            return _response(value)
+        return await wait_action(value["action_id"], wait_seconds, value)
+
     @server.tool(description="Check the connection to the Factorio AI Mod.")
     async def factorio_ping() -> CallToolResult:
         return await invoke("ping")
@@ -731,16 +765,23 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "start_adjusted, when present, is the nearby pathfinding start used when touching "
             "an obstacle; the character still moves by walking. "
             "Crafting runs alongside walking. Only one walk/mine at a time. "
-            "Returns an action ID for polling."
+            "Prefer wait_seconds (1-50) to start and wait in one call, under common 60-second "
+            "client timeouts. A timeout leaves the action running and returns timed_out=true "
+            "and action_id; continue with wait_for_action. Omit wait_seconds to return the "
+            "start result immediately."
         )
     )
     async def move_to(
-        surface: RequiredText, x: Coordinate, y: Coordinate, within: MoveWithin | None = None
+        surface: RequiredText,
+        x: Coordinate,
+        y: Coordinate,
+        within: MoveWithin | None = None,
+        wait_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] | None = None,
     ) -> CallToolResult:
         params: dict[str, Any] = {"surface": surface, "x": x, "y": y}
         if within is not None:
             params["within"] = within
-        return await invoke("move_to", params)
+        return await start_action("move_to", params, wait_seconds)
 
     @server.tool(
         description=(
@@ -762,13 +803,20 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Start normal hand crafting using the AI character’s own materials. "
             "count is 1-100. "
             "Crafting runs alongside walking and mining. Only one craft at a time. "
-            "Poll the returned action ID. On missing_materials, detail.missing_raw lists "
+            "Prefer wait_seconds (1-50) to start and wait in one call, under common 60-second "
+            "client timeouts. A timeout leaves the action running and returns timed_out=true "
+            "and action_id; continue with wait_for_action. Omit wait_seconds to return the "
+            "start result immediately. On missing_materials, detail.missing_raw lists "
             "raw items such as plates that are short after expanding hand-craftable "
             "intermediates and using held materials first."
         )
     )
-    async def craft(recipe: RequiredText, count: Count) -> CallToolResult:
-        return await invoke("craft", {"recipe": recipe, "count": count})
+    async def craft(
+        recipe: RequiredText,
+        count: Count,
+        wait_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] | None = None,
+    ) -> CallToolResult:
+        return await start_action("craft", {"recipe": recipe, "count": count}, wait_seconds)
 
     @server.tool(description=PLACE_DESCRIPTION)
     async def place_entity(
@@ -1050,7 +1098,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Wait for a walking, mining, or crafting action to finish. Prefer this over polling "
-            "get_action_status. A timeout returns the last running status "
+            "get_action_status. For move_to and craft, prefer their wait_seconds argument "
+            "to save a call; use wait_for_action to continue waiting after a timeout. "
+            "A timeout returns the last running status "
             "and leaves the action running. Running mining reports detail.gained and detail.count; "
             "running crafting reports detail.count and detail.remaining. "
             "When computable, mining detail.estimated_seconds is an estimate that can change "
@@ -1063,18 +1113,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         action_id: RequiredText,
         timeout_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] = 20,
     ) -> CallToolResult:
-        started = time.monotonic()
-        try:
-            while True:
-                response = await call("get_action_status", {"action_id": action_id})
-                value = _success_value("get_action_status", response)
-                waited = time.monotonic() - started
-                running = value.get("status") == "running"
-                if not running or waited >= timeout_seconds:
-                    return _response({**value, "timed_out": running, "waited_seconds": waited})
-                await asyncio.sleep(min(0.25, timeout_seconds - waited))
-        except Exception as exc:
-            return _error_response(exc)
+        return await wait_action(action_id, timeout_seconds)
 
     @server.tool(description="Stop an ongoing walking, mining, or crafting action.")
     async def cancel_action(action_id: RequiredText) -> CallToolResult:
