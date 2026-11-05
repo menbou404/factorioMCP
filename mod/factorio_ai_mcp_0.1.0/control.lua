@@ -1482,6 +1482,22 @@ local function placement_bounding_box(prototype, position, direction)
           right_bottom = {x = position.x + right, y = position.y + bottom}}
 end
 
+local function preview_inserter_positions(prototype, position, direction)
+  if prototype.type ~= "inserter" then return nil, nil end
+  local function absolute(vector)
+    if not vector then return nil end
+    -- Runtime Vector values are arrays, unlike MapPosition values.
+    local x, y = vector[1], vector[2]
+    -- Clockwise in map coordinates (positive y is south). North-facing
+    -- inserters pick north and drop south; direction=12 picks west.
+    if direction == 4 then x, y = -y, x
+    elseif direction == 8 then x, y = -x, -y
+    elseif direction == 12 then x, y = y, -x end
+    return {x = position.x + x, y = position.y + y}
+  end
+  return absolute(prototype.inserter_pickup_position), absolute(prototype.inserter_drop_position)
+end
+
 local function placement_electric_coverage(character, prototype, position, box)
   local is_pole = prototype.type == "electric-pole"
   if not is_pole and prototype.electric_energy_source_prototype == nil then return nil end
@@ -1818,8 +1834,9 @@ local function do_check_placement(state, params)
   local has_item = item_proto ~= nil and inventory ~= nil and
     inventory.get_item_count({name = params.item, quality = "normal"}) >= 1
   local direction = params.direction or defines.direction.north
-  local position, box, fluid_connections, electric_coverage
-  if prototype and PLACEABLE_ITEMS[params.item] and params.surface == character.surface.name and
+  local position, box, fluid_connections, electric_coverage, pickup_position, drop_position
+  if prototype and (PLACEABLE_ITEMS[params.item] or prototype.type == "inserter") and
+     params.surface == character.surface.name and
      (direction == 0 or direction == 4 or direction == 8 or direction == 12) and
      type(params.x) == "number" and type(params.y) == "number" and
      params.x == params.x and params.y == params.y and
@@ -1828,6 +1845,7 @@ local function do_check_placement(state, params)
     box = placement_bounding_box(prototype, position, direction)
     fluid_connections = preview_fluid_connections(prototype, position, direction)
     electric_coverage = placement_electric_coverage(character, prototype, position, box)
+    pickup_position, drop_position = preview_inserter_positions(prototype, position, direction)
   end
   local blocked = reason == "blocked" and detail or {}
   local water_direction, output_direction = offshore_pump_directions(
@@ -1835,6 +1853,7 @@ local function do_check_placement(state, params)
   return {placeable = placement ~= nil, reason = reason,
           entity = prototype and prototype.name or nil, has_item = has_item,
           position = position, bounding_box = box, fluid_connections = fluid_connections,
+          pickup_position = pickup_position, drop_position = drop_position,
           electric_coverage = electric_coverage,
           water_direction = water_direction, output_direction = output_direction,
           blocking = blocked.blocking, tiles = blocked.tiles,
@@ -1889,6 +1908,8 @@ local function do_place(state, params)
   return {name = created.name, position = position_data(created),
           target_ref = register_target(state, created),
           direction = created.direction, consumed_item = params.item,
+          pickup_position = created.type == "inserter" and created.pickup_position or nil,
+          drop_position = created.type == "inserter" and created.drop_position or nil,
           fluid_connections = placed_fluid_connections(created), collected_items = collected_items}
 end
 
@@ -2025,6 +2046,9 @@ local function inventory_entity_state(target)
       if previous then recipe_name = previous.name end
     end
   end
+  -- Guard: previous_recipe.name may be a LuaRecipePrototype, not a string.
+  -- Normalize before callers index recipes or serialize the value to JSON.
+  if recipe_name and type(recipe_name) ~= "string" then recipe_name = recipe_name.name end
   return status ~= nil and ENTITY_STATUS_NAMES[status] or nil, recipe_name
 end
 
@@ -2039,7 +2063,28 @@ local function do_entity_inventory(state, params)
     if inventory and inventory.valid then inventories[role] = inventory.get_contents() end
   end
   local status, recipe = inventory_entity_state(target)
-  return {name = target.name, inventories = inventories, status = status, recipe = recipe,
+  local products_finished, recipe_products, recipe_product_amounts
+  if target.type == "assembling-machine" or target.type == "furnace" then
+    products_finished = target.products_finished
+    recipe_products, recipe_product_amounts = {}, {}
+    -- inventory_entity_state resolves idle furnaces' previous recipe names.
+    local recipe_data = recipe and target.force.recipes[recipe]
+    for _, product in pairs(recipe_data and recipe_data.products or {}) do
+      if product.type == "item" then
+        if recipe_product_amounts[product.name] == nil then
+          recipe_products[#recipe_products + 1] = product.name
+        end
+        -- Ignore probability; variable amounts use their midpoint.
+        local amount = product.amount or ((product.amount_min + product.amount_max) / 2)
+        recipe_product_amounts[product.name] = (recipe_product_amounts[product.name] or 0) + amount
+      end
+    end
+    table.sort(recipe_products)
+  end
+  return {name = target.name, type = target.type,
+          inventories = inventories, status = status, recipe = recipe,
+          products_finished = products_finished, recipe_products = recipe_products,
+          recipe_product_amounts = recipe_product_amounts,
           direction = target.direction,
           drop_position = target.name == "burner-mining-drill" and
                           target.drop_position or nil}

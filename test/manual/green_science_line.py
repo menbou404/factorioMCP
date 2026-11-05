@@ -154,6 +154,7 @@ def put_batch(station, entries):
     walk(station)
     observed = observe()
     params = []
+    previews = []
     for name, position, direction, *kind in entries:
         require_reach(observed, position, "build")
         entry = {
@@ -168,10 +169,11 @@ def put_batch(station, entries):
         checked = call("check_placement", entry)
         assert checked["placeable"] and checked["has_item"], (entry, checked)
         params.append(entry)
+        previews.append(checked)
     results = successful_batch_results(call("place_entities", {"items": params}), len(params))
     observed = observe()
     observed_again = observe()
-    for entry, result in zip(params, results, strict=True):
+    for entry, result, preview in zip(params, results, previews, strict=True):
         position = (entry["x"], entry["y"])
         entity = entity_at(observed, entry["item"], position)
         assert (
@@ -180,6 +182,19 @@ def put_batch(station, entries):
             == entity_at(observed_again, entry["item"], position)["target_ref"]
         ), (entry, result, entity)
         assert result["name"] == entity["name"], (entry, result, entity)
+        if "pickup_position" in entity:
+            for field in ("pickup_position", "drop_position"):
+                for axis in ("x", "y"):
+                    assert abs(preview[field][axis] - result[field][axis]) <= 0.01, (
+                        entry,
+                        preview,
+                        result,
+                    )
+                    assert abs(result[field][axis] - entity[field][axis]) <= 0.01, (
+                        entry,
+                        result,
+                        entity,
+                    )
         # Assemblers without recipes, chests and poles may omit direction.
         if "direction" in entity:
             assert entity["direction"] == entry["direction"], (entry, entity)
@@ -380,6 +395,40 @@ def check_wait_seconds():
     asyncio.run(check())
 
 
+def check_wait_for_produced_items():
+    """M21-AW: count new green packs from the machine's lifetime craft counter."""
+    target = entity_at(observe(), "assembling-machine-1", ASSEMBLERS[SCIENCE])
+    params = {"target_ref": target["target_ref"]}
+    inventory = call("get_entity_inventory", params)
+    assert SCIENCE in inventory["recipe_products"], inventory
+    assert inventory["products_finished"] >= 1, inventory
+    # Leave output space for another craft even if earlier diagnostics filled it.
+    current = amount(inventory["inventories"]["result"], SCIENCE)
+    if current:
+        collected = call(
+            "transfer_item",
+            {
+                **params,
+                "direction": "from_entity",
+                "inventory_role": "result",
+                "item": SCIENCE,
+                "count": current,
+            },
+        )
+        assert collected["moved"] == current, collected
+    waited = asyncio.run(
+        create_server(bridge).call_tool(
+            "wait_for_items",
+            {**params, "item": SCIENCE, "count": 1, "produced": True, "timeout_seconds": 30},
+        )
+    )
+    result = json.loads(waited.content[0].text)
+    assert not waited.is_error, result
+    assert result["reached"] is True and result["produced"] is True, result
+    assert result["current"] >= 1 and not result["stalled"] and not result["timed_out"], result
+    print("PASS M21-AW wait_for_items produced", json.dumps(result), flush=True)
+
+
 def wait_for_science(held_components):
     deadline = min(time.monotonic() + 360, power.run_deadline)
     next_report = next_fuel = 0
@@ -450,6 +499,7 @@ def wait_for_science(held_components):
                 "PASS green inputs came from inserter/belt assemblers", held_components, flush=True
             )
             check_wait_for_items()
+            check_wait_for_produced_items()
             check_wait_seconds()
             print("GREEN_SCIENCE_LINE_SUCCEEDED", count, flush=True)
             return
