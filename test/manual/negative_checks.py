@@ -1854,6 +1854,276 @@ def main():
         action("move_to", return_position)
     record("assembler rejection checks preserve all held items", items() == before_rejection)
 
+    # M20-AS: recreate trial 14's walkable 0.45-tile slot with real held buildings.
+    # Only fixture positioning uses teleport, in the mod's Lua state, never through MCP.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    before_escape = items()  # Include all setup costs in the restoration baseline.
+    crafted_escape_chest = False
+    escape_targets = []
+    escape_action_id = None
+
+    def escape_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;"
+            "local c=state and state.character;assert(c and c.valid);" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+            if "m20as_fixture:" not in raw:
+                raw = client.run(command)
+        if "m20as_fixture:" not in raw:
+            raise RuntimeError("Missing M20-AS fixture response: " + raw)
+        return json.loads(raw.split("m20as_fixture:", 1)[1].strip())
+
+    def overlaps(first, second):
+        return all(
+            first["left_top"][axis] < second["right_bottom"][axis]
+            and first["right_bottom"][axis] > second["left_top"][axis]
+            for axis in ("x", "y")
+        )
+
+    def mine_escape_wood():
+        # Use a separate raw-resource fixture; later scripts still need M8-D's tree.
+        tree = escape_fixture(
+            "local e=storage.m20as_tree;"
+            "if not e or not e.valid then "
+            'local p=c.surface.find_non_colliding_position("tree-01",c.position,8,0.5);'
+            'assert(p,"M20-AS cannot place wood recovery tree");'
+            'e=c.surface.create_entity{name="tree-01",position=p};'
+            "assert(e);storage.m20as_tree=e end;"
+            'rcon.print("m20as_fixture:"..helpers.table_to_json({position=e.position}))'
+        )["position"]
+        try:
+            action("move_to", {"surface": "nauvis", **tree, "within": 2})
+            observed = bridge.call("observe_nearby", {"types": ["tree"]})["result"]["entities"]
+            target = next(
+                entity
+                for entity in observed
+                if entity["name"] == "tree-01"
+                and entity["x"] == tree["x"]
+                and entity["y"] == tree["y"]
+            )
+            action("mine_entity", {"target_ref": target["target_ref"], "count": 1})
+        finally:
+            escape_fixture(
+                "local e=storage.m20as_tree;if e and e.valid then e.destroy() end;"
+                "storage.m20as_tree=nil;rcon.print('m20as_fixture:{\"removed\":true}')"
+            )
+
+    try:
+        character_dimensions = escape_fixture(
+            'rcon.print("m20as_fixture:"..helpers.table_to_json({box=c.prototype.collision_box}))'
+        )["box"]
+        character_height = (
+            character_dimensions["right_bottom"]["y"] - character_dimensions["left_top"]["y"]
+        )
+        attempts = []
+        setup = None
+        upper_items = [
+            name
+            for name in ("wooden-chest", "iron-chest", "burner-inserter", "small-electric-pole")
+            if before_escape.get(name, 0) > 0
+        ]
+        if "wooden-chest" not in upper_items:
+            # Craft only if no held collider reproduces the slot.
+            upper_items.append("wooden-chest")
+        for upper_item in upper_items:
+            for x, y in ((12, -4), (16, 4), (-18, 8)):
+                action("move_to", {"surface": "nauvis", "x": x - 3, "y": y + 1})
+                bridge.call("observe_nearby")
+                chest_params = {"item": upper_item, "surface": "nauvis", "x": x + 0.5, "y": y + 0.5}
+                chest_check = bridge.call("check_placement", chest_params)["result"]
+                for lower_item in ("burner-mining-drill", "stone-furnace"):
+                    lower_params = {"item": lower_item, "surface": "nauvis", "x": x + 1, "y": y + 2}
+                    lower_check = bridge.call("check_placement", lower_params)["result"]
+                    goal = {"surface": "nauvis", "x": x - 5.5, "y": y + 1.5}
+                    goal_check = bridge.call("check_placement", {**goal, "item": upper_item})[
+                        "result"
+                    ]
+                    measured = {"chest": chest_check, "lower": lower_check, "goal": goal_check}
+                    attempts.append(measured)
+                    if not all(
+                        check.get("placeable") and not check.get("ground_items")
+                        for check in measured.values()
+                    ):
+                        continue
+                    if before_escape.get(lower_item, 0) < 1:
+                        continue
+                    chest_box, lower_box = chest_check["bounding_box"], lower_check["bounding_box"]
+                    gap = lower_box["left_top"]["y"] - chest_box["right_bottom"]["y"]
+                    # Factorio quantizes collision boxes to 1/256 tile.
+                    if not math.isclose(gap, 0.45, abs_tol=1 / 256) or not (
+                        0 < character_height < gap
+                    ):
+                        continue
+                    slot = {
+                        "x": lower_box["left_top"]["x"] - 1 / 128,
+                        "y": chest_box["right_bottom"]["y"]
+                        - character_dimensions["left_top"]["y"]
+                        + (gap - character_height) / 4,
+                    }
+                    setup = (chest_params, lower_params, chest_box, lower_box, slot, goal)
+                    break
+                if setup:
+                    break
+            if setup:
+                break
+        if setup is None:
+            raise RuntimeError(
+                "M20-AS cannot reproduce slot; measured boxes: " + json.dumps(attempts)
+            )
+        chest_params, lower_params, chest_box, lower_box, slot, goal = setup
+        if not before_escape.get(chest_params["item"], 0):
+            if items().get("wood", 0) < 2:
+                mine_escape_wood()
+            action("craft", {"recipe": "wooden-chest", "count": 1})
+            crafted_escape_chest = True
+            # Resource recovery may have moved us away from the selected placement.
+            action("move_to", {"surface": "nauvis", "x": x - 3, "y": y + 1})
+            bridge.call("observe_nearby")
+        for params in (chest_params, lower_params):
+            placed = bridge.call("place_entity", params)["result"]
+            escape_targets.append(placed)
+        positioned = escape_fixture(
+            "assert(not state.action and not state.craft_action);"
+            f"local ok=c.teleport({{x={slot['x']},y={slot['y']}}});"
+            'rcon.print("m20as_fixture:"..helpers.table_to_json({'
+            "positioned=ok,position=c.position,character_box=c.bounding_box}))"
+        )
+        # Check actual entity boxes too, rather than relying only on the preview.
+        observed = bridge.call("observe_nearby")["result"]["entities"]
+        actual_boxes = [
+            next(
+                entity["bounding_box"]
+                for entity in observed
+                if entity["target_ref"] == target["target_ref"]
+            )
+            for target in escape_targets
+        ]
+        character_box = positioned["character_box"]
+        measured = {**positioned, "chest": actual_boxes[0], "lower": actual_boxes[1]}
+        valid_slot = (
+            positioned.get("positioned") is True
+            and actual_boxes == [chest_box, lower_box]
+            and math.isclose(
+                lower_box["left_top"]["y"] - chest_box["right_bottom"]["y"],
+                0.45,
+                abs_tol=1 / 256,
+            )
+            and math.isclose(
+                character_box["right_bottom"]["y"] - character_box["left_top"]["y"],
+                0.4,
+                abs_tol=1 / 256,
+            )
+            and chest_box["right_bottom"]["y"] < character_box["left_top"]["y"]
+            and character_box["right_bottom"]["y"] < lower_box["left_top"]["y"]
+            and all(not overlaps(character_box, box) for box in actual_boxes)
+            and all(
+                character_box["left_top"]["x"] < box["right_bottom"]["x"]
+                and character_box["right_bottom"]["x"] > box["left_top"]["x"]
+                for box in actual_boxes
+            )
+        )
+        record(
+            "escape fixture reproduces non-overlapping trial 14 slot",
+            valid_slot,
+            json.dumps(measured),
+        )
+        if not valid_slot:
+            raise RuntimeError("M20-AS invalid slot; measured boxes: " + json.dumps(measured))
+        # Start via MCP, then retain a read-only reference to the live action for diagnostics.
+        started = asyncio.run(server.call_tool("move_to", {**goal, "within": 0.5}))
+        value = json.loads(started.content[0].text)
+        escape_action_id = value.get("action_id")
+        if not escape_action_id:
+            raise RuntimeError("M20-AS move did not start: " + json.dumps(value))
+        escape_fixture(
+            "storage.m20as_action=state.action or state.last_action;"
+            "rcon.print('m20as_fixture:{\"watching\":true}')"
+        )
+        waited = asyncio.run(
+            server.call_tool(
+                "wait_for_action", {"action_id": escape_action_id, "timeout_seconds": 20}
+            )
+        )
+        value = json.loads(waited.content[0].text)
+        diagnostics = escape_fixture(
+            "local a=storage.m20as_action;"
+            'rcon.print("m20as_fixture:"..helpers.table_to_json({'
+            "escape_tried=a and a.escape_tried or false,"
+            "start_adjusted=a and (a.path_start_adjusted or a.detail and a.detail.start_adjusted),"
+            "retries=a and a.retries}))"
+        )
+        diagnostics["start_adjusted_appeared"] = bool(diagnostics.get("start_adjusted"))
+        position = bridge.call("get_agent_status")["result"]["position"]
+        record(
+            "move walks out of trial 14 slot to open goal",
+            not started.is_error
+            and not waited.is_error
+            and value.get("status") == "succeeded"
+            and math.hypot(position["x"] - goal["x"], position["y"] - goal["y"]) <= 0.5,
+            json.dumps({"result": value, "position": position, **diagnostics}),
+        )
+    finally:
+        if escape_action_id:
+            current = bridge.call("get_action_status", {"action_id": escape_action_id})["result"]
+            if current.get("status") == "running":
+                bridge.call("cancel_action", {"action_id": escape_action_id})
+        escape_fixture("storage.m20as_action=nil;rcon.print('m20as_fixture:{\"removed\":true}')")
+        for target in escape_targets:
+            position = bridge.call("get_agent_status")["result"]["position"]
+            if (
+                math.hypot(
+                    position["x"] - target["position"]["x"],
+                    position["y"] - target["position"]["y"],
+                )
+                > 4
+            ):
+                action("move_to", {"surface": "nauvis", "x": x - 3, "y": y + 1})
+            # Chest first: a failed escape must be freed without another teleport.
+            action("mine_entity", {"target_ref": target["target_ref"], "count": 1})
+        if crafted_escape_chest:
+            if items().get("wood", 0) < before_escape.get("wood", 0):
+                mine_escape_wood()
+            # Dispose of the newly crafted chest and surplus tree yield together.
+            # Real placement/transfers restore the character's original inventory;
+            # the harness removes only this expendable fixture, never held stock.
+            action("move_to", {"surface": "nauvis", "x": x - 3, "y": y + 1})
+            bridge.call("observe_nearby")
+            disposal = bridge.call("place_entity", chest_params)["result"]
+            try:
+                surplus = items().get("wood", 0) - before_escape.get("wood", 0)
+                if surplus > 0:
+                    moved = bridge.call(
+                        "transfer_item",
+                        {
+                            "target_ref": disposal["target_ref"],
+                            "direction": "to_entity",
+                            "inventory_role": "main",
+                            "item": "wood",
+                            "count": surplus,
+                        },
+                    )["result"]
+                    if moved.get("moved") != surplus:
+                        raise RuntimeError(
+                            "M20-AS could not store surplus wood: " + json.dumps(moved)
+                        )
+            finally:
+                escape_fixture(
+                    f'local t=state.targets["{disposal["target_ref"]}"];'
+                    'if t and t.entity.valid then assert(t.entity.name=="wooden-chest");'
+                    "t.entity.destroy() end;rcon.print('m20as_fixture:{\"disposed\":true}')"
+                )
+        action("move_to", {**return_position, "within": 0.5})
+        after_escape = items()
+        record(
+            "escape fixture restores the pre-fixture inventory exactly",
+            after_escape == before_escape,
+            json.dumps({"before": before_escape, "after": after_escape}),
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

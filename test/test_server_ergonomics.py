@@ -1203,10 +1203,19 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             "standable spot",
             "no path guarantee",
             "start_adjusted",
+            "touching an obstacle",
             "character still moves by walking",
         ):
             with self.subTest(text=text):
                 self.assertIn(text, description)
+
+    async def test_move_description_and_failure_hint_explain_escape_retry(self):
+        tools = {tool.name: tool for tool in await create_server(None).list_tools()}
+        for text in (tools["move_to"].description, HINTS["path_not_found"]):
+            with self.subTest(text=text):
+                self.assertIn("tile-centre start within 2 tiles", text)
+                self.assertIn("once-per-move escape retry after a failed search", text)
+                self.assertIn("character still moves by walking", text)
 
     async def test_path_not_found_hint_and_detail(self):
         bridge = Mock()
