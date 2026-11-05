@@ -1670,6 +1670,190 @@ def main():
         action("move_to", return_position)
     record("partial transfer checks restore all held items", items() == before_partial)
 
+    # M19-AO/AP: keep the production furnace/drill untouched for the later scripts.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    before_rejection = items()
+    if not all(before_rejection.get(name, 0) > 0 for name in ("stone-furnace", "wood")):
+        raise RuntimeError("M19-AO/AP requires a held spare furnace and wood")
+    rejection_target = None
+
+    def transfer_error(label, params, code, fields):
+        before = items()
+        response = asyncio.run(server.call_tool("transfer_item", params))
+        value = json.loads(response.content[0].text)
+        detail = value.get("detail") or {}
+        record(
+            label,
+            response.is_error
+            and value.get("error") == code
+            and all(detail.get(key) == expected for key, expected in fields.items())
+            and items() == before,
+            json.dumps(value),
+        )
+        return value
+
+    try:
+        action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+        bridge.call("observe_nearby")
+        bridge.call("place_entity", {"item": "stone-furnace", **spare_position})
+        rejection_target = next(
+            entity
+            for entity in bridge.call("observe_nearby", {"names": ["stone-furnace"]})["result"][
+                "entities"
+            ]
+            if entity["x"] == spare_position["x"] and entity["y"] == spare_position["y"]
+        )
+        rejected_params = {
+            "target_ref": rejection_target["target_ref"],
+            "direction": "to_entity",
+            "inventory_role": "input",
+            "item": "wood",
+            "count": 1,
+        }
+        transfer_error(
+            "furnace rejects non-smeltable source item without moving wood",
+            rejected_params,
+            "item_not_accepted",
+            {
+                "item": "wood",
+                "entity": "stone-furnace",
+                "inventory_role": "source",
+                "reason": "no_smelting_recipe",
+                "insertable": 0,
+            },
+        )
+        machine = bridge.call(
+            "get_entity_inventory", {"target_ref": rejection_target["target_ref"]}
+        )["result"]
+        shortage = transfer_error(
+            "empty furnace result includes entity status without moving items",
+            {
+                **rejected_params,
+                "direction": "from_entity",
+                "inventory_role": "output",
+                "item": "iron-plate",
+            },
+            "missing_materials",
+            {"available": 0, "inventory_role": "result", "status": machine.get("status")},
+        )
+        record(
+            "empty furnace status uses inventory observation names",
+            isinstance(machine.get("status"), str)
+            and shortage.get("detail", {}).get("status") == machine["status"],
+        )
+    finally:
+        if rejection_target is not None:
+            action("mine_entity", {"target_ref": rejection_target["target_ref"], "count": 1})
+        action("move_to", return_position)
+    record("furnace rejection checks restore all held items", items() == before_rejection)
+
+    # The disposable-save harness supplies only a temporary unpowered assembler,
+    # never items or research. Destroy it afterwards so later scripts inherit no changes.
+    def assembler_fixture(body):
+        command = "/c " + body
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+            if "m19_fixture:" not in raw:
+                raw = client.run(command)
+        if "m19_fixture:" not in raw:
+            raise RuntimeError("Missing M19 assembler fixture response: " + raw)
+        return json.loads(raw.split("m19_fixture:", 1)[1].strip())
+
+    try:
+        action("move_to", {"surface": "nauvis", "x": 4, "y": 4})
+        created = assembler_fixture(
+            "local e=storage.m19_transfer_assembler;"
+            "if not e or not e.valid then "
+            'e=game.surfaces.nauvis.create_entity{name="assembling-machine-1",'
+            "position={1.5,6.5},force=game.forces.player};"
+            "storage.m19_transfer_assembler=e end;"
+            'rcon.print("m19_fixture:"..helpers.table_to_json({created=e~=nil and e.valid}))'
+        )
+        if created.get("created") is not True:
+            raise RuntimeError("M19 assembler fixture could not be created")
+        assembler = next(
+            entity
+            for entity in bridge.call("observe_nearby", {"names": ["assembling-machine-1"]})[
+                "result"
+            ]["entities"]
+            if entity["x"] == 1.5 and entity["y"] == 6.5
+        )
+        rejected_params = {**rejected_params, "target_ref": assembler["target_ref"]}
+        transfer_error(
+            "assembler without recipe rejects input without moving wood",
+            rejected_params,
+            "item_not_accepted",
+            {"reason": "no_recipe", "inventory_role": "source", "insertable": 0},
+        )
+        # iron-gear-wheel is enabled from the start; this uses the normal recipe tool.
+        bridge.call(
+            "set_recipe", {"target_ref": assembler["target_ref"], "recipe": "iron-gear-wheel"}
+        )
+        rejected = transfer_error(
+            "assembler rejects non-ingredient with recipe and ingredient names",
+            rejected_params,
+            "item_not_accepted",
+            {
+                "item": "wood",
+                "entity": "assembling-machine-1",
+                "inventory_role": "source",
+                "recipe": "iron-gear-wheel",
+                "ingredients": ["iron-plate"],
+                "insertable": 0,
+            },
+        )
+        take_params = {
+            **rejected_params,
+            "direction": "from_entity",
+            "inventory_role": "output",
+            "item": "iron-gear-wheel",
+        }
+        empty = transfer_error(
+            "empty assembler result includes status and configured recipe",
+            take_params,
+            "missing_materials",
+            {"available": 0, "inventory_role": "result", "recipe": "iron-gear-wheel"},
+        )
+        machine = bridge.call("get_entity_inventory", {"target_ref": assembler["target_ref"]})[
+            "result"
+        ]
+        record(
+            "empty assembler status uses inventory observation names",
+            isinstance(machine.get("status"), str)
+            and empty.get("detail", {}).get("status") == machine["status"],
+        )
+        response = asyncio.run(
+            server.call_tool("transfer_items", {"items": [rejected_params, take_params]})
+        )
+        batch = json.loads(response.content[0].text)
+        entries = batch.get("results") or []
+        record(
+            "batch rejection and empty source retain codes details and hints",
+            not response.is_error
+            and batch.get("succeeded") == 0
+            and batch.get("failed") == 2
+            and len(entries) == 2
+            and all(entry.get("ok") is False for entry in entries)
+            and entries[0].get("error") == "item_not_accepted"
+            and entries[0].get("detail") == rejected.get("detail")
+            and "detail.ingredients" in entries[0].get("hint", "")
+            and entries[1].get("error") == "missing_materials"
+            and entries[1].get("detail") == empty.get("detail")
+            and "wait_for_items" in entries[1].get("hint", "")
+            and items() == before_rejection,
+            json.dumps(batch),
+        )
+    finally:
+        assembler_fixture(
+            "local e=storage.m19_transfer_assembler;"
+            "if e and e.valid then e.destroy() end;storage.m19_transfer_assembler=nil;"
+            "rcon.print('m19_fixture:{\"removed\":true}')"
+        )
+        action("move_to", return_position)
+    record("assembler rejection checks preserve all held items", items() == before_rejection)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

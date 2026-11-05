@@ -82,11 +82,22 @@ TRANSFER_DESCRIPTION = (
     "and output -> result; lab accepts source -> input. Returned roles stay canonical. "
     "missing_materials detail includes item, requested, available (0), and contents "
     "of the source inventory (up to 10 items sorted by name, omitted when empty). "
-    "inventory_role is included when taking items from the structure. "
+    "inventory_role is included when taking items from the structure, along with status "
+    "when available and recipe for assemblers/furnaces (idle furnaces use previous_recipe). "
+    "For an empty entity source, fix no_fuel, no_power, item_ingredient_shortage, or "
+    "no_ingredients first, then wait with wait_for_items. "
+    "item_not_accepted means the entity rejects the item: assembler source accepts only "
+    "current recipe ingredients; detail includes item, entity, inventory_role, recipe, and "
+    "ingredients (names), or reason=no_recipe when unset. Insert only detail.ingredients "
+    "or change the recipe with set_recipe. Furnace source accepts ore/smeltable items from "
+    "recipes in its crafting categories, including locked recipes; otherwise "
+    "reason=no_smelting_recipe. Rejected items have insertable=0. "
     "inventory_full detail describes the destination inventory: item, requested, "
     "destination (entity or character), inventory_role (entity only), "
     "contents (up to 10 {name, quality, count} entries sorted by name then quality), "
-    "slots, empty_slots, and insertable count for the item."
+    "slots, empty_slots, and insertable count for the item. "
+    "For accepted items, insertable uses the inventory capacity estimate; Factorio may "
+    "overestimate assembler filtered slots. moved is the actual inserted count."
 )
 
 MACHINE_STATUS_DESCRIPTION = (
@@ -204,7 +215,10 @@ HINTS = {
         "Gather the missing items before retrying. "
         "For crafting, detail.missing_raw lists raw items such as plates that are short "
         "after expanding hand-craftable intermediates and using held materials first. "
-        "For transfers, check detail.contents for items in the source inventory."
+        "For transfers, check detail.contents for items in the source inventory. "
+        "For an entity source, check detail.status and detail.recipe: fix no_fuel (supply fuel), "
+        "no_power (restore power), or item_ingredient_shortage/no_ingredients (supply recipe "
+        "ingredients) first, then wait with wait_for_items before taking products."
     ),
 }
 
@@ -230,6 +244,14 @@ OPERATION_HINTS = {
         "in a straight line. Walk via intermediate points for farther goals."
     ),
     ("transfer_item", "invalid_target"): INVENTORY_TARGET_HINT,
+    ("transfer_item", "item_not_accepted"): (
+        "For an assembler, insert only the recipe ingredients in detail.ingredients or "
+        "change the recipe with set_recipe; detail.reason=no_recipe means set a recipe first. "
+        "For a furnace, insert ore/smeltable items into source; "
+        "detail.reason=no_smelting_recipe means no recipe in its crafting categories "
+        "uses that item. "
+        "For other roles, choose an item the destination accepts."
+    ),
     ("transfer_item", "inventory_full"): (
         "detail describes the destination inventory; check destination, inventory_role, "
         "contents, slots, empty_slots, and insertable. "
@@ -286,6 +308,7 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
         "ground_items",
         "collected_items",
         "items",
+        "ingredients",
     ):
         if field in detail and not isinstance(detail[field], list):
             detail[field] = []
