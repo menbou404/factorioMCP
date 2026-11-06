@@ -681,7 +681,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
     async def test_explored_map_normalizes_empty_lists_and_preserves_records(self):
         bridge = Mock()
         server = create_server(bridge)
-        lists = ("resources", "water", "trees", "rocks")
+        lists = ("resources", "water", "trees", "rocks", "frontier")
         for field in lists:
             with self.subTest(field=field):
                 entry = {
