@@ -243,6 +243,14 @@ local function mine_partial_detail(character, action, detail)
   return detail
 end
 
+local function adjusted_goal_detail(action, detail)
+  if not action or not action.goal_adjusted or not action.original_goal then return detail end
+  detail = detail or {}
+  detail.goal_adjusted = {x = action.goal_adjusted.x, y = action.goal_adjusted.y}
+  detail.original_goal = {x = action.original_goal.x, y = action.original_goal.y}
+  return detail
+end
+
 local function finish_action(state, slot, status, error_code, detail)
   local action = state[slot]
   if not action then return end
@@ -265,6 +273,7 @@ local function finish_action(state, slot, status, error_code, detail)
       detail.distance = math.sqrt(distance_squared(state.character.position, action.goal))
     end
   end
+  if action.type == "move" then detail = adjusted_goal_detail(action, detail) end
   action.status = status
   action.error = error_code
   action.detail = detail
@@ -272,6 +281,7 @@ local function finish_action(state, slot, status, error_code, detail)
   local completed = {
     id = action.id, type = action.type, status = status,
     error = error_code, detail = detail,
+    goal_adjusted = action.goal_adjusted, original_goal = action.original_goal,
     position = valid_character(state) and position_data(state.character) or nil,
     started_tick = action.started_tick, finished_tick = game.tick
   }
@@ -411,6 +421,38 @@ local function move_direction(dx, dy)
   return defines.direction.northwest
 end
 
+local function path_direction(position, start, destination)
+  local dx, dy = destination.x - position.x, destination.y - position.y
+  local ax, ay = math.abs(dx), math.abs(dy)
+  local sx, sy = dx < 0 and -1 or 1, dy < 0 and -1 or 1
+  -- The heading lies between one cardinal direction and its adjacent diagonal.
+  -- Unit vectors keep both nearest-heading and cross-track comparisons unbiased.
+  local diagonal = sx > 0 and (sy > 0 and defines.direction.southeast or defines.direction.northeast)
+                   or (sy > 0 and defines.direction.southwest or defines.direction.northwest)
+  local cardinal, cx, cy
+  if ax >= ay then
+    cardinal, cx, cy = sx > 0 and defines.direction.east or defines.direction.west, sx, 0
+  else
+    cardinal, cx, cy = sy > 0 and defines.direction.south or defines.direction.north, 0, sy
+  end
+  local qx, qy = sx / math.sqrt(2), sy / math.sqrt(2)
+  local lx, ly = destination.x - start.x, destination.y - start.y
+  local length = math.sqrt(lx * lx + ly * ly)
+  if length > 0 then
+    local cross_track = (lx * (position.y - start.y) - ly * (position.x - start.x)) / length
+    if math.abs(cross_track) > 0.1 then
+      -- Choose the step that moves the signed distance back towards zero.
+      -- This alternates the bracketing headings instead of drifting into corners.
+      local cardinal_change = cross_track * (lx * cy - ly * cx)
+      local diagonal_change = cross_track * (lx * qy - ly * qx)
+      if math.abs(cardinal_change - diagonal_change) > 0.000001 then
+        return cardinal_change < diagonal_change and cardinal or diagonal
+      end
+    end
+  end
+  return dx * cx + dy * cy >= dx * qx + dy * qy and cardinal or diagonal
+end
+
 local function reset_move_progress(action)
   action.last_waypoint_tick = game.tick
   action.final_best_distance = nil
@@ -418,29 +460,19 @@ local function reset_move_progress(action)
   action.final_progress_tick = nil
 end
 
-local function path_not_found_detail(character, goal, action)
-  local detail = {goal = {x = goal.x, y = goal.y}}
-  if action and action.path_start_adjusted then
-    local start = action.path_start_adjusted
-    detail.start_adjusted = {x = start.x, y = start.y}
-  end
-  -- A path response can arrive after the character has been removed.
-  if not character or not character.valid then return detail end
-  detail.distance = math.sqrt(distance_squared(character.position, goal))
+local function goal_obstacles(character, goal)
   local surface = character.surface
   local prototype = character.prototype
   local layers = prototype.collision_mask.layers
-  local tile = surface.get_tile(goal.x, goal.y)
-  local tiles = {}
-  for layer in pairs(layers) do
-    if tile.collides_with(layer) then tiles[tile.name] = true; break end
-  end
-  local tile_names = sorted_keys(tiles)
-  if #tile_names > 0 then detail.goal_tiles = tile_names end
-
   local box = prototype.collision_box
   local area = {left_top = {x = goal.x + box.left_top.x, y = goal.y + box.left_top.y},
                 right_bottom = {x = goal.x + box.right_bottom.x, y = goal.y + box.right_bottom.y}}
+  local tiles = {}
+  for _, tile in pairs(surface.find_tiles_filtered{area = area}) do
+    for layer in pairs(layers) do
+      if tile.collides_with(layer) then tiles[tile.name] = true; break end
+    end
+  end
   local entities = {}
   for _, entity in pairs(surface.find_entities_filtered{area = area}) do
     if entity.valid and entity ~= character then
@@ -461,8 +493,25 @@ local function path_not_found_detail(character, goal, action)
       if #entities == 5 then break end
     end
   end
+  return sorted_keys(tiles), entities
+end
+
+local function path_not_found_detail(character, goal, action)
+  local detail = {goal = {x = goal.x, y = goal.y}}
+  if action then
+    detail = adjusted_goal_detail(action, detail)
+    if action.path_start_adjusted then
+      local start = action.path_start_adjusted
+      detail.start_adjusted = {x = start.x, y = start.y}
+    end
+  end
+  -- A path response can arrive after the character has been removed.
+  if not character or not character.valid then return detail end
+  detail.distance = math.sqrt(distance_squared(character.position, goal))
+  local tiles, entities = goal_obstacles(character, goal)
+  if #tiles > 0 then detail.goal_tiles = tiles end
   if #entities > 0 then detail.goal_entities = entities end
-  local free = surface.find_non_colliding_position("character", goal, 10, 0.5)
+  local free = character.surface.find_non_colliding_position("character", goal, 10, 0.5)
   if free then detail.nearby_free_position = {x = free.x, y = free.y} end
   return detail
 end
@@ -567,11 +616,26 @@ local function do_move(state, params)
   if distance_squared(character.position, goal) > 128 * 128 then
     return nil, "out_of_range", range_detail(character, goal, 128)
   end
+  local original_goal, goal_adjusted
+  if params.within == nil then
+    -- Use the path diagnostic's character collision mask, ignoring this character
+    -- itself so moving to the current position does not spuriously adjust the goal.
+    local tiles, entities = goal_obstacles(character, goal)
+    if #tiles > 0 or #entities > 0 then
+      local free = character.surface.find_non_colliding_position("character", goal, 10, 0.5)
+      if not free then return nil, "path_not_found", path_not_found_detail(character, goal) end
+      original_goal = goal
+      goal = {x = free.x, y = free.y}
+      goal_adjusted = goal
+    end
+  end
   local result = begin_action(state, "action", {
     type = "move", goal = goal, within = params.within, path = nil, path_index = 1,
+    original_goal = original_goal, goal_adjusted = goal_adjusted,
     last_x = character.position.x, last_y = character.position.y,
     stuck_ticks = 0, retries = 0
   })
+  result = adjusted_goal_detail(state.action, result)
   if params.within ~= nil then result.within = params.within end
   if finish_move_within(state) then
     result.status = "succeeded"
@@ -2365,15 +2429,17 @@ local function do_action_status(state, params)
         end
       end
       detail = {recipe = action.recipe, count = action.count, remaining = remaining}
+    elseif action.type == "move" then
+      detail = adjusted_goal_detail(action, detail)
     end
   end
-  return {
+  return adjusted_goal_detail(action, {
     action_id = action.id, type = action.type, status = action.status,
     error = action.error, detail = detail,
     position = action.status == "running" and
                (valid_character(state) and position_data(state.character) or nil) or
                action.position
-  }
+  })
 end
 
 local function do_cancel(state, params)
@@ -2618,7 +2684,13 @@ local function tick_action(state, slot)
     local destination = waypoint and waypoint.position or action.goal
     local dx = destination.x - character.position.x
     local dy = destination.y - character.position.y
-    character.walking_state = {walking = true, direction = move_direction(dx, dy)}
+    local previous = action.path[action.path_index - 1]
+    local start = previous and previous.position or action.path_start_used or character.position
+    -- Repaths reset path_index and path_start_used, so steering starts afresh.
+    -- A zero-length first segment (including an adjusted start) uses nearest heading.
+    local direction = waypoint and path_direction(character.position, start, destination)
+                      or move_direction(dx, dy)
+    character.walking_state = {walking = true, direction = direction}
     if distance_squared(character.position, {x = action.last_x, y = action.last_y}) < 0.01 then
       action.stuck_ticks = action.stuck_ticks + 1
     else
