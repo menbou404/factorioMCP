@@ -141,10 +141,24 @@ def main():
     action("craft", {"recipe": "iron-gear-wheel", "count": 3})
     action("craft", {"recipe": "burner-mining-drill", "count": 1})
     call("get_inventory")
-    call(
-        "place_entity",
-        {"item": "burner-mining-drill", "surface": "nauvis", "x": 6, "y": 6, "direction": 0},
+    # M22-BA: preview the same snapped mining area that is returned on success.
+    drill_params = {
+        "item": "burner-mining-drill",
+        "surface": "nauvis",
+        "x": 6,
+        "y": 6,
+        "direction": 0,
+    }
+    checked = call("check_placement", drill_params)
+    assert checked["placeable"], checked
+    resources = checked["mining_area_resources"]
+    assert resources and all(r["name"] == "iron-ore" and r["tiles"] > 0 for r in resources), checked
+    placed = call("place_entity", drill_params)
+    assert placed["mining_area_resources"] == resources, (checked, placed)
+    assert "electric_network_connected" not in placed and "electric_network_id" not in placed, (
+        placed
     )
+    print("PASS M22-BA drill preview and placement mining area", json.dumps(resources), flush=True)
     print("drill", json.dumps(inventory("burner-mining-drill")), flush=True)
     transfer("burner-mining-drill", "fuel", "coal", 2)
     transfer("stone-furnace", "fuel", "coal", 1)

@@ -61,6 +61,14 @@ PLACE_DESCRIPTION = (
     " fluid_connections with port position,"
     " target_position, direction, flow, fluidbox_index, and connected when present."
     " Inserters include actual pickup_position and drop_position as absolute map coordinates."
+    " Successful mining-drill placements include mining_area_resources as {name, tiles}"
+    " in the snapped mining area, sorted by name, matching check_placement."
+    " Electric consumers and electric poles include electric_network_connected (boolean)"
+    " and electric_network_id when connected, read from the created entity in the same tick."
+    " Connection means network membership and does not guarantee power generation."
+    " Burner and other non-electric entities omit these fields."
+    " If electric_network_connected=false, hint advises checking check_placement"
+    " electric_coverage and adding a pole."
     " For offshore-pump, the water_direction side must face water; pipes/boilers"
     " connect on the output_direction side (see check_placement or observe_nearby)."
     " Blocked errors may include valid_directions for another orientation."
@@ -385,6 +393,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         "returned_items",
         "spilled_items",
         "recipe_products",
+        "mining_area_resources",
     ):
         if field in result and not isinstance(result[field], list):
             result[field] = []
@@ -425,12 +434,17 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(lab.get(field), list):
                     lab[field] = []
     if operation == "check_placement":
-        for field in ("blocking", "tiles", "mining_area_resources"):
+        for field in ("blocking", "tiles"):
             if field in result and not isinstance(result[field], list):
                 result[field] = []
         coverage = result.get("electric_coverage")
         if isinstance(coverage, dict) and not isinstance(coverage.get("poles"), list):
             coverage["poles"] = []
+    if operation in ("place_entity", "") and result.get("electric_network_connected") is False:
+        result["hint"] = (
+            "Check check_placement electric_coverage at this position and add a pole "
+            "to connect the entity to an electric network."
+        )
     if operation == "get_research_status":
         for technology in result["available"]:
             if not isinstance(technology.get("ingredients"), list):
@@ -974,8 +988,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "directions within 8 tiles of the requested position. "
             "They may be out of reach; move closer and check again with check_placement."
             " For mining drills, mining_area_resources lists mineable resources as {name, tiles} "
-            "in the snapped mining area, sorted by name; an empty list also sets "
-            "reason_detail to no_resources_in_mining_area."
+            "in the snapped mining area, sorted by name, including when placeable=true; "
+            "successful placements return it too. For placement_rules, an empty list also "
+            "sets reason_detail to no_resources_in_mining_area."
         )
     )
     async def check_placement(
