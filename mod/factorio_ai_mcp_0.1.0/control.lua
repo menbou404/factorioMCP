@@ -1691,6 +1691,31 @@ local function ground_stack(entity)
   return {name = stack.name, quality = stack.quality.name, count = stack.count}
 end
 
+local function placement_mining_area_resources(character, prototype, position, direction)
+  if prototype.type ~= "mining-drill" then return nil end
+  local centre = snapped_position(prototype, position, direction)
+  -- 2.0.77 mining_drill_radius is the square's half-size: burner 0.99
+  -- covers 2x2 resource centres, electric 2.49 covers 5x5.
+  local radius = prototype.mining_drill_radius or 0
+  local categories = prototype.resource_categories or {}
+  local counts, resources = {}, {}
+  for _, resource in pairs(character.surface.find_entities_filtered{
+    area = {{centre.x - radius, centre.y - radius},
+            {centre.x + radius, centre.y + radius}}, type = "resource"
+  }) do
+    -- Area queries include collision-box overlaps; mining uses resource centres.
+    if resource.valid and categories[resource.prototype.resource_category] and
+       math.abs(resource.position.x - centre.x) <= radius and
+       math.abs(resource.position.y - centre.y) <= radius then
+      counts[resource.name] = (counts[resource.name] or 0) + 1
+    end
+  end
+  for _, name in ipairs(sorted_keys(counts)) do
+    resources[#resources + 1] = {name = name, tiles = counts[name]}
+  end
+  return resources
+end
+
 local function placement_blocking(state, character, prototype, position, direction)
   -- Keep the requested position so every alternative direction snaps independently.
   local area = placement_bounding_box(prototype, snapped_position(prototype, position, direction),
@@ -1755,26 +1780,7 @@ local function placement_blocking(state, character, prototype, position, directi
   if #valid_directions > 0 then detail.valid_directions = valid_directions end
   if detail.reason == "placement_rules" then
     if prototype.type == "mining-drill" then
-      local centre = snapped_position(prototype, position, direction)
-      -- 2.0.77 mining_drill_radius is the square's half-size: burner 0.99
-      -- covers 2x2 resource centres, electric 2.49 covers 5x5.
-      local radius = prototype.mining_drill_radius or 0
-      local categories = prototype.resource_categories or {}
-      local counts, resources = {}, {}
-      for _, resource in pairs(character.surface.find_entities_filtered{
-        area = {{centre.x - radius, centre.y - radius},
-                {centre.x + radius, centre.y + radius}}, type = "resource"
-      }) do
-        -- Area queries include collision-box overlaps; mining uses resource centres.
-        if resource.valid and categories[resource.prototype.resource_category] and
-           math.abs(resource.position.x - centre.x) <= radius and
-           math.abs(resource.position.y - centre.y) <= radius then
-          counts[resource.name] = (counts[resource.name] or 0) + 1
-        end
-      end
-      for _, name in ipairs(sorted_keys(counts)) do
-        resources[#resources + 1] = {name = name, tiles = counts[name]}
-      end
+      local resources = placement_mining_area_resources(character, prototype, position, direction)
       detail.mining_area_resources = resources
       if #resources == 0 then detail.reason_detail = "no_resources_in_mining_area" end
     end
@@ -1981,6 +1987,11 @@ local function do_check_placement(state, params)
     pickup_position, drop_position = preview_inserter_positions(prototype, position, direction)
   end
   local blocked = reason == "blocked" and detail or {}
+  local mining_area_resources = blocked.mining_area_resources
+  if placement then
+    mining_area_resources = placement_mining_area_resources(character, prototype,
+                                                           {x = params.x, y = params.y}, direction)
+  end
   local water_direction, output_direction = offshore_pump_directions(
     prototype and prototype.name, fluid_connections)
   return {placeable = placement ~= nil, reason = reason,
@@ -1993,7 +2004,7 @@ local function do_check_placement(state, params)
           valid_directions = blocked.valid_directions, blocked_reason = blocked.reason,
           nearby_positions = blocked.nearby_positions,
           ground_items = placement and placement.ground_items or blocked.ground_items,
-          mining_area_resources = blocked.mining_area_resources,
+          mining_area_resources = mining_area_resources,
           reason_detail = blocked.reason_detail}
 end
 
@@ -2038,12 +2049,24 @@ local function do_place(state, params)
     blocked.collected_items = collected_items
     return nil, "blocked", blocked
   end
-  return {name = created.name, position = position_data(created),
+  local result = {name = created.name, position = position_data(created),
           target_ref = register_target(state, created),
           direction = created.direction, consumed_item = params.item,
           pickup_position = created.type == "inserter" and created.pickup_position or nil,
           drop_position = created.type == "inserter" and created.drop_position or nil,
-          fluid_connections = placed_fluid_connections(created), collected_items = collected_items}
+          fluid_connections = placed_fluid_connections(created), collected_items = collected_items,
+          mining_area_resources = placement_mining_area_resources(character, created.prototype,
+                                    {x = params.x, y = params.y}, placement.direction)}
+  if created.type == "electric-pole" or
+     created.prototype.electric_energy_source_prototype ~= nil then
+    -- Read network membership in the placement tick. In 2.0.77,
+    -- is_connected_to_electric_network() additionally requires a power producer;
+    -- membership alone tells the agent whether a pole-coverage gap exists.
+    local network_id = created.electric_network_id
+    result.electric_network_connected = network_id ~= nil
+    result.electric_network_id = network_id
+  end
+  return result
 end
 
 local function do_rotate(state, params)

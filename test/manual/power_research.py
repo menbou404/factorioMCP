@@ -476,10 +476,37 @@ def main():
         }, (name, checked, placed)
     pump = entity_at(observe(), "offshore-pump", PUMP)
     assert any(c.get("connected") is True for c in pump.get("fluid_connections", [])), pump
-    place("lab", LAB)
+    # M22-BB: placement reads connectivity immediately after create_entity.
+    # Recover this empty lab, then place it after both poles in the same tick;
+    # later research checks keep their original layout and inventory budget.
+    lab_params = {"item": "lab", "surface": "nauvis", "x": LAB[0], "y": LAB[1]}
+    checked = call("check_placement", lab_params)
+    assert checked["placeable"] and checked["electric_coverage"]["covered"] is False, checked
+    unconnected = call("place_entity", lab_params)
+    assert unconnected["electric_network_connected"] is False, unconnected
+    assert "electric_network_id" not in unconnected, unconnected
+    action("mine_entity", {"target_ref": unconnected["target_ref"], "count": 1})
     assert all(math.dist(a, b) <= 7 for a, b in zip(POLES, POLES[1:], strict=False)), POLES
-    for position in POLES:
-        place("small-electric-pole", position)
+    batch = call(
+        "place_entities",
+        {
+            "items": [
+                {"item": "small-electric-pole", "surface": "nauvis", "x": x, "y": y}
+                for x, y in POLES
+            ]
+            + [lab_params]
+        },
+    )
+    assert (batch["succeeded"], batch["failed"]) == (3, 0), batch
+    for entry in batch["results"]:
+        placed = entry["result"]
+        assert entry["ok"] is True and placed["electric_network_connected"] is True, entry
+        assert isinstance(placed["electric_network_id"], int), entry
+    last_pole, connected_lab = [entry["result"] for entry in batch["results"][-2:]]
+    assert connected_lab["electric_network_id"] == last_pole["electric_network_id"], batch
+    checked = call("check_placement", lab_params)
+    assert checked["electric_coverage"]["covered"] is True, checked
+    print("PASS M22-BB same-tick pole and machine connections; uncovered lab recovered", flush=True)
     asyncio.run(check_power_previews_and_inventories())
     boiler = entity_at(observe(), "boiler", BOILER)
     transfer(boiler, "fuel", "coal", 10)
