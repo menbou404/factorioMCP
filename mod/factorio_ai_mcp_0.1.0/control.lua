@@ -58,6 +58,7 @@ local function ensure_storage()
     next_target_id = 1,
     targets = {},
     owned_refs = {},
+    recipe_baselines = {},
     last_observation = nil,
     recent_observations = {},
     explored_map = {},
@@ -66,6 +67,8 @@ local function ensure_storage()
   storage.ai_mcp.next_action_id = storage.ai_mcp.next_action_id or 1
   storage.ai_mcp.next_target_id = storage.ai_mcp.next_target_id or 1
   storage.ai_mcp.targets = storage.ai_mcp.targets or {}
+  -- Existing saves have no recipe-change history; do not invent baselines.
+  storage.ai_mcp.recipe_baselines = storage.ai_mcp.recipe_baselines or {}
   if not storage.ai_mcp.owned_refs then
     -- Upgrade existing saves once. Keep the oldest ref for each owned unit;
     -- other pre-upgrade refs remain usable until their original TTL expires.
@@ -380,6 +383,7 @@ local function target_entity(character, params, max_distance, mining)
     end
     local entity = reference.entity
     if not entity or not entity.valid then
+      if reference.unit_number then state.recipe_baselines[reference.unit_number] = nil end
       if reference.owned and state.owned_refs[reference.unit_number] == params.target_ref then
         state.owned_refs[reference.unit_number] = nil
       end
@@ -1269,6 +1273,7 @@ local function do_observe(state, params)
   for key, reference in pairs(state.targets) do
     if reference.owned then
       if reference.entity and not reference.entity.valid then
+        if reference.unit_number then state.recipe_baselines[reference.unit_number] = nil end
         if state.owned_refs[reference.unit_number] == key then
           state.owned_refs[reference.unit_number] = nil
         end
@@ -2154,6 +2159,11 @@ local function do_set_recipe(state, params)
   end
   -- The API's returned list is authoritative; never insert the estimate above.
   local returned = target.set_recipe(params.recipe)
+  if target.unit_number then
+    state.recipe_baselines[target.unit_number] = {
+      recipe = params.recipe, products_finished = target.products_finished
+    }
+  end
   local spilled = {}
   for _, item in ipairs(returned) do
     local inserted = inventory and inventory.insert(item) or 0
@@ -2219,9 +2229,13 @@ local function do_entity_inventory(state, params)
     if inventory and inventory.valid then inventories[role] = inventory.get_contents() end
   end
   local status, recipe = inventory_entity_state(target)
-  local products_finished, recipe_products, recipe_product_amounts
+  local products_finished, products_since_recipe, recipe_products, recipe_product_amounts
   if target.type == "assembling-machine" or target.type == "furnace" then
     products_finished = target.products_finished
+    local baseline = target.unit_number and state.recipe_baselines[target.unit_number]
+    if baseline and recipe and baseline.recipe == recipe then
+      products_since_recipe = products_finished - baseline.products_finished
+    end
     recipe_products, recipe_product_amounts = {}, {}
     -- inventory_entity_state resolves idle furnaces' previous recipe names.
     local recipe_data = recipe and target.force.recipes[recipe]
@@ -2240,6 +2254,7 @@ local function do_entity_inventory(state, params)
   return {name = target.name, type = target.type,
           inventories = inventories, status = status, recipe = recipe,
           products_finished = products_finished, recipe_products = recipe_products,
+          products_since_recipe = products_since_recipe,
           recipe_product_amounts = recipe_product_amounts,
           direction = target.direction,
           drop_position = target.name == "burner-mining-drill" and
@@ -2598,6 +2613,7 @@ commands.add_command("ai_mcp_admin", "AI MCP administrator reset (RCON only)",
     state.completed_order = {}
     state.targets = {}
     state.owned_refs = {}
+    state.recipe_baselines = {}
     state.last_observation = nil
     state.recent_observations = {}
     state.explored_map = {}

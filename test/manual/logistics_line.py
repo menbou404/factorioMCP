@@ -8,7 +8,7 @@ import json
 import math
 import time
 
-from helpers import position_in_tile_footprint
+from helpers import assert_inserter_direction, position_in_tile_footprint
 from rcon.source import Client
 
 from factorio_mcp.bridge import RCON_FRAG_THRESHOLD, BridgeError, parse_bridge_response
@@ -54,6 +54,7 @@ def place(item, position, direction=0):
         step = "verify_placement"
         entity = entity_at(observe(), item, position)
         if "pickup_position" in entity:
+            assert_inserter_direction(entity, position, direction)
             # The occupied footprint must still return the same preview.
             blocked = call("check_placement", params)
             assert not blocked["placeable"], blocked

@@ -3,6 +3,16 @@
 import math
 
 
+def assert_inserter_direction(entity, position, direction):
+    """Back the tool wording with actual game pickup/drop sides, for either arm length."""
+    axis, sign = {0: ("y", -1), 4: ("x", 1), 8: ("y", 1), 12: ("x", -1)}[direction]
+    other = "y" if axis == "x" else "x"
+    center = dict(zip(("x", "y"), position, strict=True))
+    for field, side in (("pickup_position", sign), ("drop_position", -sign)):
+        assert (entity[field][axis] - center[axis]) * side > 0, (direction, field, entity)
+        assert abs(entity[field][other] - center[other]) <= 0.01, (direction, field, entity)
+
+
 def select_automation_technology(available):
     """Choose the cheapest non-trigger research that consumes only red science."""
     candidates = [
