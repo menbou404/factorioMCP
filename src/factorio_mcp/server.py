@@ -130,9 +130,13 @@ INVENTORY_RECIPE_DESCRIPTION = (
 )
 
 RESEARCH_STALLED_HINT = (
+    "Inspect labs: for labs with blocking=true, take packs out of that lab or add the pack "
+    "types named in missing. Add packs named in short_science; available_units counts only "
+    "labs holding every required ingredient within 16 tiles on the character's surface. "
     "Check missing_science in observe_nearby: every lab with packs must hold every required "
     "science pack. For each ingredient, check that the sum of science_units across labs "
-    "exceeds remaining_units. Partly used packs stay in the lab that started them; "
+    "holding every required ingredient exceeds remaining_units. "
+    "Partly used packs stay in the lab that started them; "
     "labs working in parallel each need a pack of every ingredient. Check lab power too."
 )
 
@@ -388,6 +392,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         "get_agent_status": ("inventory",),
         "list_craftable_recipes": ("recipes",),
         "get_research_status": ("researched", "queue", "available"),
+        "research_labs": ("labs", "short_science"),
         "get_technology_info": ("prerequisites", "ingredients", "unlocks_recipes"),
         "start_research": ("queue",),
         "get_recipe_info": ("ingredients", "products"),
@@ -411,6 +416,11 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
             ):
                 if field in entity and not isinstance(entity[field], list):
                     entity[field] = []
+    if operation == "research_labs":
+        for lab in result["labs"]:
+            for field in ("science_units", "missing"):
+                if not isinstance(lab.get(field), list):
+                    lab[field] = []
     if operation == "check_placement":
         for field in ("blocking", "tiles", "mining_area_resources"):
             if field in result and not isinstance(result[field], list):
@@ -686,7 +696,14 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " Returns early with stalled=true, stalled_seconds, progress, and timed_out=false "
             "when this technology is current and its progress has not changed for 10 seconds "
             "of waiting. Otherwise stalled=false. Includes remaining_units when this technology "
-            "is current, as returned by get_research_status. On a stall: " + RESEARCH_STALLED_HINT
+            "is current, as returned by get_research_status. On a stall, includes nearby owned "
+            "labs sorted by distance with stable target_ref, x, y, status (including unpowered "
+            "labs), unrounded science_units, missing pack names, and blocking. short_science "
+            "lists {name, available_units, remaining_units} where available_units <= "
+            "remaining_units, counting only labs holding every required ingredient. These "
+            "read-only diagnostics cover 16 tiles on the character's surface. If no labs are "
+            "nearby, stand near the labs and wait again. Diagnostic failures preserve the "
+            "stalled result with labs_error. On a stall: " + RESEARCH_STALLED_HINT
         )
     )
     async def wait_for_research(
@@ -733,6 +750,29 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                     if stalled:
                         result["stalled_seconds"] = stalled_seconds
                         result["hint"] = RESEARCH_STALLED_HINT
+                        try:
+                            diagnostics = _success_value(
+                                "research_labs", await call("research_labs")
+                            )
+                            if diagnostics.get("technology") != technology:
+                                raise BridgeError(
+                                    "research_changed",
+                                    "Current research changed during lab diagnosis.",
+                                )
+                            result["labs"] = diagnostics["labs"]
+                            result["short_science"] = diagnostics["short_science"]
+                            if not result["labs"]:
+                                result["hint"] = (
+                                    "No owned labs within 16 tiles on this surface. "
+                                    "Stand near the labs and wait again. " + RESEARCH_STALLED_HINT
+                                )
+                        except Exception as exc:
+                            result["labs_error"] = {
+                                "error": exc.code
+                                if isinstance(exc, BridgeError)
+                                else "internal_error",
+                                "message": str(exc),
+                            }
                     return _response(result)
                 await asyncio.sleep(min(0.25, timeout_seconds - waited))
         except Exception as exc:

@@ -926,7 +926,7 @@ local function do_get_explored_map(state, params)
   return result
 end
 
-local function lab_science_units(input)
+local function lab_science_units(input, unrounded)
   local units_by_name = {}
   for index = 1, #input do
     local stack = input[index]
@@ -940,9 +940,78 @@ local function lab_science_units(input)
   end
   local units = {}
   for _, name in ipairs(sorted_keys(units_by_name)) do
-    units[#units + 1] = {name = name, units = math.floor(units_by_name[name] * 1000 + 0.5) / 1000}
+    local amount = units_by_name[name]
+    units[#units + 1] = {name = name,
+                        units = unrounded and amount or math.floor(amount * 1000 + 0.5) / 1000}
   end
   return #units > 0 and units or nil
+end
+
+local function do_research_labs(state)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  local force = character.force
+  local current = force.current_research
+  local remaining = current and current.research_unit_count * (1 - force.research_progress) or nil
+  local required = {}
+  if current then
+    for _, ingredient in pairs(current.research_unit_ingredients) do
+      required[#required + 1] = ingredient.name
+    end
+    table.sort(required)
+  end
+  local entities = character.surface.find_entities_filtered{
+    position = character.position, radius = OBSERVATION_RADIUS, type = "lab", force = force
+  }
+  local labs = {}
+  local available = {}
+  for _, entity in pairs(entities) do
+    -- Also check centre distance: the surface query may intersect a lab's bounding box.
+    if entity.valid and distance_squared(character.position, entity.position) <=
+       OBSERVATION_RADIUS ^ 2 then
+      local input = entity.get_inventory(defines.inventory.lab_input)
+      local units = input and input.valid and lab_science_units(input, true) or {}
+      local by_name = {}
+      for _, entry in ipairs(units) do by_name[entry.name] = entry.units end
+      local missing = {}
+      local holds_required = false
+      for _, name in ipairs(required) do
+        if (by_name[name] or 0) > 0 then
+          holds_required = true
+        else
+          missing[#missing + 1] = name
+        end
+      end
+      -- Packs stranded in an incomplete lab cannot contribute to this research.
+      -- Power is reported separately; unpowered labs still hold usable packs.
+      if #missing == 0 then
+        for _, name in ipairs(required) do
+          available[name] = (available[name] or 0) + (by_name[name] or 0)
+        end
+      end
+      labs[#labs + 1] = {
+        target_ref = register_target(state, entity), x = entity.position.x, y = entity.position.y,
+        status = ENTITY_STATUS_NAMES[entity.status], science_units = units, missing = missing,
+        blocking = holds_required and #missing > 0
+      }
+    end
+  end
+  table.sort(labs, function(a, b)
+    local da = distance_squared(character.position, a)
+    local db = distance_squared(character.position, b)
+    if da ~= db then return da < db end
+    if a.x ~= b.x then return a.x < b.x end
+    return a.y < b.y
+  end)
+  local short = {}
+  for _, name in ipairs(required) do
+    local amount = available[name] or 0
+    if amount <= remaining then
+      short[#short + 1] = {name = name, available_units = amount, remaining_units = remaining}
+    end
+  end
+  return {technology = current and current.name or nil, remaining_units = remaining,
+          labs = labs, short_science = short}
 end
 
 local function do_observe(state, params)
@@ -2340,6 +2409,7 @@ local handlers = {
   list_craftable_recipes = do_list_craftable,
   get_recipe_info = do_recipe_info,
   get_research_status = do_research,
+  research_labs = do_research_labs,
   get_technology_info = do_technology_info,
   start_research = do_start_research,
   set_recipe = do_set_recipe,
