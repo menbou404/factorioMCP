@@ -321,7 +321,7 @@ def main():
         json.dumps({"requested": requested, "position": checked.get("position")}),
     )
 
-    # M8-D: a tree trunk allows a path but blocks arrival at its exact center.
+    # M8-D / M22-AZ: a tree trunk's occupied centre uses a standable arrival goal.
     return_position = bridge.call("get_agent_status")["result"]["position"]
     goal = {"x": 0, "y": -4}
     fixture = (
@@ -355,13 +355,16 @@ def main():
     elapsed = time.monotonic() - wait_started
     value = json.loads(waited.content[0].text)
     detail = value.get("detail") or {}
+    adjusted = detail.get("goal_adjusted")
+    position = bridge.call("get_agent_status")["result"]["position"]
     record(
-        "move to a blocked goal finishes nearby",
+        "move to a blocked tree goal finishes at goal_adjusted",
         not waited.is_error
         and value.get("status") == "succeeded"
-        and detail.get("goal_blocked") is True
-        and isinstance(detail.get("distance"), (int, float))
-        and detail["distance"] <= 1.5
+        and isinstance(adjusted, dict)
+        and adjusted != goal
+        and detail.get("original_goal") == goal
+        and math.hypot(position["x"] - adjusted["x"], position["y"] - adjusted["y"]) <= 0.5
         and elapsed < 10,
         json.dumps({"goal": goal, "result": value, "elapsed": elapsed}),
     )
@@ -467,7 +470,7 @@ def main():
     if value.get("status") == "running":
         bridge.call("cancel_action", {"action_id": started["action_id"]})
 
-    # M9-G: a water goal reports its blocking tile and a nearby standable position.
+    # M9-G: within preserves the original water goal and its failure diagnostics.
     return_position = bridge.call("get_agent_status")["result"]["position"]
     goal = {"x": -10, "y": -10}
 
@@ -494,7 +497,9 @@ def main():
     started = None
     try:
         set_goal_tiles("water")
-        started = bridge.call("move_to", {"surface": return_position["surface"], **goal})["result"]
+        started = bridge.call(
+            "move_to", {"surface": return_position["surface"], **goal, "within": 0.5}
+        )["result"]
         waited = asyncio.run(
             create_server(bridge).call_tool(
                 "wait_for_action", {"action_id": started["action_id"], "timeout_seconds": 15}
@@ -1262,11 +1267,11 @@ def main():
         except BridgeError as error:
             plain = {"status": "failed", "error": error.code, "detail": error.detail}
         record(
-            "plain move_to cannot stand at enclosed goal",
+            "plain move_to adjusts an enclosed goal or explains no path",
             (plain.get("status") == "failed" and plain.get("error") == "path_not_found")
             or (
                 plain.get("status") == "succeeded"
-                and (plain.get("detail") or {}).get("goal_blocked") is True
+                and isinstance((plain.get("detail") or {}).get("goal_adjusted"), dict)
             ),
             json.dumps(plain),
         )
@@ -2158,6 +2163,135 @@ def main():
             "escape fixture restores the pre-fixture inventory exactly",
             after_escape == before_escape,
             json.dumps({"before": before_escape, "after": after_escape}),
+        )
+
+    # M22-AZ/AY: use held buildings and ordinary walking in a clear fixture area.
+    # AY is a corner-navigation smoke test: pathfinder waypoint choices can vary,
+    # so this geometry cannot guarantee that the old steering clips on every save.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    before_m22 = items()
+    m22_targets = []
+    m22_action_id = None
+
+    def movement_fixture(body):
+        # Read-only collision probes; no spawning, teleporting or inventory changes.
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;"
+            "local c=state and state.character;assert(c and c.valid);" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=5, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+            if "m22_fixture:" not in raw:
+                raw = client.run(command)
+        if "m22_fixture:" not in raw:
+            raise RuntimeError("Missing M22 fixture response: " + raw)
+        return json.loads(raw.split("m22_fixture:", 1)[1].strip())
+
+    def place_movement_obstacle(item):
+        for x, y in ((-18, -18), (12, -18), (-18, 18), (12, 18)):
+            action("move_to", {"surface": "nauvis", "x": x + 5, "y": y - 3})
+            params = {"item": item, "surface": "nauvis", "x": x, "y": y}
+            preview = bridge.call("check_placement", params)["result"]
+            if not preview.get("placeable") or preview.get("ground_items"):
+                continue
+            centre = preview["position"]
+            clear = movement_fixture(
+                f"local a={{x={centre['x']},y={centre['y']}}};local clear=true;"
+                "for dx=-7,6 do for dy=-3,4 do local p={x=a.x+dx,y=a.y+dy};"
+                "local d=(p.x-c.position.x)^2+(p.y-c.position.y)^2;"
+                'if d>0.25 and not c.surface.can_place_entity{name="character",position=p} '
+                "then clear=false end end end;"
+                'rcon.print("m22_fixture:"..helpers.table_to_json({clear=clear}))'
+            )
+            if clear["clear"]:
+                placed = bridge.call("place_entity", params)["result"]
+                m22_targets.append(placed)
+                return placed
+        raise RuntimeError("M22 cannot find a clear movement fixture for " + item)
+
+    def finish_movement(params):
+        nonlocal m22_action_id
+        started = bridge.call("move_to", params)["result"]
+        m22_action_id = started["action_id"]
+        running = bridge.call("get_action_status", {"action_id": m22_action_id})["result"]
+        waited = asyncio.run(
+            server.call_tool("wait_for_action", {"action_id": m22_action_id, "timeout_seconds": 20})
+        )
+        return started, running, json.loads(waited.content[0].text)
+
+    def recover_movement_obstacle(target):
+        nonlocal m22_action_id
+        if m22_action_id:
+            current = bridge.call("get_action_status", {"action_id": m22_action_id})["result"]
+            if current.get("status") == "running":
+                bridge.call("cancel_action", {"action_id": m22_action_id})
+            m22_action_id = None
+        reach = bridge.call("observe_nearby")["result"]["reach"]["mine_resource"]
+        position = bridge.call("get_agent_status")["result"]["position"]
+        centre = target["position"]
+        if math.hypot(position["x"] - centre["x"], position["y"] - centre["y"]) > reach:
+            action("move_to", {**centre, "surface": "nauvis", "within": reach})
+        action("mine_entity", {"target_ref": target["target_ref"], "count": 1})
+        m22_targets.remove(target)
+
+    try:
+        if not before_m22.get("stone-furnace"):
+            raise RuntimeError("M22-AZ requires a held stone furnace")
+        target = place_movement_obstacle("stone-furnace")
+        centre = target["position"]
+        action("move_to", {**centre, "x": centre["x"] + 5.2, "y": centre["y"] - 1.1})
+        goal = {"x": centre["x"], "y": centre["y"]}
+        started, running, final = finish_movement({"surface": "nauvis", **goal})
+        adjusted = started.get("goal_adjusted")
+        position = bridge.call("get_agent_status")["result"]["position"]
+        record(
+            "non-standable furnace goal walks to goal_adjusted",
+            final.get("status") == "succeeded"
+            and isinstance(adjusted, dict)
+            and adjusted != goal
+            and started.get("original_goal") == goal
+            and all(
+                value.get("goal_adjusted") == adjusted and value.get("original_goal") == goal
+                for value in (running.get("detail") or {}, final, final.get("detail") or {})
+            )
+            and math.hypot(position["x"] - adjusted["x"], position["y"] - adjusted["y"]) <= 0.5,
+            json.dumps({"start": started, "running": running, "final": final}),
+        )
+        # Move away before can_place_entity: the character itself occupies the arrival spot.
+        action("move_to", {**centre, "x": centre["x"] + 5.2, "y": centre["y"] - 1.1})
+        if isinstance(adjusted, dict):
+            standable = movement_fixture(
+                'rcon.print("m22_fixture:"..helpers.table_to_json({standable='
+                'c.surface.can_place_entity{name="character",'
+                f"position={{x={adjusted['x']},y={adjusted['y']}}}" + "}}))"
+            )
+            record("goal_adjusted is standable", standable.get("standable"), json.dumps(standable))
+        recover_movement_obstacle(target)
+
+        corner_item = (
+            "assembling-machine-1" if before_m22.get("assembling-machine-1") else "stone-furnace"
+        )
+        target = place_movement_obstacle(corner_item)
+        centre = target["position"]
+        action("move_to", {**centre, "x": centre["x"] + 5.2, "y": centre["y"] - 1.1})
+        goal = {"surface": "nauvis", "x": centre["x"] - 6, "y": centre["y"] + 3}
+        _, _, final = finish_movement(goal)
+        record(
+            "path-following walks around a building corner (smoke test)",
+            final.get("status") == "succeeded",
+            json.dumps({"item": corner_item, "centre": centre, "goal": goal, "result": final}),
+        )
+        recover_movement_obstacle(target)
+    finally:
+        for target in list(m22_targets):
+            recover_movement_obstacle(target)
+        action("move_to", {**return_position, "within": 0.5})
+        record(
+            "M22 movement fixtures restore all held items",
+            items() == before_m22,
+            json.dumps({"before": before_m22, "after": items()}),
         )
 
     failed = [label for label, passed, _ in results if not passed]

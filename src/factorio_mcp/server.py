@@ -210,6 +210,9 @@ HINTS = {
     ),
     "path_not_found": (
         "Check detail.goal_tiles and detail.goal_entities for obstacles explaining the failure. "
+        "Without within, a non-standable goal is adjusted to a standable spot within 10 tiles; "
+        "goal_adjusted and original_goal report the actual and requested goals. "
+        "An adjusted goal still has no path guarantee. "
         "detail.start_adjusted, when present, is the nearby pathfinding start used because "
         "the character was touching an obstacle, or a tile-centre start within 2 tiles "
         "used for a once-per-move escape retry after a failed search; "
@@ -817,6 +820,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Walk to a position on the current surface. By default, arrival is within 0.5 tiles. "
+            "Without within, if terrain or an entity prevents standing at the goal, walk to "
+            "a standable spot within 10 tiles instead. The start result, running detail and "
+            "final result include goal_adjusted (the actual goal) and original_goal "
+            "(the requested goal). With within set, the original goal is used unchanged. "
             "Set within (0.5-10 tiles) to stop when the character centre is within that "
             "Euclidean distance of the goal; the pathfinder uses the same radius. "
             "Use within = the needed reach (e.g. reach.interact from observe_nearby) to walk "
@@ -832,6 +839,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "an obstacle, or a tile-centre start within 2 tiles used for a once-per-move "
             "escape retry after a failed search; the character still moves by walking. "
             "Crafting runs alongside walking. Only one walk/mine at a time. "
+            "Check a move's result before acting on targets near the destination; "
+            "later transfers can fail with out_of_range if the walk failed. "
             "Prefer wait_seconds (1-50) to start and wait in one call, under common 60-second "
             "client timeouts. A timeout leaves the action running and returns timed_out=true "
             "and action_id; continue with wait_for_action. Omit wait_seconds to return the "
