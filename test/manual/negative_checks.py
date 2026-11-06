@@ -8,6 +8,7 @@ import asyncio
 import json
 import math
 import time
+from unittest.mock import patch
 
 from rcon.source import Client
 
@@ -17,6 +18,25 @@ from production_line import action, bridge, password, reference
 
 results = []
 errors = {}
+observed_map_cells = {}
+
+
+def remember_map_observation(observation):
+    # Reconstruct fully observed 8x8 cells using only observe_nearby's returned circle.
+    position, radius = observation["position"], observation["radius"]
+    cells = observed_map_cells.setdefault(position["surface"], set())
+    for cx in range(
+        math.floor((position["x"] - radius) / 8), math.floor((position["x"] + radius) / 8) + 1
+    ):
+        for cy in range(
+            math.floor((position["y"] - radius) / 8), math.floor((position["y"] + radius) / 8) + 1
+        ):
+            if all(
+                (x - position["x"]) ** 2 + (y - position["y"]) ** 2 <= radius**2
+                for x in (cx * 8, (cx + 1) * 8)
+                for y in (cy * 8, (cy + 1) * 8)
+            ):
+                cells.add((cx, cy))
 
 
 def record(label, passed, info=""):
@@ -2294,6 +2314,84 @@ def main():
             json.dumps({"before": before_m22, "after": items()}),
         )
 
+    # M23-BF: check frontier against cells derived from actual observation responses.
+    bridge.call("observe_nearby")
+    mapped = bridge.call("get_explored_map", {"limit": 50})["result"]
+    frontier = mapped["frontier"]
+    size, position = mapped["cell_size"], mapped["position"]
+    explored = mapped["explored"]
+    known_cells = observed_map_cells[position["surface"]]
+    left, top = explored["left_top"]["x"], explored["left_top"]["y"]
+    right, bottom = explored["right_bottom"]["x"], explored["right_bottom"]["y"]
+    offsets = ((-1, 0), (1, 0), (0, -1), (0, 1))
+    frontier_keys = {
+        (math.floor(cell["x"] / size), math.floor(cell["y"] / size)) for cell in frontier
+    }
+
+    def valid_frontier_cell(cell):
+        x, y = cell["x"], cell["y"]
+        cx, cy = math.floor(x / size), math.floor(y / size)
+        # A save may contain observations from production_line.py before this script.
+        # For those cells, use the permitted bounds fallback without reading the world.
+        outside_bounds = not (left <= x < right and top <= y < bottom)
+        adjacent = any((cx + dx, cy + dy) in known_cells for dx, dy in offsets)
+        bounds_adjacent = outside_bounds and any(
+            left <= x + dx * size < right and top <= y + dy * size < bottom for dx, dy in offsets
+        )
+        return (
+            set(cell) == {"x", "y", "distance"}
+            and x == (cx + 0.5) * size
+            and y == (cy + 0.5) * size
+            and (cx, cy) not in known_cells
+            and (adjacent or bounds_adjacent)
+            and math.isclose(
+                cell["distance"],
+                math.hypot(x - position["x"], y - position["y"]),
+                rel_tol=0,
+                abs_tol=1e-6,
+            )
+        )
+
+    record(
+        "frontier cells are unexplored edge neighbors with only coordinates and distance",
+        size == 8
+        and bool(frontier)
+        and len(frontier_keys) == len(frontier)
+        and all(valid_frontier_cell(cell) for cell in frontier),
+        json.dumps(mapped),
+    )
+    record(
+        "frontier distances are sorted with coordinate tie breaks",
+        frontier == sorted(frontier, key=lambda cell: (cell["distance"], cell["x"], cell["y"])),
+        json.dumps(frontier),
+    )
+    if len(known_cells) == explored["cells"]:
+        # All remembered cells were observed during this script: verify the exact set.
+        expected = {(cx + dx, cy + dy) for cx, cy in known_cells for dx, dy in offsets}
+        expected -= known_cells
+        expected = sorted(
+            expected,
+            key=lambda cell: (
+                math.hypot(
+                    (cell[0] + 0.5) * size - position["x"], (cell[1] + 0.5) * size - position["y"]
+                ),
+                cell[0],
+                cell[1],
+            ),
+        )
+        record(
+            "frontier matches all observed cell edges before truncation",
+            mapped["frontier_total"] == len(expected) and frontier_keys == set(expected[:50]),
+        )
+    limited = bridge.call("get_explored_map", {"limit": 1, "resource_names": []})["result"]
+    record(
+        "frontier respects limit and ignores resource filtering",
+        len(frontier) == min(50, mapped["frontier_total"])
+        and limited["frontier_total"] == mapped["frontier_total"]
+        and limited["frontier"] == frontier[:1],
+        json.dumps(limited),
+    )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
@@ -2301,4 +2399,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    original_call = bridge.call
+
+    def track_observation(operation, params=None):
+        response = original_call(operation, params)
+        if operation == "observe_nearby":
+            remember_map_observation(response["result"])
+        return response
+
+    with patch.object(bridge, "call", side_effect=track_observation):
+        main()

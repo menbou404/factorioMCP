@@ -964,10 +964,22 @@ local function do_get_explored_map(state, params)
   if names_error then return nil, "invalid_input" end
   local map = state.explored_map[character.surface.name] or {cells = {}, count = 0}
   local result = {position = position_data(character), cell_size = MAP_CELL_SIZE,
-                  explored = {cells = map.count}, resources = {}}
-  local resource_names = {}
+                  explored = {cells = map.count}, resources = {}, frontier = {}}
+  local resource_names, frontier_seen = {}, {}
+  local edge_offsets = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
   for _, cell in pairs(map.cells) do
     extend_map_bounds(result.explored, cell)
+    -- Derive only coordinates from remembered cells; never query unexplored terrain.
+    for _, offset in ipairs(edge_offsets) do
+      local cx, cy = cell.cx + offset[1], cell.cy + offset[2]
+      local key = map_cell_key(cx, cy)
+      if not map.cells[key] and not frontier_seen[key] then
+        frontier_seen[key] = true
+        local centre = map_cell_centre{cx = cx, cy = cy}
+        centre.distance = math.sqrt(distance_squared(character.position, centre))
+        result.frontier[#result.frontier + 1] = centre
+      end
+    end
     for name in pairs(cell.resources) do
       if not names or names[name] then resource_names[name] = true end
     end
@@ -980,6 +992,13 @@ local function do_get_explored_map(state, params)
   for _, kind in ipairs({"water", "trees", "rocks"}) do
     result[kind] = map_components(map.cells, kind, nil, character.position)
   end
+  result.frontier_total = #result.frontier
+  table.sort(result.frontier, function(a, b)
+    if a.distance ~= b.distance then return a.distance < b.distance end
+    if a.x ~= b.x then return a.x < b.x end
+    return a.y < b.y
+  end)
+  for index = #result.frontier, limit + 1, -1 do result.frontier[index] = nil end
   for _, kind in ipairs({"resources", "water", "trees", "rocks"}) do
     local groups = result[kind]
     result[kind .. "_total"] = #groups

@@ -411,7 +411,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
             result[field] = []
     array_fields = {
         "observe_nearby": ("entities", "blocked_tiles", "resources"),
-        "get_explored_map": ("resources", "water", "trees", "rocks"),
+        "get_explored_map": ("resources", "water", "trees", "rocks", "frontier"),
         "get_inventory": ("items",),
         "get_agent_status": ("inventory",),
         "list_craftable_recipes": ("recipes",),
@@ -666,7 +666,13 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Lists resource patches, water (with a shore tile for offshore pumps), forests "
             "and rocks nearest first. Each list contains at most limit components; "
             "resources_total, water_total, trees_total and rocks_total count components "
-            "before truncation. Use resource_names to filter resource kinds."
+            "before truncation. Use resource_names to filter resource kinds. "
+            "frontier lists unexplored cells sharing an edge with an explored cell, "
+            "as {x, y, distance} at cell centres, sorted by distance then x then y, "
+            "up to limit; frontier_total counts all frontier cells before truncation. "
+            "Only coordinates and distance are returned for unexplored cells, without "
+            "terrain, resource or tile data. Walk toward the nearest frontier cell and "
+            "observe_nearby to explore efficiently."
         )
     )
     async def get_explored_map(
