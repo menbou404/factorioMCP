@@ -12,7 +12,11 @@ import time
 
 import power_research as power
 from automation_line import orient_inserter, restore_pairs
-from helpers import position_in_tile_footprint, successful_batch_results
+from helpers import (
+    assert_inserter_direction,
+    position_in_tile_footprint,
+    successful_batch_results,
+)
 from power_research import (
     BOILER,
     LAB,
@@ -183,6 +187,7 @@ def put_batch(station, entries):
         ), (entry, result, entity)
         assert result["name"] == entity["name"], (entry, result, entity)
         if "pickup_position" in entity:
+            assert_inserter_direction(entity, position, entry["direction"])
             for field in ("pickup_position", "drop_position"):
                 for axis in ("x", "y"):
                     assert abs(preview[field][axis] - result[field][axis]) <= 0.01, (
@@ -274,9 +279,9 @@ def build():
         call("set_recipe", {"target_ref": entity["target_ref"], "recipe": recipe})
         entity = entity_at(observe(), "assembling-machine-1", position)
         assert entity.get("recipe") == recipe, (recipe, entity)
-        inventories = bridge.call("get_entity_inventory", {"target_ref": entity["target_ref"]})[
-            "result"
-        ]["inventories"]
+        inventory = call("get_entity_inventory", {"target_ref": entity["target_ref"]})
+        assert inventory["products_since_recipe"] == 0, (recipe, inventory)
+        inventories = inventory["inventories"]
         assert not any(inventories.values()), (recipe, inventories)
     print("PASS all four fresh assembler inventories empty before feeding", flush=True)
 
@@ -500,6 +505,7 @@ def wait_for_science(held_components):
             )
             check_wait_for_items()
             check_wait_for_produced_items()
+            check_products_since_recipe()
             check_wait_seconds()
             print("GREEN_SCIENCE_LINE_SUCCEEDED", count, flush=True)
             return
@@ -507,6 +513,18 @@ def wait_for_science(held_components):
     raise TimeoutError(
         f"Green assembler did not produce two packs within the remaining run/wait budget: {last}"
     )
+
+
+def check_products_since_recipe():
+    """M23-BD: the fresh recipe baseline counts production in single and batch reads."""
+    target = entity_at(observe(), "assembling-machine-1", ASSEMBLERS[SCIENCE])
+    params = {"target_ref": target["target_ref"]}
+    inventory = call("get_entity_inventory", params)
+    batch = call("get_entity_inventories", {"target_refs": [target["target_ref"]]})
+    for result in (inventory, *successful_batch_results(batch, 1)):
+        assert result["recipe"] == SCIENCE, result
+        assert 1 <= result["products_since_recipe"] <= result["products_finished"], result
+    print("PASS M23-BD products_since_recipe", json.dumps(inventory), flush=True)
 
 
 def main():

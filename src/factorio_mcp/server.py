@@ -43,12 +43,20 @@ PLACEMENT_VISIBILITY_DESCRIPTION = (
 )
 
 
+INSERTER_DIRECTION_DESCRIPTION = (
+    " Inserter direction names the pickup side: 0 picks up from north and drops south;"
+    " 4 picks up from east and drops west; 8 picks up from south and drops north;"
+    " 12 picks up from west and drops east."
+)
+
+
 PLACE_DESCRIPTION = (
     "Place a supported entity within build reach, consuming one real inventory item."
     " Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground."
     " underground_type is only valid for underground-belt: input or output"
     " (default input). direction is belt travel direction for both ends;"
     " for output it is the direction items leave."
+    + INSERTER_DIRECTION_DESCRIPTION
     + PLACEMENT_VISIBILITY_DESCRIPTION
     + " Items on the ground inside the footprint are picked up into the main inventory"
     " in the same tick before building when they are the only blockers and all fit."
@@ -135,6 +143,10 @@ INVENTORY_RECIPE_DESCRIPTION = (
     " idle furnaces use their previous recipe. Omitted when no recipe is available."
     " They also include products_finished (lifetime crafts), recipe_products (item names),"
     " and recipe_product_amounts (amount per craft by item, ignoring probability)."
+    " Assemblers include products_since_recipe (crafts since the last recipe change via"
+    " set_recipe, computed as products_finished minus the recorded baseline) only when"
+    " a baseline exists and its recipe matches the current recipe."
+    " Repeating set_recipe with the same recipe preserves the baseline."
 )
 
 RESEARCH_STALLED_HINT = (
@@ -954,6 +966,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "underground_type is only valid for underground-belt: input or output "
             "(default input). direction is belt travel direction for both ends; "
             "for output it is the direction items leave."
+            + INSERTER_DIRECTION_DESCRIPTION
             + PLACEMENT_VISIBILITY_DESCRIPTION
             + " Items on the ground inside the footprint are picked up into the main inventory "
             "by placement when they are the only blockers and all fit. This check collects "
@@ -1012,7 +1025,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             params["underground_type"] = underground_type
         return await invoke("check_placement", params)
 
-    @server.tool(description="Rotate an owned observed entity within reach by 90 degrees.")
+    @server.tool(
+        description="Rotate an owned observed entity within reach by 90 degrees."
+        + INSERTER_DIRECTION_DESCRIPTION
+    )
     async def rotate_entity(target_ref: RequiredText, reverse: bool = False) -> CallToolResult:
         return await invoke("rotate_entity", {"target_ref": target_ref, "reverse": reverse})
 
