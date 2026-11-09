@@ -1639,20 +1639,27 @@ local function placement_bounding_box(prototype, position, direction)
           right_bottom = {x = position.x + right, y = position.y + bottom}}
 end
 
+local function absolute_placement_position(vector, position, direction)
+  if not vector then return nil end
+  -- Runtime Vector values are arrays, unlike MapPosition values.
+  local x, y = vector[1], vector[2]
+  -- Clockwise in map coordinates (positive y is south). North-facing
+  -- inserters pick north and drop south; direction=12 picks west.
+  if direction == 4 then x, y = -y, x
+  elseif direction == 8 then x, y = -x, -y
+  elseif direction == 12 then x, y = y, -x end
+  return {x = position.x + x, y = position.y + y}
+end
+
 local function preview_inserter_positions(prototype, position, direction)
   if prototype.type ~= "inserter" then return nil, nil end
-  local function absolute(vector)
-    if not vector then return nil end
-    -- Runtime Vector values are arrays, unlike MapPosition values.
-    local x, y = vector[1], vector[2]
-    -- Clockwise in map coordinates (positive y is south). North-facing
-    -- inserters pick north and drop south; direction=12 picks west.
-    if direction == 4 then x, y = -y, x
-    elseif direction == 8 then x, y = -x, -y
-    elseif direction == 12 then x, y = y, -x end
-    return {x = position.x + x, y = position.y + y}
-  end
-  return absolute(prototype.inserter_pickup_position), absolute(prototype.inserter_drop_position)
+  return absolute_placement_position(prototype.inserter_pickup_position, position, direction),
+         absolute_placement_position(prototype.inserter_drop_position, position, direction)
+end
+
+local function preview_drill_drop_position(prototype, position, direction)
+  if prototype.type ~= "mining-drill" then return nil end
+  return absolute_placement_position(prototype.vector_to_place_result, position, direction)
 end
 
 local function placement_electric_coverage(character, prototype, position, box)
@@ -1998,7 +2005,8 @@ local function do_check_placement(state, params)
     inventory.get_item_count({name = params.item, quality = "normal"}) >= 1
   local direction = params.direction or defines.direction.north
   local position, box, fluid_connections, electric_coverage, pickup_position, drop_position
-  if prototype and (PLACEABLE_ITEMS[params.item] or prototype.type == "inserter") and
+  if prototype and (PLACEABLE_ITEMS[params.item] or prototype.type == "inserter" or
+                    prototype.type == "mining-drill") and
      params.surface == character.surface.name and
      (direction == 0 or direction == 4 or direction == 8 or direction == 12) and
      type(params.x) == "number" and type(params.y) == "number" and
@@ -2009,6 +2017,9 @@ local function do_check_placement(state, params)
     fluid_connections = preview_fluid_connections(prototype, position, direction)
     electric_coverage = placement_electric_coverage(character, prototype, position, box)
     pickup_position, drop_position = preview_inserter_positions(prototype, position, direction)
+    if prototype.type == "mining-drill" then
+      drop_position = preview_drill_drop_position(prototype, position, direction)
+    end
   end
   local blocked = reason == "blocked" and detail or {}
   local mining_area_resources = blocked.mining_area_resources
@@ -2077,7 +2088,8 @@ local function do_place(state, params)
           target_ref = register_target(state, created),
           direction = created.direction, consumed_item = params.item,
           pickup_position = created.type == "inserter" and created.pickup_position or nil,
-          drop_position = created.type == "inserter" and created.drop_position or nil,
+          drop_position = (created.type == "inserter" or created.type == "mining-drill") and
+                          created.drop_position or nil,
           fluid_connections = placed_fluid_connections(created), collected_items = collected_items,
           mining_area_resources = placement_mining_area_resources(character, created.prototype,
                                     {x = params.x, y = params.y}, placement.direction)}
