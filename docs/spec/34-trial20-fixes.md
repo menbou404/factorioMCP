@@ -31,7 +31,7 @@
 ## BL. `observe_nearby` の省略表示
 
 - `observe_nearby` に `compact` を加える。既定は `false` で、今までの結果を変えない。
-- `compact = true` のとき、設備の項目は `target_ref`、`name`、`x`、`y` と、値があれば `direction`、`status`、`recipe`、`belt_items` に絞る。`type`、`distance`、`surface`、`unit_number`、`owned`、`bounding_box` などは省く。`entity_total` やページ送りは変えない。
+- `compact = true` のとき、設備の項目は `target_ref`、`name`、`x`、`y` と、値があれば `direction`、`status`、`recipe`、`belt_items`、`underground_type`、`neighbour`、`pickup_position`、`drop_position`、`electric_network_id` に絞る。`type`、`distance`、`surface`、`unit_number`、`owned`、`bounding_box` などは省く。`entity_total` やページ送りは変えない。
 
 ## 効果の確認
 
