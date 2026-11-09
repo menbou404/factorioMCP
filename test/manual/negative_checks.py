@@ -3059,6 +3059,194 @@ def main():
             and bridge.call("get_agent_status")["result"]["position"] == status_position,
         )
 
+    # M27-BM/BN: feeder diagnostics and current position on reach failures.
+    diagnostics_surface = "m27-feeder-diagnostics-check"
+    diagnostics_inventory = bridge.call("get_inventory")["result"]["items"]
+    diagnostics_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def diagnostics_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;"
+            "local c=state and state.character;assert(c and c.valid);"
+            f'local name="{diagnostics_surface}";local s=game.surfaces[name];'
+            "local inv=c.get_main_inventory();assert(inv);" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m27_diagnostics:" not in raw:
+            raise RuntimeError("M27 diagnostics fixture failed: " + raw)
+        return json.loads(raw.split("m27_diagnostics:", 1)[1].strip())
+
+    diagnostics_server = create_server(bridge)
+
+    async def diagnostics_tool(operation, params):
+        response = await diagnostics_server.call_tool(operation, params)
+        return response.is_error, json.loads(response.content[0].text)
+
+    def wait_for_chest(target_ref):
+        is_error, result = asyncio.run(
+            diagnostics_tool(
+                "wait_for_items",
+                {
+                    "target_ref": target_ref,
+                    "item": "iron-plate",
+                    "count": 1,
+                    "timeout_seconds": 1,
+                },
+            )
+        )
+        assert not is_error, result
+        return result
+
+    try:
+        diagnostics_fixture(
+            "assert(not state.action and not state.craft_action);"
+            "assert(not s and not storage.m27_diagnostics_backup,'M27 fixture already exists');"
+            "local b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv)};storage.m27_diagnostics_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=64,height=64});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},1);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-32,31 do for y=-32,31 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,4.5},s));assert(c.reach_distance<13);"
+            'b.feeder=s.create_entity{name="inserter",position={0.5,0.5},'
+            "direction=0,force=c.force};assert(b.feeder);b.feeder.energy=0;"
+            # Derive chest tiles from actual pickup/drop positions, including the
+            # inserter prototype's fractional drop offset, rather than guessing.
+            "local p=b.feeder.pickup_position;local d=b.feeder.drop_position;"
+            'b.source=s.create_entity{name="iron-chest",'
+            "position={math.floor(p.x)+0.5,math.floor(p.y)+0.5},force=c.force};assert(b.source);"
+            'b.target=s.create_entity{name="wooden-chest",'
+            "position={math.floor(d.x)+0.5,math.floor(d.y)+0.5},force=c.force};assert(b.target);"
+            'b.other=s.create_entity{name="inserter",position={2.5,0.5},'
+            "direction=0,force=c.force};assert(b.other);b.other.energy=0;"
+            "local o=b.other.drop_position;"
+            'b.other_target=s.create_entity{name="wooden-chest",'
+            "position={math.floor(o.x)+0.5,math.floor(o.y)+0.5},force=c.force};"
+            "assert(b.other_target);"
+            'assert(s.create_entity{name="wooden-chest",position={-3.5,1.5},force=c.force});'
+            'assert(s.create_entity{name="wooden-chest",position={13.5,4.5},force=c.force});'
+            "rcon.print('m27_diagnostics:{\"ready\":true}')"
+        )
+        # Let Factorio assign the inserters' targets on simulation ticks. A fixture
+        # failure must be explicit rather than silently testing an empty feeder list.
+        deadline = time.monotonic() + 5
+        while True:
+            ready = diagnostics_fixture(
+                "local b=storage.m27_diagnostics_backup;"
+                "local d=b.feeder.drop_target;local p=b.feeder.pickup_target;"
+                "local o=b.other.drop_target;"
+                "rcon.print('m27_diagnostics:'..helpers.table_to_json({"
+                "ready=d and d.valid and d.unit_number==b.target.unit_number and "
+                "p and p.valid and p.unit_number==b.source.unit_number and "
+                "o and o.valid and o.unit_number==b.other_target.unit_number or false}))"
+            )
+            if ready["ready"]:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("M27 inserters did not acquire the fixture chest targets")
+            time.sleep(0.1)
+
+        entities = bridge.call("observe_nearby")["result"]["entities"]
+        target = next(e for e in entities if e["name"] == "wooden-chest" and e["x"] == 0.5)
+        empty = next(e for e in entities if e["name"] == "wooden-chest" and e["x"] == -3.5)
+        distant = next(e for e in entities if e["name"] == "wooden-chest" and e["x"] == 13.5)
+        feeder = next(e for e in entities if e["name"] == "inserter" and e["x"] == 0.5)
+        feeder_status = bridge.call("get_entity_inventory", {"target_ref": feeder["target_ref"]})[
+            "result"
+        ]["status"]
+        timed_out = wait_for_chest(target["target_ref"])
+        record(
+            "M27 timeout reports exactly the unpowered feeder and its pickup chest",
+            timed_out["reached"] is False
+            and timed_out["timed_out"] is True
+            and timed_out["stalled"] is False
+            and feeder_status == "no_power"
+            and timed_out.get("feeders")
+            == [
+                {
+                    "name": "inserter",
+                    "x": feeder["x"],
+                    "y": feeder["y"],
+                    "status": feeder_status,
+                    "pickup_target": "iron-chest",
+                }
+            ],
+            json.dumps(timed_out),
+        )
+        record(
+            "M27 nearby inserter dropping into a different chest is excluded",
+            isinstance(timed_out.get("feeders"), list)
+            and all(f["x"] != 2.5 for f in timed_out["feeders"])
+            and len(timed_out["feeders"]) == 1,
+        )
+        no_feeders = wait_for_chest(empty["target_ref"])
+        record(
+            "M27 chest with no inserters returns an empty feeder list",
+            no_feeders["timed_out"] is True and no_feeders.get("feeders") == [],
+            json.dumps(no_feeders),
+        )
+        diagnostics_fixture(
+            "local b=storage.m27_diagnostics_backup;assert(b.source.destroy());"
+            "rcon.print('m27_diagnostics:{\"source_removed\":true}')"
+        )
+        no_pickup = wait_for_chest(target["target_ref"])
+        record(
+            "M27 feeder without a pickup entity omits pickup_target",
+            no_pickup.get("feeders")
+            == [{"name": "inserter", "x": feeder["x"], "y": feeder["y"], "status": feeder_status}],
+            json.dumps(no_pickup),
+        )
+        diagnostics_fixture(
+            'assert(storage.m27_diagnostics_backup.target.insert{name="iron-plate",count=1}==1);'
+            "rcon.print('m27_diagnostics:{\"stocked\":true}')"
+        )
+        reached = wait_for_chest(target["target_ref"])
+        record(
+            "M27 reached wait omits feeders",
+            reached["reached"] is True and "feeders" not in reached,
+            json.dumps(reached),
+        )
+        actual_position = bridge.call("get_agent_status")["result"]["position"]
+        is_error, out_of_range = asyncio.run(
+            diagnostics_tool("get_entity_inventory", {"target_ref": distant["target_ref"]})
+        )
+        reported_position = out_of_range.get("detail", {}).get("character_position", {})
+        record(
+            "M27 out_of_range includes the character's actual position",
+            is_error
+            and out_of_range.get("error") == "out_of_range"
+            and all(
+                isinstance(reported_position.get(axis), (int, float))
+                and math.isclose(reported_position[axis], actual_position[axis], abs_tol=0.01)
+                for axis in ("x", "y")
+            ),
+            json.dumps(out_of_range),
+        )
+    finally:
+        diagnostics_fixture(
+            "local b=storage.m27_diagnostics_backup;if b then "
+            "assert(not state.action and not state.craft_action);"
+            "assert(c.teleport(b.position,b.surface),'M27 position restore failed');"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "b.inventory.destroy();storage.m27_diagnostics_backup=nil;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil end;"
+            "rcon.print('m27_diagnostics:{\"restored\":true}')"
+        )
+        observed_map_cells.pop(diagnostics_surface, None)
+        record(
+            "M27 diagnostics fixture restores exact inventory and position",
+            bridge.call("get_inventory")["result"]["items"] == diagnostics_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == diagnostics_position,
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

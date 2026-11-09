@@ -445,6 +445,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         "list_craftable_recipes": ("recipes",),
         "get_research_status": ("researched", "queue", "available"),
         "research_labs": ("labs", "short_science"),
+        "entity_feeders": ("feeders",),
         "get_technology_info": ("prerequisites", "ingredients", "unlocks_recipes"),
         "start_research": ("queue",),
         "get_recipe_info": ("ingredients", "products"),
@@ -997,8 +998,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Endpoints are snapped to tile centres and must share a row or column. "
             "Direction follows travel from start to end: east 4, south 8, west 12, north 0. "
             "It does not walk and uses the same reach, observation and inventory checks as "
-            "place_entity. Build reach is 10 tiles, so standing near the middle of the segment "
-            "places about 21 tiles per call. The call stops at the first tile it cannot place "
+            "place_entity. Build reach is 10 tiles in a circle, so standing near the middle "
+            "of the segment reliably places about 19 tiles per call. "
+            "The call stops at the first tile it cannot place "
             "and keeps earlier tiles. On stop, resolve stopped/detail, walk near next_position "
             "and call again from it to the original end (already placed tiles are skipped). "
             "Same-name belts of different direction stop with blocked/different_direction; "
@@ -1172,6 +1174,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             + ". Working states and containers without status never stall. "
             "For full_output, take products out or add an output inserter; "
             "for ingredient shortages, supply materials; for no_fuel/no_power, supply fuel/power."
+            " When reached=false (timed out or stalled), includes feeders: up to 16 owned "
+            "inserters whose drop_target is the target, sorted by x then y, with name, x, y, "
+            "status and pickup_target (source entity name, omitted when none). "
+            "No feeders returns an empty list. Feeders are omitted when reached=true or "
+            "diagnostics fail; diagnostic failures preserve the wait result."
             + MACHINE_BUFFER_DESCRIPTION
         )
     )
@@ -1271,6 +1278,16 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                     if stalled:
                         result["stalled_seconds"] = stalled_seconds
                         result["hint"] = ITEMS_STALLED_HINTS[status]
+                    if not reached:
+                        try:
+                            diagnostics = _success_value(
+                                "entity_feeders",
+                                await call("entity_feeders", {"target_ref": target_ref}),
+                            )
+                            result["feeders"] = diagnostics["feeders"]
+                        except Exception:
+                            # Optional diagnostics must not discard a valid wait result.
+                            pass
                     return _response(result)
                 await asyncio.sleep(min(0.5, timeout_seconds - waited))
         except Exception as exc:

@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -35,7 +35,9 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
             elapsed += seconds
 
         bridge = Mock()
-        bridge.call.side_effect = lambda *_: {"result": inventory_at(elapsed)}
+        bridge.call.side_effect = lambda operation, _: {
+            "result": {"feeders": {}} if operation == "entity_feeders" else inventory_at(elapsed)
+        }
         server = create_server(bridge)
         with (
             patch("factorio_mcp.server.time") as clock,
@@ -46,9 +48,11 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
                 "wait_for_items",
                 {"target_ref": "assembler", "item": "iron-gear-wheel", "count": 100, **arguments},
             )
-        # The server must only read the existing inventory operation.
-        for call in bridge.call.call_args_list:
-            self.assertEqual(call.args, ("get_entity_inventory", {"target_ref": "assembler"}))
+        reads = bridge.call.call_args_list.copy()
+        if not result.is_error and not payload(result)["reached"]:
+            self.assertEqual(reads.pop(), call("entity_feeders", {"target_ref": "assembler"}))
+        for read in reads:
+            self.assertEqual(read, call("get_entity_inventory", {"target_ref": "assembler"}))
         return result, elapsed, sleep
 
     async def test_already_reached_returns_immediately_and_sums_roles_and_qualities(self):

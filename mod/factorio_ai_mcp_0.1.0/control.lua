@@ -140,7 +140,8 @@ local function distance_squared(a, b)
 end
 
 local function range_detail(character, position, reach)
-  return {distance = math.sqrt(distance_squared(character.position, position)), reach = reach}
+  return {distance = math.sqrt(distance_squared(character.position, position)), reach = reach,
+          character_position = {x = character.position.x, y = character.position.y}}
 end
 
 local function conflict_detail(action)
@@ -2403,6 +2404,39 @@ local function inventory_entity_state(target)
   return status ~= nil and ENTITY_STATUS_NAMES[status] or nil, recipe_name
 end
 
+local function do_entity_feeders(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  local target, _, target_error, detail = get_entity_inventory(character, params, true)
+  if not target then return nil, target_error, detail end
+  local box = target.bounding_box
+  local entities = target.surface.find_entities_filtered{
+    area = {{box.left_top.x - 3.5, box.left_top.y - 3.5},
+            {box.right_bottom.x + 3.5, box.right_bottom.y + 3.5}},
+    type = "inserter", force = character.force
+  }
+  local feeders = {}
+  for _, entity in pairs(entities) do
+    if entity.valid then
+      local drop = entity.drop_target
+      if drop and drop.valid and target.unit_number and drop.unit_number == target.unit_number then
+        local pickup = entity.pickup_target
+        feeders[#feeders + 1] = {
+          name = entity.name, x = entity.position.x, y = entity.position.y,
+          status = ENTITY_STATUS_NAMES[entity.status],
+          pickup_target = pickup and pickup.valid and pickup.name or nil
+        }
+      end
+    end
+  end
+  table.sort(feeders, function(a, b)
+    if a.x ~= b.x then return a.x < b.x end
+    return a.y < b.y
+  end)
+  for index = #feeders, 17, -1 do feeders[index] = nil end
+  return {feeders = feeders}
+end
+
 local function do_entity_inventory(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -2704,6 +2738,7 @@ local handlers = {
     return {agent_id = AGENT_ID, items = inventory_contents(character)}
   end,
   get_entity_inventory = do_entity_inventory,
+  entity_feeders = do_entity_feeders,
   get_entity_inventories = function(state, params)
     return do_batch(state, params, do_entity_inventory)
   end,

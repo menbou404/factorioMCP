@@ -1,7 +1,7 @@
 import copy
 import json
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -35,7 +35,9 @@ class ProducedItemsTests(unittest.IsolatedAsyncioTestCase):
             nonlocal elapsed
             elapsed += seconds
 
-        def read(*_):
+        def read(operation, _):
+            if operation == "entity_feeders":
+                return {"result": {"feeders": {}}}
             value = inventory_at(elapsed)
             if isinstance(value, Exception):
                 raise value
@@ -58,8 +60,11 @@ class ProducedItemsTests(unittest.IsolatedAsyncioTestCase):
                     **arguments,
                 },
             )
-        for call in bridge.call.call_args_list:
-            self.assertEqual(call.args, ("get_entity_inventory", {"target_ref": "machine"}))
+        reads = bridge.call.call_args_list.copy()
+        if not result.is_error and not payload(result)["reached"]:
+            self.assertEqual(reads.pop(), call("entity_feeders", {"target_ref": "machine"}))
+        for read in reads:
+            self.assertEqual(read, call("get_entity_inventory", {"target_ref": "machine"}))
         return result, elapsed, sleep
 
     async def test_reached_uses_delta_even_when_output_stays_empty(self):
