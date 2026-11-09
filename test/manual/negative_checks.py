@@ -2801,6 +2801,264 @@ def main():
             and bridge.call("get_agent_status")["result"]["position"] == m26_return_position,
         )
 
+    # M26-BK/BL: isolated machines and enough belts to exercise compact paging.
+    status_surface = "m26-status-compact-check"
+    status_inventory = bridge.call("get_inventory")["result"]["items"]
+    status_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def status_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;"
+            "local c=state and state.character;assert(c and c.valid);"
+            f'local name="{status_surface}";local s=game.surfaces[name];'
+            "local inv=c.get_main_inventory();assert(inv);" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m26_status:" not in raw:
+            raise RuntimeError("M26 status fixture failed: " + raw)
+        return json.loads(raw.split("m26_status:", 1)[1].strip())
+
+    try:
+        status_fixture(
+            "assert(not state.action and not state.craft_action);"
+            "assert(not s and not storage.m26_status_backup,'M26 status fixture already exists');"
+            "local b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv)};storage.m26_status_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;"
+            "s=game.create_surface(name,{width=128,height=128});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},2);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-64,63 do for y=-64,63 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,3.5},s));assert(c.reach_distance<13);"
+            'local ore=s.create_entity{name="iron-ore",position={-2.5,0.5},amount=1000000};'
+            "assert(ore and ore.valid,'M26 requires a real resource under the drill');"
+            'b.drill=s.create_entity{name="electric-mining-drill",position={-2.5,0.5},'
+            "direction=0,force=c.force};assert(b.drill and b.drill.valid);"
+            # Keep the drill supplied while it acquires its mining target. No fixture
+            # power network is needed; all writes are confined to this test surface.
+            "b.drill.energy=1000000;"
+            'b.inserter=s.create_entity{name="inserter",position={3.5,3.5},'
+            "direction=0,force=c.force};assert(b.inserter);b.inserter.active=false;"
+            'assert(s.create_entity{name="burner-inserter",position={5.5,3.5},force=c.force});'
+            'assert(s.create_entity{name="burner-mining-drill",position={-2,-4},force=c.force});'
+            'assert(s.create_entity{name="small-electric-pole",position={0.5,0.5},force=c.force});'
+            'assert(s.create_entity{name="electric-mining-drill",position={13.5,3.5},'
+            "force=c.force});"
+            'assert(s.create_entity{name="inserter",position={6.5,3.5},force="enemy"});'
+            "for x=-5,5 do for y=-13,-4 do "
+            # Skip the burner drill's occupied tiles, while retaining >100 entities.
+            "if not (x>=-3 and x<=-2 and y>=-5 and y<=-4) then "
+            'assert(s.create_entity{name="transport-belt",position={x+0.5,y+0.5},'
+            "direction=4,force=c.force}) end end end;"
+            # A blocked tile verifies compact does not change tile results.
+            's.set_tiles{{name="water",position={8,8}}};'
+            "rcon.print('m26_status:{\"ready\":true}')"
+        )
+        # mining_target may be assigned on a subsequent simulation tick. Fail loudly
+        # if this fixture cannot get the drill targeting the resource it just placed.
+        deadline = time.monotonic() + 5
+        while True:
+            target = status_fixture(
+                "local d=storage.m26_status_backup.drill;assert(d and d.valid);"
+                "d.energy=1000000;local t=d.mining_target;"
+                "if t and t.valid then d.energy=0 end;"
+                "rcon.print('m26_status:'..helpers.table_to_json({"
+                "resource=t and t.valid and t.name or nil}))"
+            )
+            if target.get("resource") == "iron-ore":
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("M26 electric drill never acquired the placed iron-ore resource")
+            time.sleep(0.1)
+
+        near = bridge.call(
+            "observe_nearby",
+            {"names": ["electric-mining-drill", "inserter", "small-electric-pole"]},
+        )["result"]["entities"]
+        drill = next(e for e in near if e["name"] == "electric-mining-drill" and e["x"] < 0)
+        far_drill = next(e for e in near if e["name"] == "electric-mining-drill" and e["x"] > 10)
+        inserter = next(e for e in near if e["name"] == "inserter" and e["owned"])
+        enemy = next(e for e in near if e["name"] == "inserter" and not e["owned"])
+        pole = next(e for e in near if e["name"] == "small-electric-pole")
+        refs = [drill["target_ref"], inserter["target_ref"]]
+        reads = [bridge.call("get_entity_inventory", {"target_ref": ref})["result"] for ref in refs]
+        for entity, result in zip((drill, inserter), reads, strict=True):
+            record(
+                "M26 inventory-less " + entity["name"] + " returns status and positions",
+                not result["inventories"]
+                and isinstance(result.get("status"), str)
+                and result.get("direction") == entity["direction"]
+                and result.get("drop_position") == entity["drop_position"]
+                and (
+                    result.get("pickup_position") == entity["pickup_position"]
+                    if entity["type"] == "inserter"
+                    else result.get("mining_target") == "iron-ore"
+                ),
+                json.dumps(result),
+            )
+        record("M26 empty inserter hand omits held_stack", "held_stack" not in reads[1])
+        status_fixture(
+            "local i=storage.m26_status_backup.inserter;assert(i and i.valid);"
+            'assert(i.held_stack.set_stack{name="iron-plate",quality="normal",count=1});'
+            "rcon.print('m26_status:{\"holding\":true}')"
+        )
+        holding = bridge.call("get_entity_inventory", {"target_ref": refs[1]})["result"]
+        record(
+            "M26 held_stack reports name quality and count",
+            holding.get("held_stack") == {"name": "iron-plate", "quality": "normal", "count": 1},
+            json.dumps(holding),
+        )
+        batch = bridge.call("get_entity_inventories", {"target_refs": refs})["result"]
+        record(
+            "M26 status-only inventory batch succeeds for both machines",
+            batch["succeeded"] == 2
+            and batch["failed"] == 0
+            and all(e["ok"] and not e["result"]["inventories"] for e in batch["results"])
+            and batch["results"][0]["result"].get("mining_target") == "iron-ore"
+            and batch["results"][1]["result"] == holding,
+            json.dumps(batch),
+        )
+        burners = bridge.call(
+            "observe_nearby", {"names": ["burner-inserter", "burner-mining-drill"]}
+        )["result"]["entities"]
+        for entity in burners:
+            result = bridge.call("get_entity_inventory", {"target_ref": entity["target_ref"]})[
+                "result"
+            ]
+            record(
+                "M26 " + entity["name"] + " keeps fuel inventory and adds positions",
+                "fuel" in result["inventories"]
+                and "status" in result
+                and result.get("drop_position") == entity["drop_position"]
+                and (
+                    result.get("pickup_position") == entity["pickup_position"]
+                    and "held_stack" not in result
+                    if entity["type"] == "inserter"
+                    else "mining_target" not in result
+                ),
+                json.dumps(result),
+            )
+        for entity in (drill, inserter):
+            label = "M26 transfer still rejects " + entity["name"]
+            expect_error(
+                label,
+                "transfer_item",
+                {
+                    "target_ref": entity["target_ref"],
+                    "direction": "to_entity",
+                    "inventory_role": "fuel",
+                    "item": "coal",
+                    "count": 1,
+                },
+                {"invalid_target"},
+            )
+            record(
+                label + " as unsupported_entity",
+                errors[label].detail["reason"] == "unsupported_entity",
+            )
+        for label, entity, code in (
+            ("M26 reachable pole remains unsupported", pole, "invalid_target"),
+            ("M26 distant drill remains out of range", far_drill, "out_of_range"),
+            ("M26 enemy inserter remains forbidden", enemy, "invalid_target"),
+        ):
+            expect_error(
+                label, "get_entity_inventory", {"target_ref": entity["target_ref"]}, {code}
+            )
+        record(
+            "M26 enemy inserter rejection retains other_force reason",
+            errors["M26 enemy inserter remains forbidden"].detail.get("reason") == "other_force",
+        )
+
+        whitelist = {
+            "target_ref",
+            "name",
+            "x",
+            "y",
+            "direction",
+            "status",
+            "recipe",
+            "belt_items",
+            "underground_type",
+            "neighbour",
+            "pickup_position",
+            "drop_position",
+            "electric_network_id",
+        }
+        page = 0
+        total = 0
+        while True:
+            params = {"owned_only": True, "entity_offset": page}
+            full = bridge.call("observe_nearby", params)["result"]
+            compact = bridge.call("observe_nearby", {**params, "compact": True})["result"]
+            explicit_false = bridge.call("observe_nearby", {**params, "compact": False})["result"]
+            record(
+                f"M26 compact page {page} preserves references and only whitelisted fields",
+                full == explicit_false
+                and "compact" not in full["filters"]
+                and compact["filters"] == {**full["filters"], "compact": True}
+                and compact["entity_total"] == full["entity_total"]
+                and compact.get("next_entity_offset") == full.get("next_entity_offset")
+                and compact["entities"]
+                == [
+                    {k: v for k, v in entity.items() if k in whitelist}
+                    for entity in full["entities"]
+                ]
+                and compact["resources"] == full["resources"]
+                and compact["blocked_tiles"] == full["blocked_tiles"]
+                and compact["blocked_tile_total"] == full["blocked_tile_total"]
+                and compact.get("next_tile_offset") == full.get("next_tile_offset")
+                and len(json.dumps(compact)) < len(json.dumps(full)),
+                f"full={len(json.dumps(full))}, compact={len(json.dumps(compact))}",
+            )
+            total += len(compact["entities"])
+            if "next_entity_offset" not in full:
+                break
+            page = full["next_entity_offset"]
+        record(
+            "M26 compact exercises multiple pages without losing entities",
+            page > 0 and total == full["entity_total"],
+        )
+        compact_refs = bridge.call(
+            "observe_nearby", {"owned_only": True, "names": ["inserter"], "compact": True}
+        )["result"]["entities"]
+        record(
+            "M26 compact target_ref remains usable for inventory reads",
+            bridge.call("get_entity_inventory", {"target_ref": compact_refs[0]["target_ref"]})[
+                "result"
+            ]
+            == holding,
+        )
+        for compact in (0, 1, "true", [], {}):
+            expect_error(
+                "M26 non-boolean compact rejected " + repr(compact),
+                "observe_nearby",
+                {"compact": compact},
+                {"invalid_input"},
+            )
+    finally:
+        status_fixture(
+            "local b=storage.m26_status_backup;if b then "
+            "assert(not state.action and not state.craft_action);"
+            "assert(c.teleport(b.position,b.surface),'M26 status position restore failed');"
+            # Only slots stashed above are swapped back, even if setup failed partway.
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "b.inventory.destroy();storage.m26_status_backup=nil;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil end;"
+            "rcon.print('m26_status:{\"restored\":true}')"
+        )
+        observed_map_cells.pop(status_surface, None)
+        record(
+            "M26 status fixture restores exact inventory and position",
+            bridge.call("get_inventory")["result"]["items"] == status_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == status_position,
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

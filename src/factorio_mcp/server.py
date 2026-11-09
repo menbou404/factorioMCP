@@ -134,6 +134,15 @@ MACHINE_STATUS_DESCRIPTION = (
     " waiting_for_space_in_destination for inserters means their target is full."
 )
 
+INVENTORY_MACHINE_DESCRIPTION = (
+    " Owned inserter and mining-drill types without inventory roles also succeed within"
+    " interact reach, with empty inventories; other unsupported entities return invalid_target."
+    " Inserters include pickup_position, drop_position, and held_stack = {name, quality, count}"
+    " only when holding an item. Mining drills include drop_position and mining_target"
+    " (resource name) when present. Both retain direction and include status when available."
+    " These reads do not extend transfer_item support."
+)
+
 MACHINE_BUFFER_DESCRIPTION = (
     " Assemblers and furnaces stop with full_output once the result slot holds a"
     " recipe-dependent amount. Inserters fill machine and lab inputs only up to a small buffer"
@@ -649,6 +658,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Inserters, including long-handed-inserter, include pickup_position and drop_position. "
             "Use check_placement for snapped position and valid_directions before building. "
             "Follow offsets for additional pages."
+            " Use compact=true when inspecting many belts or machines: it omits bounding boxes"
+            " and other per-entity details, and target_ref stays usable. Entity entries keep only"
+            " target_ref, name, x, y, direction, status, recipe, belt_items, underground_type,"
+            " neighbour, pickup_position, drop_position, and electric_network_id when present."
+            " Counts, paging, resources and blocked_tiles are unchanged; compact defaults to false."
             " Each call also records fully observed 8x8 cells for get_explored_map, "
             "and seen resources in partially observed cells, independent of filters and paging."
             + MACHINE_STATUS_DESCRIPTION
@@ -663,6 +677,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         owned_only: Annotated[bool, Field(strict=True)] = False,
         include_resources: Annotated[bool, Field(strict=True)] = True,
         include_tiles: Annotated[bool, Field(strict=True)] = True,
+        compact: Annotated[bool, Field(strict=True)] = False,
     ) -> CallToolResult:
         params: dict[str, Any] = {"entity_offset": entity_offset, "tile_offset": tile_offset}
         if radius != 16:
@@ -673,6 +688,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             params["names"] = names
         if owned_only:
             params["owned_only"] = owned_only
+        if compact:
+            params["compact"] = compact
         if not include_resources:
             params["include_resources"] = include_resources
         if not include_tiles:
@@ -1120,6 +1137,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Read accessible inventory sections of a nearby observed structure."
+            + INVENTORY_MACHINE_DESCRIPTION
             + MACHINE_STATUS_DESCRIPTION
             + MACHINE_BUFFER_DESCRIPTION
             + INVENTORY_RECIPE_DESCRIPTION
@@ -1280,6 +1298,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and result or error/detail/hint using the same error codes as get_entity_inventory, "
             "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
             "even if all entries failed."
+            + INVENTORY_MACHINE_DESCRIPTION
             + MACHINE_STATUS_DESCRIPTION
             + MACHINE_BUFFER_DESCRIPTION
             + INVENTORY_RECIPE_DESCRIPTION

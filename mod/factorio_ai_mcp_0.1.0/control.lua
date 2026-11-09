@@ -3,6 +3,10 @@ local AGENT_ID = "agent-1"
 local MAX_OBSERVATIONS = 100
 local MAX_RECENT_OBSERVATIONS = 8
 local OBSERVATION_RADIUS = 16
+local COMPACT_ENTITY_FIELDS = {
+  "target_ref", "name", "x", "y", "direction", "status", "recipe", "belt_items",
+  "underground_type", "neighbour", "pickup_position", "drop_position", "electric_network_id"
+}
 local MAP_CELL_SIZE = 8
 local MAX_EXPLORED_CELLS = 16384
 local TARGET_TTL_TICKS = 60 * 60
@@ -1162,7 +1166,7 @@ local function do_observe(state, params)
   if type(radius) ~= "number" or radius ~= radius or radius < 1 or radius > 16 then
     return nil, "invalid_input"
   end
-  for _, name in ipairs({"owned_only", "include_resources", "include_tiles"}) do
+  for _, name in ipairs({"owned_only", "include_resources", "include_tiles", "compact"}) do
     if params[name] ~= nil and type(params[name]) ~= "boolean" then
       return nil, "invalid_input"
     end
@@ -1174,6 +1178,7 @@ local function do_observe(state, params)
                    owned_only = params.owned_only == true,
                    include_resources = params.include_resources ~= false,
                    include_tiles = params.include_tiles ~= false}
+  if params.compact == true then filters.compact = true end
   local entities = character.surface.find_entities_filtered{
     position = character.position, radius = radius
   }
@@ -1320,6 +1325,11 @@ local function do_observe(state, params)
         return a.quality < b.quality
       end)
       if #items > 0 then observed.belt_items = items end
+    end
+    if filters.compact then
+      local compact = {}
+      for _, field in ipairs(COMPACT_ENTITY_FIELDS) do compact[field] = observed[field] end
+      observed = compact
     end
     output[#output + 1] = observed
   end
@@ -2353,13 +2363,17 @@ local function do_set_recipe(state, params)
           spilled_items = #spilled > 0 and spilled or nil}
 end
 
-local function get_entity_inventory(character, params)
+local function get_entity_inventory(character, params, allow_status_only)
   local target, err, detail = target_entity(character, params, character.reach_distance)
   if not target then return nil, nil, err, detail end
   if target.force ~= character.force then
     return nil, nil, "invalid_target", {entity = target.name, reason = "other_force"}
   end
   local roles = INVENTORY_ROLES[target.name]
+  -- Only inventory reads accept machines without inventories. Transfers retain
+  -- the existing unsupported_entity error, including its supported-entity list.
+  if not roles and allow_status_only and
+     (target.type == "inserter" or target.type == "mining-drill") then roles = {} end
   if not roles then
     return nil, nil, "invalid_target", {entity = target.name, reason = "unsupported_entity",
                                        supported_entities = sorted_keys(INVENTORY_ROLES)}
@@ -2392,7 +2406,7 @@ end
 local function do_entity_inventory(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  local target, roles, target_error, detail = get_entity_inventory(character, params)
+  local target, roles, target_error, detail = get_entity_inventory(character, params, true)
   if not target then return nil, target_error, detail end
   local inventories = {}
   for role, inventory_id in pairs(roles) do
@@ -2422,14 +2436,26 @@ local function do_entity_inventory(state, params)
     end
     table.sort(recipe_products)
   end
+  local pickup_position, drop_position, held_stack, mining_target
+  if target.type == "inserter" then
+    pickup_position, drop_position = target.pickup_position, target.drop_position
+    local stack = target.held_stack
+    if stack and stack.valid_for_read then
+      held_stack = {name = stack.name, quality = stack.quality.name, count = stack.count}
+    end
+  elseif target.type == "mining-drill" then
+    drop_position = target.drop_position
+    local resource = target.mining_target
+    if resource and resource.valid then mining_target = resource.name end
+  end
   return {name = target.name, type = target.type,
           inventories = inventories, status = status, recipe = recipe,
           products_finished = products_finished, recipe_products = recipe_products,
           products_since_recipe = products_since_recipe,
           recipe_product_amounts = recipe_product_amounts,
           direction = target.direction,
-          drop_position = target.name == "burner-mining-drill" and
-                          target.drop_position or nil}
+          pickup_position = pickup_position, drop_position = drop_position,
+          held_stack = held_stack, mining_target = mining_target}
 end
 
 local function transfer_inventory_contents(inventory)
