@@ -31,7 +31,7 @@ class PlaceLineTests(unittest.IsolatedAsyncioTestCase):
             "same reach, observation and inventory checks",
             "Build reach is 10 tiles",
             "near the middle",
-            "about 21 tiles per call",
+            "about 19 tiles per call",
             "stops at the first tile",
             "keeps earlier tiles",
             "walk near next_position",

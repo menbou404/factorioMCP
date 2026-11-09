@@ -45,6 +45,7 @@
 | [32-hands-off-automation.md](32-hands-off-automation.md) | 手運びなしの自動化に向けた修正（M24） |
 | [33-trial19-fixes.md](33-trial19-fixes.md) | 19 回目の試行で見つかった問題の修正（M25） |
 | [34-trial20-fixes.md](34-trial20-fixes.md) | 20 回目の試行で見つかった問題の修正（M26） |
+| [35-trial21-fixes.md](35-trial21-fixes.md) | 21 回目の試行で見つかった問題の修正（M27） |
 
 ## 共通の不変条件
 
