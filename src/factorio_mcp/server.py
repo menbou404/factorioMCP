@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import threading
 import time
@@ -21,6 +22,7 @@ NonNegative = Annotated[int, Field(ge=0, strict=True)]
 Count = Annotated[int, Field(ge=1, le=100, strict=True)]
 RequiredText = Annotated[str, Field(min_length=1)]
 Coordinate = Annotated[float, Field(allow_inf_nan=False)]
+LineCoordinate = Annotated[float, Field(ge=-1000000, le=1000000, allow_inf_nan=False, strict=True)]
 ObservationRadius = Annotated[float, Field(ge=1, le=16, allow_inf_nan=False, strict=True)]
 MoveWithin = Annotated[float, Field(ge=0.5, le=10, allow_inf_nan=False, strict=True)]
 FilterNames = Annotated[
@@ -331,6 +333,10 @@ OPERATION_HINTS = {
         "Check the recipe name; list_craftable_recipes lists unlocked hand crafting recipes."
     ),
     ("place_entity", "invalid_target"): "Choose an item supported by place_entity.",
+    ("place_line", "invalid_target"): (
+        "Choose an item whose place_result is a transport-belt or pipe; "
+        "use place_entity for single tiles and undergrounds."
+    ),
 }
 
 
@@ -381,6 +387,17 @@ def _normalize_batch_result(result: dict[str, Any], operation: str | None = None
 
 
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
+    if operation in ("place_line", "") and "next_position" in result and result.get("stopped"):
+        if isinstance(result.get("detail"), dict):
+            result["detail"] = _normalize_error_detail(result["detail"])
+        hint = _hint("place_line", result["stopped"])
+        if (result.get("detail") or {}).get("reason") == "different_direction":
+            hint = "Rotate or recover the belt at next_position to match this line's direction."
+        result["hint"] = (
+            (hint + " " if hint else "")
+            + "Walk near next_position and call place_line again from it to the original end; "
+            "already placed tiles are skipped. Use place_entity if only one tile remains."
+        )
     batch_operations = {
         "transfer_items": "transfer_item",
         "place_entities": "place_entity",
@@ -956,6 +973,54 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                 )
             params["underground_type"] = underground_type
         return await invoke("place_entity", params)
+
+    @server.tool(
+        description=(
+            "Place a straight line of transport-belt or pipe items, 2-64 tiles inclusive. "
+            "Endpoints are snapped to tile centres and must share a row or column. "
+            "Direction follows travel from start to end: east 4, south 8, west 12, north 0. "
+            "It does not walk and uses the same reach, observation and inventory checks as "
+            "place_entity. Build reach is 10 tiles, so standing near the middle of the segment "
+            "places about 21 tiles per call. The call stops at the first tile it cannot place "
+            "and keeps earlier tiles. On stop, resolve stopped/detail, walk near next_position "
+            "and call again from it to the original end (already placed tiles are skipped). "
+            "Same-name belts of different direction stop with blocked/different_direction; "
+            "pipes ignore direction for already_present. To turn a corner, start the next line "
+            "on the tile that the previous line's last belt points at. Use place_entity for "
+            "single tiles and undergrounds. Walking/mining causes action_conflict for the "
+            "whole call; crafting is allowed. Returns ok: true even if placed=0; complete "
+            "reports whether the whole line finished. Summary includes requested, placed, "
+            "already_present, direction, first_position, last_position (if any), next_position "
+            "and stopped/detail/hint on stop, and merged collected_items when picked up."
+        )
+    )
+    async def place_line(
+        item: RequiredText,
+        surface: RequiredText,
+        from_x: LineCoordinate,
+        from_y: LineCoordinate,
+        to_x: LineCoordinate,
+        to_y: LineCoordinate,
+    ) -> CallToolResult:
+        dx, dy = math.floor(to_x) - math.floor(from_x), math.floor(to_y) - math.floor(from_y)
+        if (dx and dy) or not 2 <= abs(dx) + abs(dy) + 1 <= 64:
+            return _error_response(
+                BridgeError(
+                    "invalid_input", "Line endpoints must share a row or column, 2-64 tiles."
+                ),
+                "place_line",
+            )
+        return await invoke(
+            "place_line",
+            {
+                "item": item,
+                "surface": surface,
+                "from_x": from_x,
+                "from_y": from_y,
+                "to_x": to_x,
+                "to_y": to_y,
+            },
+        )
 
     @server.tool(
         description=(

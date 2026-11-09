@@ -2569,6 +2569,238 @@ def main():
         observed_map_cells.pop(m25_surface, None)
         record("M25 fixture preserves held items", items() == before_m25)
 
+    # M26-BJ: use an isolated, explicitly cleared surface and stash the *actual*
+    # original stacks, including metadata and slots. Fixture items never consume
+    # the production/logistics scripts' wood, belts, or other materials.
+    m26_surface = "m26-place-line-check"
+    before_m26 = bridge.call("get_inventory")["result"]["items"]
+    m26_return_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def line_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;"
+            "local c=state and state.character;assert(c and c.valid);"
+            f'local name="{m26_surface}";local s=game.surfaces[name];'
+            "local inv=c.get_main_inventory();assert(inv);" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            # Do not retry mutations: a missing acknowledgement must fail loudly.
+            raw = client.run(command)
+        if "m26_fixture:" not in raw:
+            raise RuntimeError("M26 line fixture failed: " + raw)
+        return json.loads(raw.split("m26_fixture:", 1)[1].strip())
+
+    def reset_line_fixture(belts=80, extra=""):
+        return line_fixture(
+            "assert(s and not state.action and not state.craft_action);"
+            "for _,e in pairs(s.find_entities()) do "
+            'if e.type~="character" then e.destroy() end end;'
+            "assert(c.teleport({0.5,3.5},s));inv.clear();"
+            f'assert(inv.insert{{name="transport-belt",count={belts}}}=={belts});'
+            + extra
+            + "rcon.print('m26_fixture:{\"reset\":true}')"
+        )
+
+    def line(start=(0.5, 0.5), end=(5.5, 0.5), item="transport-belt"):
+        return {
+            "item": item,
+            "surface": m26_surface,
+            "from_x": start[0],
+            "from_y": start[1],
+            "to_x": end[0],
+            "to_y": end[1],
+        }
+
+    def fixture_belts():
+        return line_fixture(
+            'local found={};for _,e in pairs(s.find_entities_filtered{type="transport-belt"}) '
+            "do found[#found+1]={x=e.position.x,y=e.position.y,direction=e.direction} end;"
+            "rcon.print('m26_fixture:'..helpers.table_to_json({belts=found}))"
+        )["belts"]
+
+    try:
+        line_fixture(
+            "assert(not state.action and not state.craft_action);"
+            "assert(not s and not storage.m26_line_backup,'M26 fixture already exists');"
+            "storage.m26_line_backup={position={x=c.position.x,y=c.position.y},"
+            "surface=c.surface,inventory=game.create_inventory(#inv)};"
+            "local backup=storage.m26_line_backup.inventory;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(backup[i].swap_stack(inv[i])) end end;storage.m26_line_backup.stashed=true;"
+            "s=game.create_surface(name,{width=128,height=128});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},2);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-64,63 do for y=-64,63 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,3.5},s),'M26 cannot find a clear test location');"
+            "assert(c.build_distance==10,'M26 expects build reach 10');"
+            "rcon.print('m26_fixture:{\"ready\":true}')"
+        )
+        for start, end, direction in (
+            ((-6.2, 0.1), (-1.1, 0.9), 4),
+            ((0.5, -4.5), (0.5, 0.5), 8),
+            ((5.5, 0.5), (0.5, 0.5), 12),
+            ((0.5, 0.5), (0.5, -4.5), 0),
+        ):
+            reset_line_fixture()
+            params = line(start, end)
+            request_id = f"m26-line-{direction}-{time.time_ns()}"
+            response = send_with_id("place_line", params, request_id)
+            built = response["result"]
+            belts = fixture_belts()
+            fx, fy = math.floor(start[0]) + 0.5, math.floor(start[1]) + 0.5
+            tx, ty = math.floor(end[0]) + 0.5, math.floor(end[1]) + 0.5
+            dx, dy = (tx - fx) / 5, (ty - fy) / 5
+            expected = {(fx + i * dx, fy + i * dy, direction) for i in range(6)}
+            record(
+                f"M26 straight line direction {direction} builds each belt with travel direction",
+                built.get("complete") is True
+                and built["requested"] == built["placed"] == 6
+                and built["already_present"] == 0
+                and built["direction"] == direction
+                and built["first_position"] == {"x": fx, "y": fy}
+                and built["last_position"] == {"x": tx, "y": ty}
+                and "next_position" not in built
+                and {(b["x"], b["y"], b["direction"]) for b in belts} == expected,
+                json.dumps(built),
+            )
+            after_first = items()
+            record(
+                "M26 request id replay returns cached progress without consuming more belts",
+                send_with_id("place_line", params, request_id) == response
+                and items() == after_first
+                and bridge.call("get_request_result", {"request_id": request_id})["result"][
+                    "original_response"
+                ]
+                == response,
+            )
+            repeated = bridge.call("place_line", params)["result"]
+            record(
+                "M26 repeated line skips every belt",
+                repeated["placed"] == 0
+                and repeated["already_present"] == repeated["requested"] == 6
+                and repeated["complete"] is True
+                and items() == after_first,
+                json.dumps(repeated),
+            )
+
+        reset_line_fixture()
+        params = line(end=(25.5, 0.5))
+        partial = bridge.call("place_line", params)["result"]
+        next_tile = {"x": 0.5 + partial["placed"], "y": 0.5}
+        record(
+            "M26 reach stop identifies the first unplaced tile and leaves later tiles empty",
+            partial["complete"] is False
+            and partial["stopped"] == "out_of_range"
+            and 0 < partial["placed"] < partial["requested"] == 26
+            and partial["next_position"] == next_tile
+            and partial["last_position"] == {"x": next_tile["x"] - 1, "y": 0.5}
+            and {(b["x"], b["y"]) for b in fixture_belts()}
+            == {(0.5 + i, 0.5) for i in range(partial["placed"])},
+            json.dumps(partial),
+        )
+        action(
+            "move_to",
+            {"surface": m26_surface, "x": (next_tile["x"] + 25.5) / 2, "y": 3.5, "within": 0.5},
+        )
+        resumed = bridge.call("place_line", line((next_tile["x"], next_tile["y"]), (25.5, 0.5)))[
+            "result"
+        ]
+        record(
+            "M26 walking near next_position and resuming finishes the line",
+            resumed["complete"] is True
+            and resumed["placed"] + partial["placed"] == 26
+            and len(fixture_belts()) == 26,
+            json.dumps(resumed),
+        )
+
+        reset_line_fixture(
+            extra='assert(s.create_entity{name="wooden-chest",position={3.5,0.5},force=c.force});'
+        )
+        blocked = bridge.call("place_line", line())["result"]
+        record(
+            "M26 chest obstacle stops before its tile and preserves the prefix",
+            blocked["complete"] is False
+            and blocked["stopped"] == "blocked"
+            and blocked["placed"] == 3
+            and blocked["next_position"] == {"x": 3.5, "y": 0.5}
+            and {b["x"] for b in fixture_belts()} == {0.5, 1.5, 2.5},
+            json.dumps(blocked),
+        )
+        reset_line_fixture(
+            extra='assert(s.create_entity{name="transport-belt",position={3.5,0.5},'
+            "direction=0,force=c.force});"
+        )
+        turned = bridge.call("place_line", line())["result"]
+        record(
+            "M26 different belt direction stops with its existing direction",
+            turned["complete"] is False
+            and turned["stopped"] == "blocked"
+            and turned["placed"] == 3
+            and turned["next_position"] == {"x": 3.5, "y": 0.5}
+            and turned["detail"]["reason"] == "different_direction"
+            and turned["detail"]["existing_direction"] == 0,
+            json.dumps(turned),
+        )
+        reset_line_fixture(belts=2)
+        short = bridge.call("place_line", line())["result"]
+        record(
+            "M26 missing belts stops after consuming only the available prefix",
+            short["complete"] is False
+            and short["stopped"] == "missing_materials"
+            and short["placed"] == 2
+            and short["next_position"] == {"x": 2.5, "y": 0.5}
+            and items().get("transport-belt", 0) == 0
+            and {b["x"] for b in fixture_belts()} == {0.5, 1.5},
+            json.dumps(short),
+        )
+        expect_error(
+            "M26 diagonal line rejected", "place_line", line(end=(3.5, 2.5)), {"invalid_input"}
+        )
+        expect_error(
+            "M26 non-line item rejected",
+            "place_line",
+            line(item="wooden-chest"),
+            {"invalid_target"},
+        )
+        record(
+            "M26 non-line item explains not_line_placeable",
+            errors["M26 non-line item rejected"].detail.get("reason") == "not_line_placeable",
+        )
+
+        reset_line_fixture(
+            extra='assert(inv.insert{name="pipe",count=3}==3);'
+            'assert(s.create_entity{name="pipe",position={1.5,0.5},direction=8,force=c.force});'
+        )
+        pipes = bridge.call("place_line", line(end=(2.5, 0.5), item="pipe"))["result"]
+        record(
+            "M26 existing pipe ignores direction",
+            pipes["complete"] is True and pipes["placed"] == 2 and pipes["already_present"] == 1,
+            json.dumps(pipes),
+        )
+    finally:
+        line_fixture(
+            "local b=storage.m26_line_backup;"
+            "if b then "
+            "if state.action then c.walking_state={walking=false};state.action=nil end;"
+            "assert(not state.craft_action);"
+            "assert(c.teleport(b.position,b.surface),'M26 could not restore character position');"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "b.inventory.destroy();storage.m26_line_backup=nil;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil end;"
+            "rcon.print('m26_fixture:{\"restored\":true}')"
+        )
+        observed_map_cells.pop(m26_surface, None)
+        record(
+            "M26 restores the exact original inventory and character position",
+            bridge.call("get_inventory")["result"]["items"] == before_m26
+            and bridge.call("get_agent_status")["result"]["position"] == m26_return_position,
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
