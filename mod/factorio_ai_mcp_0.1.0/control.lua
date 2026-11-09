@@ -1963,9 +1963,13 @@ local function valid_underground_type(params)
           (params.underground_type == "input" or params.underground_type == "output"))
 end
 
-local function validate_placement(state, character, params, require_item)
+local function validate_placement(state, character, params, require_item, line_placement)
   if not valid_underground_type(params) then return nil, "invalid_input" end
-  if type(params.item) ~= "string" or not PLACEABLE_ITEMS[params.item] then
+  local item_proto = type(params.item) == "string" and prototypes.item[params.item] or nil
+  local prototype = item_proto and item_proto.place_result
+  local line_placeable = prototype and
+                         (prototype.type == "transport-belt" or prototype.type == "pipe")
+  if not item_proto or not (PLACEABLE_ITEMS[params.item] or (line_placement and line_placeable)) then
     return nil, "invalid_target"
   end
   local direction = params.direction or defines.direction.north
@@ -1977,8 +1981,6 @@ local function validate_placement(state, character, params, require_item)
      math.abs(params.x) > 1000000 or math.abs(params.y) > 1000000 then
     return nil, "invalid_input"
   end
-  local item_proto = prototypes.item[params.item]
-  local prototype = item_proto and item_proto.place_result
   local requested_position = {x = params.x, y = params.y}
   local position = prototype and snapped_position(prototype, requested_position, direction) or
                    requested_position
@@ -2091,11 +2093,11 @@ local function do_check_placement(state, params)
           reason_detail = blocked.reason_detail}
 end
 
-local function do_place(state, params)
+local function do_place(state, params, line_placement)
   local character, err = require_character(state)
   if not character then return nil, err end
   if state.action then return nil, "action_conflict", conflict_detail(state.action) end
-  local placement, reason, detail = validate_placement(state, character, params, true)
+  local placement, reason, detail = validate_placement(state, character, params, true, line_placement)
   if not placement then return nil, reason, detail end
   local inventory = placement.inventory
   local collected_items = placement.ground_items
@@ -2108,7 +2110,7 @@ local function do_place(state, params)
       return nil, "blocked", blocked
     end
     -- Re-run all existing checks in this tick, after the items have been moved.
-    placement, reason, detail = validate_placement(state, character, params, true)
+    placement, reason, detail = validate_placement(state, character, params, true, line_placement)
     if not placement then
       detail = detail or {}
       detail.collected_items = collected_items
@@ -2149,6 +2151,96 @@ local function do_place(state, params)
     local network_id = created.electric_network_id
     result.electric_network_connected = network_id ~= nil
     result.electric_network_id = network_id
+  end
+  return result
+end
+
+local function do_place_line(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
+  if params.surface ~= character.surface.name then return nil, "invalid_input" end
+  for _, key in ipairs({"from_x", "from_y", "to_x", "to_y"}) do
+    local value = params[key]
+    if type(value) ~= "number" or value ~= value or math.abs(value) > 1000000 then
+      return nil, "invalid_input"
+    end
+  end
+  local first = {x = math.floor(params.from_x) + 0.5, y = math.floor(params.from_y) + 0.5}
+  local last = {x = math.floor(params.to_x) + 0.5, y = math.floor(params.to_y) + 0.5}
+  local dx, dy = last.x - first.x, last.y - first.y
+  local requested = math.abs(dx) + math.abs(dy) + 1
+  if (dx ~= 0 and dy ~= 0) or requested < 2 or requested > 64 then
+    return nil, "invalid_input"
+  end
+  local item_proto = type(params.item) == "string" and prototypes.item[params.item] or nil
+  local prototype = item_proto and item_proto.place_result
+  if not prototype or (prototype.type ~= "transport-belt" and prototype.type ~= "pipe") then
+    return nil, "invalid_target", {reason = "not_line_placeable"}
+  end
+  local direction = dx > 0 and 4 or (dx < 0 and 12 or (dy > 0 and 8 or 0))
+  local step_x, step_y = dx == 0 and 0 or dx / math.abs(dx), dy == 0 and 0 or dy / math.abs(dy)
+  local result = {item = params.item, name = prototype.name, direction = direction,
+                  requested = requested, placed = 0, already_present = 0,
+                  complete = false, first_position = first}
+  local collected = {}
+  local function merge_collected(items)
+    for _, item in ipairs(items or {}) do
+      collected[item.name] = collected[item.name] or {}
+      local qualities = collected[item.name]
+      qualities[item.quality] = (qualities[item.quality] or 0) + item.count
+    end
+  end
+  for index = 0, requested - 1 do
+    local position = {x = first.x + index * step_x, y = first.y + index * step_y}
+    local existing
+    for _, entity in ipairs(character.surface.find_entities_filtered{
+      name = prototype.name, position = position, force = character.force
+    }) do
+      if entity.position.x == position.x and entity.position.y == position.y then
+        existing = entity
+        break
+      end
+    end
+    if existing then
+      if prototype.type == "pipe" or existing.direction == direction then
+        result.already_present = result.already_present + 1
+      else
+        result.stopped = "blocked"
+        result.detail = {reason = "different_direction", existing_direction = existing.direction}
+      end
+    else
+      -- Keep earlier progress even if a placement handler raises, as do_batch does.
+      local ok, placed, reason, detail = pcall(do_place, state, {
+        item = params.item, surface = params.surface, x = position.x, y = position.y,
+        direction = direction
+      }, true)
+      if not ok then
+        log("AI MCP line handler error: " .. tostring(placed))
+        reason = "internal_error"
+      end
+      if reason then
+        result.stopped, result.detail = reason, detail
+        merge_collected(detail and detail.collected_items)
+      else
+        result.placed = result.placed + 1
+        merge_collected(placed and placed.collected_items)
+      end
+    end
+    if result.stopped then
+      result.next_position = position
+      break
+    end
+    result.last_position = position
+  end
+  result.complete = result.stopped == nil
+  for _, name in ipairs(sorted_keys(collected)) do
+    for _, quality in ipairs(sorted_keys(collected[name])) do
+      result.collected_items = result.collected_items or {}
+      result.collected_items[#result.collected_items + 1] = {
+        name = name, quality = quality, count = collected[name][quality]
+      }
+    end
   end
   return result
 end
@@ -2608,6 +2700,7 @@ local handlers = {
   mine_entity = do_mine,
   craft = do_craft,
   place_entity = do_place,
+  place_line = do_place_line,
   place_entities = function(state, params) return do_batch(state, params, do_place) end,
   check_placement = do_check_placement,
   rotate_entity = do_rotate,
@@ -2661,7 +2754,8 @@ commands.add_command("ai_mcp", "AI MCP bridge (RCON only)", function(command)
   if request.operation == "move_to" or request.operation == "mine_entity" or
      request.operation == "cancel_action" or request.operation == "craft" or
      request.operation == "place_entity" or request.operation == "transfer_item" or
-     request.operation == "place_entities" or request.operation == "transfer_items" or
+     request.operation == "place_entities" or request.operation == "place_line" or
+     request.operation == "transfer_items" or
      request.operation == "rotate_entity" or request.operation == "set_recipe" or
      request.operation == "start_research" then
     state.processed[request_id] = response
