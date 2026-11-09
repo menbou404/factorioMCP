@@ -149,15 +149,35 @@ def main():
         "y": 6,
         "direction": 0,
     }
-    checked = call("check_placement", drill_params)
-    assert checked["placeable"], checked
-    resources = checked["mining_area_resources"]
-    assert resources and all(r["name"] == "iron-ore" and r["tiles"] > 0 for r in resources), checked
-    placed = call("place_entity", drill_params)
-    assert placed["mining_area_resources"] == resources, (checked, placed)
-    assert "electric_network_connected" not in placed and "electric_network_id" not in placed, (
-        placed
-    )
+    # M24-BG: reuse the unfueled drill to cover east, then restore north for production.
+    for direction in (4, 0):
+        # Non-centred coordinates verify that the preview uses the snapped centre (6, 6).
+        params = {**drill_params, "x": 6.24, "y": 5.76, "direction": direction}
+        checked = call("check_placement", params)
+        assert checked["placeable"], checked
+        resources = checked["mining_area_resources"]
+        assert resources and all(r["name"] == "iron-ore" and r["tiles"] > 0 for r in resources), (
+            checked
+        )
+        placed = call("place_entity", params)
+        assert placed["mining_area_resources"] == resources, (checked, placed)
+        assert "electric_network_connected" not in placed and "electric_network_id" not in placed, (
+            placed
+        )
+        blocked = call("check_placement", params)
+        assert not blocked["placeable"], blocked
+        for preview in (checked, blocked):
+            for axis in ("x", "y"):
+                assert (
+                    abs(preview["drop_position"][axis] - placed["drop_position"][axis]) <= 0.02
+                ), (
+                    direction,
+                    preview,
+                    placed,
+                )
+        print("PASS M24-BG drill drop preview and placement", direction, flush=True)
+        if direction == 4:
+            action("mine_entity", {"target_ref": placed["target_ref"], "count": 1})
     print("PASS M22-BA drill preview and placement mining area", json.dumps(resources), flush=True)
     print("drill", json.dumps(inventory("burner-mining-drill")), flush=True)
     transfer("burner-mining-drill", "fuel", "coal", 2)
