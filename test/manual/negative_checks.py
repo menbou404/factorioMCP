@@ -2392,6 +2392,183 @@ def main():
         json.dumps(limited),
     )
 
+    # M25-BH/BI: isolate sightings from earlier full observations in this save.
+    # Only the disposable-save harness creates/teleports; the tools still observe and walk.
+    return_position = bridge.call("get_agent_status")["result"]["position"]
+    before_m25 = items()
+    m25_surface = "m25-partial-map-check"
+    m25_action_id = None
+
+    def partial_map_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;"
+            "local c=state and state.character;assert(c and c.valid);"
+            f'local name="{m25_surface}";local s=game.surfaces[name];' + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+            if "m25_fixture:" not in raw:
+                raw = client.run(command)
+        if "m25_fixture:" not in raw:
+            raise RuntimeError("Missing M25 fixture response: " + raw)
+        return json.loads(raw.split("m25_fixture:", 1)[1].strip())
+
+    def coal_map():
+        return bridge.call("get_explored_map", {"limit": 50, "resource_names": ["coal"]})["result"]
+
+    def coal_summary(observation):
+        return next((entry for entry in observation["resources"] if entry["name"] == "coal"), None)
+
+    try:
+        setup = partial_map_fixture(
+            "assert(not state.action and not state.craft_action);"
+            "if not s then s=game.create_surface(name,{width=64,height=64});"
+            "s.request_to_generate_chunks({0,0},1);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-32,31 do for y=-32,31 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "s.peaceful_mode=true end;"
+            "for _,x in ipairs({3.5,5.5}) do "
+            'local e=s.find_entity("coal",{x,4.5}) or '
+            's.create_entity{name="coal",position={x,4.5},amount=100};assert(e) end;'
+            "assert(c.teleport({4,4},s));"
+            # Exercise the legacy shape with no partial_cells/partial_count fields.
+            "state.explored_map[name]=state.explored_map[name] or {cells={},count=0};"
+            "rcon.print('m25_fixture:{\"ready\":true}')"
+        )
+        initial = coal_map()
+        if setup != {"ready": True} or initial["explored"]["cells"] != 0 or initial["resources"]:
+            raise RuntimeError("M25 requires an empty explored map: " + json.dumps(initial))
+
+        observed = bridge.call("observe_nearby", {"radius": 1})["result"]
+        seen = coal_summary(observed)
+        if not seen or seen["tiles"] != 1:
+            raise RuntimeError(
+                "M25 cannot see exactly one partial-cell coal tile: " + json.dumps(observed)
+            )
+        mapped = coal_map()
+        record(
+            "partial resource sightings retain exactly the seen tile and amount totals",
+            len(mapped["resources"]) == 1
+            and mapped["resources"][0].get("partial") is True
+            and mapped["resources"][0]["tiles"] == seen["tiles"]
+            and mapped["resources"][0]["total_amount"] == seen["total_amount"],
+            json.dumps(mapped),
+        )
+        record(
+            "partial-only cells do not add explored bounds, terrain or frontier edges",
+            mapped["explored"] == {"cells": 0}
+            and mapped["frontier_total"] == 0
+            and not mapped["frontier"]
+            and all(not mapped[kind] for kind in ("water", "trees", "rocks")),
+            json.dumps(mapped),
+        )
+
+        observed = bridge.call("observe_nearby", {"radius": 2})["result"]
+        seen = coal_summary(observed)
+        if not seen or seen["tiles"] != 2:
+            raise RuntimeError("M25 cannot see both coal fixture tiles: " + json.dumps(observed))
+        larger = coal_map()["resources"]
+        bridge.call("observe_nearby", {"radius": 1})
+        record(
+            "partial re-observation keeps the larger resource tile sum",
+            len(larger) == 1 and larger[0]["tiles"] == 2 and coal_map()["resources"] == larger,
+            json.dumps(larger),
+        )
+        partial_map_fixture(
+            'for _,e in pairs(s.find_entities_filtered{type="resource"}) do e.amount=77 end;'
+            "rcon.print('m25_fixture:{\"updated\":true}')"
+        )
+        bridge.call("observe_nearby", {"radius": 2})
+        equal = coal_map()["resources"]
+        record(
+            "equal partial tile sums replace the old amounts",
+            len(equal) == 1 and equal[0]["tiles"] == 2 and equal[0]["total_amount"] == 154,
+            json.dumps(equal),
+        )
+        action("move_to", {"surface": m25_surface, "x": 4, "y": 7, "within": 0.5})
+        empty = bridge.call("observe_nearby", {"radius": 1})["result"]
+        after_empty = coal_map()["resources"]
+        record(
+            "empty partial observations preserve earlier resources",
+            coal_summary(empty) is None
+            and len(after_empty) == 1
+            and after_empty[0].get("partial") is True
+            and all(
+                after_empty[0][key] == equal[0][key]
+                for key in ("tiles", "total_amount", "observed_tick")
+            ),
+            json.dumps(empty),
+        )
+        action("move_to", {"surface": m25_surface, "x": 4, "y": 4, "within": 0.5})
+        partial_map_fixture(
+            'local e=s.find_entity("coal",{8.5,4.5}) or '
+            's.create_entity{name="coal",position={8.5,4.5},amount=77};assert(e);'
+            "rcon.print('m25_fixture:{\"neighbor\":true}')"
+        )
+        bridge.call("observe_nearby", {"radius": 6.5})
+        mixed = coal_map()
+        record(
+            "partial resources join full neighbors while remaining in frontier",
+            mixed["explored"]
+            == {"cells": 1, "left_top": {"x": 0, "y": 0}, "right_bottom": {"x": 8, "y": 8}}
+            and len(mixed["resources"]) == 1
+            and mixed["resources"][0].get("partial") is True
+            and mixed["resources"][0]["cells"] == 2
+            and mixed["resources"][0]["tiles"] == 3
+            and mixed["resources"][0]["total_amount"] == 231
+            and any(cell["x"] == 12 and cell["y"] == 4 for cell in mixed["frontier"]),
+            json.dumps(mixed),
+        )
+        bridge.call("observe_nearby", {"radius": 16})
+        full = coal_map()
+        record(
+            "full observation replaces partial resources and counts the explored cell",
+            len(full["resources"]) == 1
+            and not full["resources"][0].get("partial", False)
+            and full["resources"][0]["tiles"] == 3
+            and full["resources"][0]["total_amount"] == 231
+            and full["explored"]["cells"] > 0,
+            json.dumps(full),
+        )
+        bridge.call("observe_nearby", {"radius": 1})
+        record(
+            "partial observations never overwrite full resources",
+            coal_map()["resources"] == full["resources"],
+        )
+        partial_map_fixture(
+            'for _,e in pairs(s.find_entities_filtered{type="resource"}) do e.destroy() end;'
+            "rcon.print('m25_fixture:{\"depleted\":true}')"
+        )
+        bridge.call("observe_nearby", {"radius": 16})
+        record("full re-observation still forgets depleted resources", not coal_map()["resources"])
+
+        started = bridge.call("move_to", {"surface": m25_surface, "x": 20, "y": 4})["result"]
+        m25_action_id = started["action_id"]
+        running = bridge.call("get_agent_status")["result"].get("action") or {}
+        record(
+            "running move status includes action_id equal to id",
+            running.get("status") == "running"
+            and running.get("action_id") == running.get("id") == m25_action_id,
+            json.dumps(running),
+        )
+    finally:
+        if m25_action_id:
+            current = bridge.call("get_action_status", {"action_id": m25_action_id})["result"]
+            if current.get("status") == "running":
+                bridge.call("cancel_action", {"action_id": m25_action_id})
+        partial_map_fixture(
+            "assert(not state.action and not state.craft_action);"
+            f"assert(c.teleport({{x={return_position['x']},y={return_position['y']}}},"
+            f"game.surfaces[{json.dumps(return_position['surface'])}]));"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil;"
+            "rcon.print('m25_fixture:{\"removed\":true}')"
+        )
+        observed_map_cells.pop(m25_surface, None)
+        record("M25 fixture preserves held items", items() == before_m25)
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

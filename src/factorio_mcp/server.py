@@ -594,7 +594,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Get the AI character position, health, inventory, and current actions. "
-            "action is the walk/mine slot; craft_action is the crafting slot."
+            "action is the walk/mine slot; craft_action is the crafting slot. "
+            "Both include action_id (the same value as id, kept for compatibility)."
         )
     )
     async def get_agent_status() -> CallToolResult:
@@ -632,7 +633,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Use check_placement for snapped position and valid_directions before building. "
             "Follow offsets for additional pages."
             " Each call also records fully observed 8x8 cells for get_explored_map, "
-            "independent of filters and paging." + MACHINE_STATUS_DESCRIPTION
+            "and seen resources in partially observed cells, independent of filters and paging."
+            + MACHINE_STATUS_DESCRIPTION
         )
     )
     async def observe_nearby(
@@ -663,7 +665,14 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Read only what this character saw with observe_nearby on the current surface: "
-            "8x8 tiles per cell, recorded only when fully inside an observation circle. "
+            "8x8 tiles per cell; cells fully inside an observation circle record resources, "
+            "water, trees and rocks. "
+            "Partially observed cells record only seen resources. Resource components include "
+            "partial = true if any cell is partial; tile and amount totals are only what was seen. "
+            "A partial observation replaces a partial record when its summed resource tiles "
+            "are at least as many; a full observation replaces it and clears partial. "
+            "Partial cells do not count in explored.cells or explored bounds and may appear "
+            "in frontier; they never overwrite fully observed cells. "
             "Values are as of observed_tick and update when the area is observed again. "
             "Lists resource patches, water (with a shore tile for offshore pumps), forests "
             "and rocks nearest first. Each list contains at most limit components; "
@@ -672,8 +681,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "frontier lists unexplored cells sharing an edge with an explored cell, "
             "as {x, y, distance} at cell centres, sorted by distance then x then y, "
             "up to limit; frontier_total counts all frontier cells before truncation. "
-            "Only coordinates and distance are returned for unexplored cells, without "
-            "terrain, resource or tile data. Walk toward the nearest frontier cell and "
+            "Frontier entries contain only coordinates and distance, "
+            "without terrain, resource or tile data. Walk toward the nearest frontier cell and "
             "observe_nearby to explore efficiently."
         )
     )

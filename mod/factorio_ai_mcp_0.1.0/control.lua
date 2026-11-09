@@ -345,8 +345,10 @@ local function status(state)
     health = character.health,
     inventory = inventory_contents(character),
     crafting_queue_size = character.crafting_queue_size,
-    action = state.action and {id = state.action.id, type = state.action.type, status = state.action.status} or nil,
+    action = state.action and {id = state.action.id, action_id = state.action.id,
+      type = state.action.type, status = state.action.status} or nil,
     craft_action = state.craft_action and {id = state.craft_action.id,
+      action_id = state.craft_action.id,
       type = state.craft_action.type, status = state.craft_action.status} or nil
   }
 end
@@ -805,6 +807,10 @@ local function record_explored_map(state, character, radius, entities)
     map = {cells = {}, count = 0}
     state.explored_map[surface.name] = map
   end
+  -- Keep partial resource sightings out of explored counts, bounds and frontier edges.
+  -- Saves predating partial cells have neither of these fields.
+  map.partial_cells = map.partial_cells or {}
+  map.partial_count = map.partial_count or 0
   local fresh = {}
   for cx = math.floor((position.x - radius) / MAP_CELL_SIZE),
            math.floor((position.x + radius) / MAP_CELL_SIZE) do
@@ -844,20 +850,28 @@ local function record_explored_map(state, character, radius, entities)
   for _, entity in pairs(entities) do
     if entity.valid then
       local position = entity.position
-      local cell = fresh[map_cell_key(math.floor(position.x / MAP_CELL_SIZE),
-                                      math.floor(position.y / MAP_CELL_SIZE))]
+      local cx, cy = math.floor(position.x / MAP_CELL_SIZE), math.floor(position.y / MAP_CELL_SIZE)
+      local key = map_cell_key(cx, cy)
+      local cell = fresh[key]
+      local seen_resource = entity.type == "resource" and
+                            distance_squared(character.position, position) <= radius * radius
+      if not cell and seen_resource then
+        cell = {cx = cx, cy = cy, tick = game.tick, resources = {}, partial = true}
+        fresh[key] = cell
+      end
       if cell then
         local centre = map_cell_centre(cell)
-        if entity.type == "resource" then
+        if entity.type == "resource" and (not cell.partial or seen_resource) then
           local resource = cell.resources[entity.name] or {tiles = 0, amount = 0}
           resource.tiles = resource.tiles + 1
           resource.amount = resource.amount + entity.amount
           resource.sample = nearest_sample(resource.sample, position, centre)
           cell.resources[entity.name] = resource
-        elseif entity.type == "tree" then
+        elseif not cell.partial and entity.type == "tree" then
           cell.trees = cell.trees + 1
           cell.tree_sample = nearest_sample(cell.tree_sample, position, centre)
-        elseif entity.type == "simple-entity" and string.find(entity.name, "rock", 1, true) then
+        elseif not cell.partial and entity.type == "simple-entity" and
+               string.find(entity.name, "rock", 1, true) then
           cell.rocks = cell.rocks + 1
           cell.rock_sample = nearest_sample(cell.rock_sample, position, centre)
         end
@@ -865,21 +879,50 @@ local function record_explored_map(state, character, radius, entities)
     end
   end
   for key, cell in pairs(fresh) do
-    if not map.cells[key] then map.count = map.count + 1 end
-    map.cells[key] = cell
+    if cell.partial then
+      if not map.cells[key] then
+        local previous = map.partial_cells[key]
+        local tiles, previous_tiles = 0, 0
+        for _, resource in pairs(cell.resources) do tiles = tiles + resource.tiles end
+        for _, resource in pairs(previous and previous.resources or {}) do
+          previous_tiles = previous_tiles + resource.tiles
+        end
+        if tiles > 0 and tiles >= previous_tiles then
+          if not previous then map.partial_count = map.partial_count + 1 end
+          map.partial_cells[key] = cell
+        end
+      end
+    else
+      if not map.cells[key] then map.count = map.count + 1 end
+      map.cells[key] = cell
+      if map.partial_cells[key] then
+        map.partial_cells[key] = nil
+        map.partial_count = map.partial_count - 1
+      end
+    end
   end
-  if map.count > MAX_EXPLORED_CELLS then
+  local stored_count = map.count + map.partial_count
+  if stored_count > MAX_EXPLORED_CELLS then
     local oldest = {}
     for key, cell in pairs(map.cells) do
       oldest[#oldest + 1] = {key = key, tick = cell.tick}
+    end
+    for key, cell in pairs(map.partial_cells) do
+      oldest[#oldest + 1] = {key = key, tick = cell.tick, partial = true}
     end
     table.sort(oldest, function(a, b)
       if a.tick ~= b.tick then return a.tick < b.tick end
       return a.key < b.key
     end)
-    for index = 1, map.count - MAX_EXPLORED_CELLS do
-      map.cells[oldest[index].key] = nil
-      map.count = map.count - 1
+    for index = 1, stored_count - MAX_EXPLORED_CELLS do
+      local entry = oldest[index]
+      if entry.partial then
+        map.partial_cells[entry.key] = nil
+        map.partial_count = map.partial_count - 1
+      else
+        map.cells[entry.key] = nil
+        map.count = map.count - 1
+      end
     end
   end
 end
@@ -920,6 +963,7 @@ local function map_components(cells, kind, name, position)
         extend_map_bounds(group, cell)
         if kind == "resources" then
           local resource = cell.resources[name]
+          if cell.partial then group.partial = true end
           group.tiles = (group.tiles or 0) + resource.tiles
           group.total_amount = (group.total_amount or 0) + resource.amount
           group.nearest = nearest_sample(group.nearest, resource.sample, position)
@@ -965,7 +1009,9 @@ local function do_get_explored_map(state, params)
   local map = state.explored_map[character.surface.name] or {cells = {}, count = 0}
   local result = {position = position_data(character), cell_size = MAP_CELL_SIZE,
                   explored = {cells = map.count}, resources = {}, frontier = {}}
-  local resource_names, frontier_seen = {}, {}
+  local resource_names, frontier_seen, resource_cells = {}, {}, {}
+  for key, cell in pairs(map.partial_cells or {}) do resource_cells[key] = cell end
+  for key, cell in pairs(map.cells) do resource_cells[key] = cell end
   local edge_offsets = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}}
   for _, cell in pairs(map.cells) do
     extend_map_bounds(result.explored, cell)
@@ -980,12 +1026,14 @@ local function do_get_explored_map(state, params)
         result.frontier[#result.frontier + 1] = centre
       end
     end
+  end
+  for _, cell in pairs(resource_cells) do
     for name in pairs(cell.resources) do
       if not names or names[name] then resource_names[name] = true end
     end
   end
   for name in pairs(resource_names) do
-    for _, group in ipairs(map_components(map.cells, "resources", name, character.position)) do
+    for _, group in ipairs(map_components(resource_cells, "resources", name, character.position)) do
       result.resources[#result.resources + 1] = group
     end
   end
