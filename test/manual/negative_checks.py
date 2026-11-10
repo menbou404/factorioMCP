@@ -10,6 +10,7 @@ import math
 import time
 from unittest.mock import patch
 
+from mcp.server.mcpserver.exceptions import ToolError
 from rcon.source import Client
 
 from factorio_mcp.bridge import RCON_FRAG_THRESHOLD, BridgeError, parse_bridge_response
@@ -4747,6 +4748,176 @@ def main():
             restored.get("restored") is True
             and bridge.call("get_inventory")["result"]["items"] == m32_inventory
             and bridge.call("get_agent_status")["result"]["position"] == m32_position,
+        )
+
+    # M33: strict tool arguments and absolute rotations in one Mod request.
+    # The installed 2.0.77 base/prototypes/entity/entities.lua sets
+    # storage-tank.two_direction_only=true. Probe its native cycle as well.
+    m33_surface = "m33-absolute-rotation-fixture"
+    m33_server = create_server(bridge)
+    m33_inventory = bridge.call("get_inventory")["result"]["items"]
+    m33_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m33_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m33_surface}";local s=game.surfaces[name];'
+            "local b=storage.m33_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m33:" not in raw:
+            raise RuntimeError("M33 fixture failed: " + raw)
+        return json.loads(raw.split("m33:", 1)[1].strip())
+
+    async def m33_tool(arguments):
+        try:
+            response = await m33_server.call_tool("rotate_entity", arguments)
+        except ToolError as exc:
+            return True, json.loads(str(exc))
+        return bool(response.is_error), json.loads(response.content[0].text)
+
+    try:
+        cycle = m33_fixture(
+            "assert(not s and not b,'M33 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv),selected=c.selected,"
+            "last_observation=state.last_observation,recent_observations=state.recent_observations};"
+            "storage.m33_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=64,height=64});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},1);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-32,31 do for y=-32,31 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,0.5},s));"
+            "state.last_observation=nil;state.recent_observations={};"
+            'b.inserter=s.create_entity{name="inserter",position={2.5,0.5},'
+            "force=c.force,direction=0};"
+            'b.tank=s.create_entity{name="storage-tank",position={-2.5,0.5},'
+            "force=c.force,direction=0};"
+            'b.chest=s.create_entity{name="wooden-chest",position={0.5,2.5},force=c.force};'
+            "assert(b.inserter and b.tank and b.chest);"
+            "local original=b.tank.direction;local seen={[original]=true};"
+            "for i=1,4 do assert(b.tank.rotate{reverse=false});seen[b.tank.direction]=true end;"
+            "b.tank.direction=original;local reachable={};"
+            "for d in pairs(seen) do reachable[#reachable+1]=d end;table.sort(reachable);"
+            "rcon.print('m33:'..helpers.table_to_json({original=original,reachable=reachable}))"
+        )
+        seen = bridge.call("observe_nearby")["result"]["entities"]
+        refs = {
+            e["name"]: e["target_ref"]
+            for e in seen
+            if e["name"] in ("inserter", "storage-tank", "wooden-chest")
+        }
+        for direction in (0, 4, 8, 12):
+            m33_fixture("b.inserter.direction=0;rcon.print('m33:{}')")
+            with patch.object(bridge, "call", wraps=bridge.call) as calls:
+                is_error, value = asyncio.run(
+                    m33_tool({"target_ref": refs["inserter"], "direction": direction})
+                )
+            actual = m33_fixture(
+                "rcon.print('m33:'..helpers.table_to_json({direction=b.inserter.direction}))"
+            )
+            record(
+                f"M33 inserter absolute direction {direction} uses {direction // 4} rotations",
+                not is_error
+                and value["direction"] == actual["direction"] == direction
+                and value["rotations"] == direction // 4
+                and calls.call_count == 1,
+                json.dumps(value),
+            )
+        is_error, already = asyncio.run(m33_tool({"target_ref": refs["inserter"], "direction": 12}))
+        record(
+            "M33 already at requested direction rotates zero times",
+            not is_error and already["rotations"] == 0 and already["direction"] == 12,
+            json.dumps(already),
+        )
+        is_error, plain = asyncio.run(m33_tool({"target_ref": refs["inserter"]}))
+        record(
+            "M33 plain rotation preserves behavior and reports one rotation",
+            not is_error and plain["rotations"] == 1 and plain["direction"] == 0,
+        )
+        record(
+            "M33 storage tank has a native two-direction rotation cycle",
+            len(cycle["reachable"]) == 2,
+        )
+        unreachable = next(d for d in (0, 4, 8, 12) if d not in cycle["reachable"])
+        is_error, value = asyncio.run(
+            m33_tool({"target_ref": refs["storage-tank"], "direction": unreachable})
+        )
+        actual = m33_fixture(
+            "rcon.print('m33:'..helpers.table_to_json({direction=b.tank.direction}))"
+        )
+        record(
+            "M33 unreachable tank direction restores exact original direction",
+            is_error
+            and value["error"] == "invalid_target"
+            and value["detail"]
+            == {
+                "reason": "direction_unreachable",
+                "direction": cycle["original"],
+                "reachable_directions": cycle["reachable"],
+            }
+            and actual["direction"] == cycle["original"],
+            json.dumps(value),
+        )
+        is_error, value = asyncio.run(
+            m33_tool({"target_ref": refs["wooden-chest"], "direction": 4})
+        )
+        record(
+            "M33 non-rotatable entity reports direction_unreachable",
+            is_error
+            and value["error"] == "invalid_target"
+            and value["detail"]
+            == {"reason": "direction_unreachable", "direction": 0, "reachable_directions": [0]},
+            json.dumps(value),
+        )
+        with patch.object(bridge, "call", wraps=bridge.call) as calls:
+            is_error, value = asyncio.run(m33_tool({"target_ref": refs["inserter"], "dir": 12}))
+        actual = m33_fixture(
+            "rcon.print('m33:'..helpers.table_to_json({direction=b.inserter.direction}))"
+        )
+        record(
+            "M33 unknown argument rejects before bridge and leaves entity unchanged",
+            is_error
+            and value["error"] == "invalid_input"
+            and value["detail"]["errors"][0]["field"] == "dir"
+            and value["detail"]["errors"][0]["type"] == "unexpected_argument"
+            and calls.call_count == 0
+            and actual["direction"] == 0,
+            json.dumps(value),
+        )
+    finally:
+        restored = m33_fixture(
+            "if b then assert(c.crafting_queue_size==0);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();state.last_observation=b.last_observation;"
+            "state.recent_observations=b.recent_observations;"
+            "for ref,entry in pairs(state.targets) do if entry.entity and entry.entity.valid "
+            "and entry.entity.surface==s then if entry.unit_number then "
+            "state.owned_refs[entry.unit_number]=nil end;state.targets[ref]=nil end end;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil;"
+            "storage.m33_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m33:'..helpers.table_to_json({restored=true}))"
+        )
+        observed_map_cells.pop(m33_surface, None)
+        record(
+            "M33 removes fixtures and restores exact inventory, empty queue and position",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m33_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m33_position,
         )
 
     failed = [label for label, passed, _ in results if not passed]

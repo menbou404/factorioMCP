@@ -794,12 +794,12 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(field, [e["field"] for e in value["detail"]["errors"]])
         bridge.call.assert_not_called()
 
-    async def test_extra_arguments_keep_sdk_behavior(self):
-        # The installed SDK ignores extra arguments rather than rejecting them.
+    async def test_extra_arguments_are_rejected(self):
         async with Client(create_server(None)) as client:
             result = await client.call_tool("wait_for_action", {"action_id": "42", "extra": 1})
         self.assertTrue(result.is_error)
-        self.assertEqual(payload(result)["error"], "not_configured")
+        self.assertEqual(payload(result)["error"], "invalid_input")
+        self.assertEqual(payload(result)["detail"]["errors"][0]["type"], "unexpected_argument")
 
     async def test_mod_invalid_input_gets_hint_without_validation_detail(self):
         bridge = Mock()
