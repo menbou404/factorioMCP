@@ -396,6 +396,13 @@ def _normalize_batch_result(result: dict[str, Any], operation: str | None = None
 
 
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
+    if operation == "check_line" or (operation == "" and "problem_total" in result):
+        if not isinstance(result.get("problems"), list):
+            result["problems"] = []
+        for problem in result["problems"]:
+            for field in ("blocking", "tiles"):
+                if field in problem and not isinstance(problem[field], list):
+                    problem[field] = []
     if operation in ("place_line", "") and "next_position" in result and result.get("stopped"):
         if isinstance(result.get("detail"), dict):
             result["detail"] = _normalize_error_detail(result["detail"])
@@ -579,6 +586,44 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             return _response(_success_value(operation, await call(operation, params)))
         except Exception as exc:
             return _error_response(exc, operation)
+
+    async def read_position() -> dict[str, float] | None:
+        try:
+            position = (await call("get_character_position"))["result"]["position"]
+            if all(
+                isinstance(position[axis], (int, float))
+                and not isinstance(position[axis], bool)
+                and math.isfinite(position[axis])
+                for axis in ("x", "y")
+            ):
+                return {axis: position[axis] for axis in ("x", "y")}
+        except Exception:
+            # Position is optional metadata; preserve the primary wait result.
+            pass
+        return None
+
+    async def wait_result(
+        result: dict[str, Any], start_position: dict[str, float] | None
+    ) -> CallToolResult:
+        end_position = await read_position()
+        if start_position is not None and end_position is not None:
+            result["character_position"] = end_position
+            distance = math.hypot(
+                end_position["x"] - start_position["x"],
+                end_position["y"] - start_position["y"],
+            )
+            if distance > 0.5:
+                result["position_drift"] = {
+                    "from": start_position,
+                    "to": end_position,
+                    "distance": distance,
+                }
+                result["hint"] = (
+                    (result["hint"] + " " if result.get("hint") else "")
+                    + "The character may have been carried by a belt; "
+                    "stand off belts before the next action."
+                )
+        return _response(result)
 
     async def wait_action(
         action_id: str, timeout_seconds: float, start_value: dict[str, Any] | None = None
@@ -775,9 +820,13 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Prefer this over polling get_research_status. The maximum wait is 50 seconds "
             "to keep it under common 60-second client tool timeouts."
             " Returns early with stalled=true, stalled_seconds, progress, and timed_out=false "
-            "when this technology is current and its progress has not changed for 10 seconds "
+            "when this technology is current and its progress has not changed for "
+            "stall_seconds (5-50, default 10 seconds) "
             "of waiting. Otherwise stalled=false. Includes remaining_units when this technology "
-            "is current, as returned by get_research_status. On a stall, includes nearby owned "
+            "is current. Raise stall_seconds when science packs arrive with gaps. "
+            "Returns character_position at the end when available; position_drift and a hint "
+            "warn when the character moved more than 0.5 tiles, possibly carried by a belt. "
+            "Stand off belts before the next action. On a stall, includes nearby owned "
             "labs sorted by distance with stable target_ref, x, y, status (including unpowered "
             "labs), unrounded science_units, missing pack names, and blocking. short_science "
             "lists {name, available_units, remaining_units} where available_units <= "
@@ -790,7 +839,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     async def wait_for_research(
         technology: RequiredText,
         timeout_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] = 20,
+        stall_seconds: Annotated[float, Field(ge=5, le=50, allow_inf_nan=False)] = 10,
     ) -> CallToolResult:
+        start_position = await read_position()
         started = time.monotonic()
         unchanged_since = None
         last_progress = None
@@ -812,7 +863,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                     unchanged_since = None
                     last_progress = None
                 stalled_seconds = now - unchanged_since if unchanged_since is not None else 0
-                stalled = stalled_seconds >= 10
+                stalled = stalled_seconds >= stall_seconds
                 if researched or not researching or stalled or waited >= timeout_seconds:
                     result = {
                         "technology": technology,
@@ -854,7 +905,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                                 else "internal_error",
                                 "message": str(exc),
                             }
-                    return _response(result)
+                    return await wait_result(result, start_position)
                 await asyncio.sleep(min(0.25, timeout_seconds - waited))
         except Exception as exc:
             return _error_response(exc)
@@ -919,6 +970,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Crafting runs alongside walking. Only one walk/mine at a time. "
             "Check a move's result before acting on targets near the destination; "
             "later transfers can fail with out_of_range if the walk failed. "
+            "A successful move ending on a transport-belt, underground-belt or splitter "
+            "includes standing_on_belt=true and a hint to stand off belts. "
             "Prefer wait_seconds (1-50) to start and wait in one call, under common 60-second "
             "client timeouts. A timeout leaves the action running and returns timed_out=true "
             "and action_id; continue with wait_for_action. Omit wait_seconds to return the "
@@ -1021,16 +1074,55 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         to_x: LineCoordinate,
         to_y: LineCoordinate,
     ) -> CallToolResult:
+        return await invoke_line("place_line", item, surface, from_x, from_y, to_x, to_y)
+
+    @server.tool(
+        description=(
+            "Check before place_line to find trees, water and other blockers along the whole "
+            "line. Remove trees with mine_entity. Read-only: places nothing, consumes nothing, "
+            "needs no item in inventory, and works while walking or mining. "
+            "Supports items placing transport-belt or pipe entities; axis-aligned, 2-64 tiles "
+            "inclusive. Endpoints snap down to tile centres; direction runs from start to end. "
+            "No reach check. Each tile must be in current surroundings or recent observation; "
+            "tiles outside recent observation are not_visible, so observe_nearby first. "
+            "Unobserved tiles reveal no entity or terrain data. Same-name entities with the "
+            "same direction count as already_present (pipes ignore direction); different "
+            "directions report different_direction and existing_direction. Ground items do "
+            "not block. Returns requested, clear, already_present, direction, complete, "
+            "first_position, last_position, problems (at most 16, in line order), and "
+            "problem_total. Blocked problems include blocking entities with name and "
+            "target_ref and/or blocking tile names."
+        )
+    )
+    async def check_line(
+        item: RequiredText,
+        surface: RequiredText,
+        from_x: LineCoordinate,
+        from_y: LineCoordinate,
+        to_x: LineCoordinate,
+        to_y: LineCoordinate,
+    ) -> CallToolResult:
+        return await invoke_line("check_line", item, surface, from_x, from_y, to_x, to_y)
+
+    async def invoke_line(
+        operation: str,
+        item: str,
+        surface: str,
+        from_x: float,
+        from_y: float,
+        to_x: float,
+        to_y: float,
+    ) -> CallToolResult:
         dx, dy = math.floor(to_x) - math.floor(from_x), math.floor(to_y) - math.floor(from_y)
         if (dx and dy) or not 2 <= abs(dx) + abs(dy) + 1 <= 64:
             return _error_response(
                 BridgeError(
                     "invalid_input", "Line endpoints must share a row or column, 2-64 tiles."
                 ),
-                "place_line",
+                operation,
             )
         return await invoke(
-            "place_line",
+            operation,
             {
                 "item": item,
                 "surface": surface,
@@ -1168,6 +1260,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Unknown roles return invalid_input with detail.valid_roles. "
             "Returns target_ref, item, count, current, reached, status (if present), stalled, "
             "timed_out, waited_seconds, and inventory_role (if given). "
+            "Includes character_position at the end when available; position_drift and a "
+            "hint warn when the character moved more than 0.5 tiles, possibly carried by a "
+            "belt. Stand off belts before the next action. "
             "Returns early with stalled=true, stalled_seconds, and a status hint when the "
             "count stays unchanged for 10 consecutive seconds in stopped states: "
             + ", ".join(ITEMS_STALLED_HINTS)
@@ -1190,6 +1285,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         timeout_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] = 20,
         produced: Annotated[bool, Field(strict=True)] = False,
     ) -> CallToolResult:
+        start_position = await read_position()
         started = time.monotonic()
         unchanged_since = None
         last_count = None
@@ -1288,7 +1384,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                         except Exception:
                             # Optional diagnostics must not discard a valid wait result.
                             pass
-                    return _response(result)
+                    return await wait_result(result, start_position)
                 await asyncio.sleep(min(0.5, timeout_seconds - waited))
         except Exception as exc:
             if (
@@ -1384,6 +1480,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "A timeout returns the last running status "
             "and leaves the action running. Running mining reports detail.gained and detail.count; "
             "running crafting reports detail.count and detail.remaining. "
+            "Successful moves ending on a belt include standing_on_belt=true and a hint "
+            "to stand off belts before the next action. "
             "When computable, mining detail.estimated_seconds is an estimate that can change "
             "if mining is interrupted or the target is depleted; use it to pick timeout_seconds. "
             "The maximum wait is 50 seconds to keep it under "

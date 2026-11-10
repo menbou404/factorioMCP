@@ -163,6 +163,21 @@ local function observation_detail(state)
           age_seconds = (game.tick - observation.tick) / 60}}
 end
 
+local function placement_visible(state, character, position)
+  if distance_squared(character.position, position) <= OBSERVATION_RADIUS ^ 2 then
+    return true
+  end
+  for _, observation in ipairs(state.recent_observations) do
+    if observation.surface == character.surface.name and
+       game.tick - observation.tick <= TARGET_TTL_TICKS and
+       distance_squared(observation.position, position) <=
+         (observation.radius or OBSERVATION_RADIUS) ^ 2 then
+      return true
+    end
+  end
+  return false
+end
+
 local function valid_character(state)
   return state.character and state.character.valid and state.character.health > 0
 end
@@ -293,6 +308,16 @@ local function finish_action(state, slot, status, error_code, detail)
     position = valid_character(state) and position_data(state.character) or nil,
     started_tick = action.started_tick, finished_tick = game.tick
   }
+  if action.type == "move" and status == "succeeded" and valid_character(state) then
+    -- A point query tests the final position against belt collision boxes, any force.
+    local belts = state.character.surface.find_entities_filtered{
+      position = state.character.position, type = {"transport-belt", "underground-belt", "splitter"}
+    }
+    if #belts > 0 then
+      completed.standing_on_belt = true
+      completed.hint = "Stand off belts before the next action; belts can carry the character."
+    end
+  end
   state.last_action = completed
   state.completed_actions[action.id] = completed
   state.completed_order[#state.completed_order + 1] = action.id
@@ -651,6 +676,8 @@ local function do_move(state, params)
   if finish_move_within(state) then
     result.status = "succeeded"
     result.distance = math.sqrt(distance_squared(character.position, goal))
+    result.standing_on_belt = state.last_action.standing_on_belt
+    result.hint = state.last_action.hint
     return result
   end
   local ok = pcall(request_path, state, character, goal)
@@ -1806,7 +1833,7 @@ local function placement_mining_area_resources(character, prototype, position, d
   return resources
 end
 
-local function placement_blocking(state, character, prototype, position, direction)
+local function placement_blocking(state, character, prototype, position, direction, observed_only)
   -- Keep the requested position so every alternative direction snaps independently.
   local area = placement_bounding_box(prototype, snapped_position(prototype, position, direction),
                                       direction)
@@ -1828,7 +1855,8 @@ local function placement_blocking(state, character, prototype, position, directi
   local blocking, ground_entities = {}, {}
   local only_ground_items = true
   for _, entity in pairs(character.surface.find_entities_filtered{area = area}) do
-    if entity ~= character and overlaps_and_collides(entity) then
+    if entity ~= character and overlaps_and_collides(entity) and
+       (not observed_only or placement_visible(state, character, entity.position)) then
       local stack = ground_stack(entity)
       if stack then
         ground_entities[#ground_entities + 1] = entity
@@ -1845,8 +1873,11 @@ local function placement_blocking(state, character, prototype, position, directi
   end
   local tiles = {}
   for _, tile in pairs(character.surface.find_tiles_filtered{area = area}) do
-    for layer in pairs(layers) do
-      if tile.collides_with(layer) then tiles[tile.name] = true; break end
+    if not observed_only or placement_visible(state, character,
+        {x = tile.position.x + 0.5, y = tile.position.y + 0.5}) then
+      for layer in pairs(layers) do
+        if tile.collides_with(layer) then tiles[tile.name] = true; break end
+      end
     end
   end
   local tile_names = sorted_keys(tiles)
@@ -1856,6 +1887,9 @@ local function placement_blocking(state, character, prototype, position, directi
   elseif #blocking == 0 and #tile_names == 0 then
     detail.reason = "placement_rules"
   end
+  -- Line previews need only local blockers. Avoid reach checks and searches for
+  -- alternative positions that could expose terrain beyond the observed area.
+  if observed_only then return detail end
   local valid_directions = {}
   for _, candidate in ipairs({0, 4, 8, 12}) do
     if candidate ~= direction then
@@ -2000,17 +2034,7 @@ local function validate_placement(state, character, params, require_item, line_p
     return nil, "out_of_range", range_detail(character, position, character.build_distance)
   end
   -- Current surroundings count for placement without recording an observation.
-  local visible = distance_squared(character.position, position) <= OBSERVATION_RADIUS ^ 2
-  for _, observation in ipairs(state.recent_observations) do
-    if observation.surface == character.surface.name and
-       game.tick - observation.tick <= TARGET_TTL_TICKS and
-       distance_squared(observation.position, position) <=
-         (observation.radius or OBSERVATION_RADIUS) ^ 2 then
-      visible = true
-      break
-    end
-  end
-  if not visible then
+  if not placement_visible(state, character, position) then
     return nil, "not_visible", observation_detail(state)
   end
   if not prototype then return nil, "invalid_target" end
@@ -2166,10 +2190,7 @@ local function do_place(state, params, line_placement)
   return result
 end
 
-local function do_place_line(state, params)
-  local character, err = require_character(state)
-  if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
+local function validate_line(character, params)
   if params.surface ~= character.surface.name then return nil, "invalid_input" end
   for _, key in ipairs({"from_x", "from_y", "to_x", "to_y"}) do
     local value = params[key]
@@ -2191,6 +2212,74 @@ local function do_place_line(state, params)
   end
   local direction = dx > 0 and 4 or (dx < 0 and 12 or (dy > 0 and 8 or 0))
   local step_x, step_y = dx == 0 and 0 or dx / math.abs(dx), dy == 0 and 0 or dy / math.abs(dy)
+  return {first = first, last = last, requested = requested, prototype = prototype,
+          direction = direction, step_x = step_x, step_y = step_y}
+end
+
+local function do_check_line(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  local line, reason, detail = validate_line(character, params)
+  if not line then return nil, reason, detail end
+  local prototype = line.prototype
+  local result = {requested = line.requested, clear = 0, already_present = 0,
+                  direction = line.direction, first_position = line.first,
+                  last_position = line.last, problems = {}, problem_total = 0}
+  for index = 0, line.requested - 1 do
+    local position = {x = line.first.x + index * line.step_x,
+                      y = line.first.y + index * line.step_y}
+    local problem
+    -- Visibility must precede *all* entity/terrain queries for this tile.
+    if not placement_visible(state, character, position) then
+      problem = {x = position.x, y = position.y, reason = "not_visible"}
+    else
+      local existing
+      for _, entity in ipairs(character.surface.find_entities_filtered{
+        name = prototype.name, position = position
+      }) do
+        if entity.valid and entity.position.x == position.x and entity.position.y == position.y then
+          existing = entity
+          break
+        end
+      end
+      if existing then
+        if prototype.type == "pipe" or existing.direction == line.direction then
+          result.already_present = result.already_present + 1
+        else
+          problem = {x = position.x, y = position.y, reason = "different_direction",
+                     existing_direction = existing.direction}
+        end
+      -- LuaSurface::can_place_entity checks terrain/entity collisions, without
+      -- LuaControl::can_place_entity's character build restrictions (2.0.77).
+      elseif character.surface.can_place_entity{
+        name = prototype.name, position = position, direction = line.direction,
+        force = character.force, build_check_type = defines.build_check_type.manual
+      } then
+        result.clear = result.clear + 1
+      else
+        local blocked = placement_blocking(state, character, prototype, position,
+                                            line.direction, true)
+        problem = {x = position.x, y = position.y, reason = "blocked",
+                   blocking = blocked.blocking, tiles = blocked.tiles}
+      end
+    end
+    if problem then
+      result.problem_total = result.problem_total + 1
+      if #result.problems < 16 then result.problems[#result.problems + 1] = problem end
+    end
+  end
+  result.complete = result.problem_total == 0
+  return result
+end
+
+local function do_place_line(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
+  local line, reason, detail = validate_line(character, params)
+  if not line then return nil, reason, detail end
+  local first, requested, prototype = line.first, line.requested, line.prototype
+  local direction, step_x, step_y = line.direction, line.step_x, line.step_y
   local result = {item = params.item, name = prototype.name, direction = direction,
                   requested = requested, placed = 0, already_present = 0,
                   complete = false, first_position = first}
@@ -2705,6 +2794,7 @@ local function do_action_status(state, params)
   return adjusted_goal_detail(action, {
     action_id = action.id, type = action.type, status = action.status,
     error = action.error, detail = detail,
+    standing_on_belt = action.standing_on_belt, hint = action.hint,
     position = action.status == "running" and
                (valid_character(state) and position_data(state.character) or nil) or
                action.position
@@ -2730,6 +2820,11 @@ local handlers = {
             agent_id = AGENT_ID}
   end,
   get_agent_status = function(state) return status(state) end,
+  get_character_position = function(state)
+    local character, err = require_character(state)
+    if not character then return nil, err end
+    return {position = position_data(character)}
+  end,
   observe_nearby = do_observe,
   get_explored_map = do_get_explored_map,
   get_inventory = function(state)
@@ -2762,6 +2857,7 @@ local handlers = {
   craft = do_craft,
   place_entity = do_place,
   place_line = do_place_line,
+  check_line = do_check_line,
   place_entities = function(state, params) return do_batch(state, params, do_place) end,
   check_placement = do_check_placement,
   rotate_entity = do_rotate,
@@ -2816,6 +2912,7 @@ commands.add_command("ai_mcp", "AI MCP bridge (RCON only)", function(command)
      request.operation == "cancel_action" or request.operation == "craft" or
      request.operation == "place_entity" or request.operation == "transfer_item" or
      request.operation == "place_entities" or request.operation == "place_line" or
+     request.operation == "check_line" or
      request.operation == "transfer_items" or
      request.operation == "rotate_entity" or request.operation == "set_recipe" or
      request.operation == "start_research" then

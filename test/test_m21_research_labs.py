@@ -16,6 +16,13 @@ def payload(result):
     return json.loads(result.content[0].text)
 
 
+def wait_reads(bridge):
+    # Keep earlier diagnostic assertions scoped to primary wait operations.
+    return [
+        entry for entry in bridge.call.call_args_list if entry.args[0] != "get_character_position"
+    ]
+
+
 class ResearchLabsTests(unittest.IsolatedAsyncioTestCase):
     async def wait_with_clock(self, diagnostics, status_at=None, timeout=20):
         elapsed = 0.0
@@ -25,6 +32,8 @@ class ResearchLabsTests(unittest.IsolatedAsyncioTestCase):
             elapsed += seconds
 
         def read(operation, params):
+            if operation == "get_character_position":
+                return {"result": {}}  # Optional metadata is tested in M28.
             self.assertIsNone(params)
             if operation == "get_research_status":
                 status = (
@@ -93,9 +102,13 @@ class ResearchLabsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value["labs"], diagnostics["labs"])
         self.assertEqual(value["short_science"], diagnostics["short_science"])
         self.assertNotIn("labs_error", value)
-        self.assertEqual(bridge.call.call_args_list[-1], call("research_labs", None))
         self.assertEqual(
-            sum(entry == call("research_labs", None) for entry in bridge.call.call_args_list), 1
+            wait_reads(bridge)[-1],
+            call("research_labs", None),
+        )
+        self.assertEqual(
+            sum(entry == call("research_labs", None) for entry in wait_reads(bridge)),
+            1,
         )
         for text in ("blocking=true", "take packs out", "missing", "Add packs", "short_science"):
             self.assertIn(text, value["hint"])
@@ -153,10 +166,7 @@ class ResearchLabsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("short_science", value)
                 self.assertNotIn("labs_error", value)
                 self.assertTrue(
-                    all(
-                        entry.args == ("get_research_status", None)
-                        for entry in bridge.call.call_args_list
-                    )
+                    all(entry.args == ("get_research_status", None) for entry in wait_reads(bridge))
                 )
 
     def test_nested_lua_empty_tables_are_normalized(self):

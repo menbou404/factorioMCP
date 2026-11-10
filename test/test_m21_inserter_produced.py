@@ -60,7 +60,11 @@ class ProducedItemsTests(unittest.IsolatedAsyncioTestCase):
                     **arguments,
                 },
             )
-        reads = bridge.call.call_args_list.copy()
+        reads = [
+            entry
+            for entry in bridge.call.call_args_list
+            if entry.args[0] != "get_character_position"
+        ]
         if not result.is_error and not payload(result)["reached"]:
             self.assertEqual(reads.pop(), call("entity_feeders", {"target_ref": "machine"}))
         for read in reads:

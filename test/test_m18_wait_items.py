@@ -48,7 +48,11 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
                 "wait_for_items",
                 {"target_ref": "assembler", "item": "iron-gear-wheel", "count": 100, **arguments},
             )
-        reads = bridge.call.call_args_list.copy()
+        reads = [
+            entry
+            for entry in bridge.call.call_args_list
+            if entry.args[0] != "get_character_position"
+        ]
         if not result.is_error and not payload(result)["reached"]:
             self.assertEqual(reads.pop(), call("entity_feeders", {"target_ref": "assembler"}))
         for read in reads:
@@ -262,7 +266,7 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
                     bridge.call.side_effect = error
                     expected = await server.call_tool("get_entity_inventory", {"target_ref": "a"})
                     bridge.call.side_effect = (
-                        [{"result": inventory()}, error] if after_poll else error
+                        [{"result": {}}, {"result": inventory()}, error] if after_poll else error
                     )
                     with patch("factorio_mcp.server.asyncio.sleep"):
                         result = await server.call_tool(

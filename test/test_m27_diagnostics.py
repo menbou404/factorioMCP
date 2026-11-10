@@ -19,6 +19,13 @@ def payload(result):
     return json.loads(result.content[0].text)
 
 
+def wait_reads(bridge):
+    # Keep earlier diagnostic assertions scoped to primary wait operations.
+    return [
+        entry for entry in bridge.call.call_args_list if entry.args[0] != "get_character_position"
+    ]
+
+
 class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     async def wait_with_clock(self, diagnostics, *, timeout=1, status=None, reached_at=None):
         elapsed = 0.0
@@ -28,6 +35,8 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             elapsed += seconds
 
         def read(operation, params):
+            if operation == "get_character_position":
+                return {"result": {}}  # Optional metadata is tested in M28.
             self.assertEqual(params, {"target_ref": "target"})
             if operation == "get_entity_inventory":
                 reached = reached_at is not None and elapsed >= reached_at
@@ -80,12 +89,18 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("materials", value["hint"])
                 self.assertEqual(value["feeders"], [FEEDER])
                 diagnostic_call = call("entity_feeders", {"target_ref": "target"})
-                self.assertEqual(bridge.call.call_args_list[-1], diagnostic_call)
-                self.assertEqual(bridge.call.call_args_list.count(diagnostic_call), 1)
+                self.assertEqual(
+                    wait_reads(bridge)[-1],
+                    diagnostic_call,
+                )
+                self.assertEqual(
+                    wait_reads(bridge).count(diagnostic_call),
+                    1,
+                )
                 self.assertTrue(
                     all(
                         entry == call("get_entity_inventory", {"target_ref": "target"})
-                        for entry in bridge.call.call_args_list[:-1]
+                        for entry in wait_reads(bridge)[:-1]
                     )
                 )
 
@@ -108,10 +123,7 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(value["stalled"])
                 self.assertNotIn("feeders", value)
                 self.assertTrue(
-                    all(
-                        entry.args[0] == "get_entity_inventory"
-                        for entry in bridge.call.call_args_list
-                    )
+                    all(entry.args[0] == "get_entity_inventory" for entry in wait_reads(bridge))
                 )
 
     async def test_diagnostic_failures_preserve_timeout_and_stall_without_feeders(self):
@@ -127,7 +139,7 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                     expected.pop("feeders")
                     self.assertEqual(value, expected)
                     self.assertEqual(
-                        bridge.call.call_args_list[-1],
+                        wait_reads(bridge)[-1],
                         call("entity_feeders", {"target_ref": "target"}),
                     )
 
