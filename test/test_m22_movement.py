@@ -16,8 +16,10 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(phrase, text)
         for phrase in (
             "With within set, the original goal is used unchanged",
-            "Check a move's result before acting on targets near the destination",
-            "out_of_range if the walk failed",
+            "Check a move's result before acting on targets near the destination; "
+            "later transfers can fail with out_of_range if the walk failed. "
+            "A successful move ending on a transport-belt, underground-belt or splitter "
+            "includes standing_on_belt=true and a hint to stand off belts.",
         ):
             self.assertIn(phrase, description)
 

@@ -983,7 +983,14 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 "stalled": False,
             },
         )
-        bridge.call.assert_called_once_with("get_research_status", None)
+        self.assertEqual(
+            [entry.args for entry in bridge.call.call_args_list],
+            [
+                ("get_character_position", None),
+                ("get_research_status", None),
+                ("get_character_position", None),
+            ],
+        )
         sleep.assert_not_awaited()
 
     async def test_research_wait_returns_immediately_when_not_queued(self):
@@ -1009,12 +1016,20 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(value["researching"])
                 self.assertIsNone(value["progress"])
                 self.assertFalse(value["timed_out"])
-                bridge.call.assert_called_once_with("get_research_status", None)
+                self.assertEqual(
+                    [entry.args for entry in bridge.call.call_args_list],
+                    [
+                        ("get_character_position", None),
+                        ("get_research_status", None),
+                        ("get_character_position", None),
+                    ],
+                )
                 sleep.assert_not_awaited()
 
     async def test_research_wait_follows_queue_until_researched(self):
         bridge = Mock()
         bridge.call.side_effect = [
+            {"result": {}},  # Initial position unavailable.
             {"result": {"queue": ["automation"], "current": "other", "progress": 0.9}},
             {"result": {"current": "automation", "progress": 0.5}},
             {"result": {"researched": ["automation"]}},
@@ -1026,13 +1041,14 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.is_error)
         self.assertTrue(payload(result)["researched"])
         self.assertFalse(payload(result)["timed_out"])
-        self.assertEqual(bridge.call.call_count, 3)
+        self.assertEqual(bridge.call.call_count, 5)
         self.assertEqual(sleep.await_count, 2)
         sleep.assert_awaited_with(0.25)
 
     async def test_research_wait_returns_when_removed_from_queue(self):
         bridge = Mock()
         bridge.call.side_effect = [
+            {"result": {}},  # Initial position unavailable.
             {"result": {"queue": ["automation"]}},
             {"result": {"queue": {}}},
         ]
@@ -1045,7 +1061,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload(result)["researching"])
         self.assertIsNone(payload(result)["progress"])
         self.assertFalse(payload(result)["timed_out"])
-        self.assertEqual(bridge.call.call_count, 2)
+        self.assertEqual(bridge.call.call_count, 4)
         sleep.assert_awaited_once_with(0.25)
 
     async def test_research_wait_timeout_preserves_current_progress(self):
@@ -1082,11 +1098,12 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
                 self.assertEqual(sleeper.await_count, 4)
-                self.assertEqual(bridge.call.call_count, 5)
+                self.assertEqual(bridge.call.call_count, 7)
 
     async def test_research_wait_handles_bridge_errors_and_unconfigured(self):
         bridge = Mock()
         bridge.call.side_effect = [
+            {"result": {}},  # Initial position unavailable.
             {"result": {"current": "automation"}},
             BridgeError("not_connected", "Disconnected", {"request_id": "req"}),
         ]

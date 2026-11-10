@@ -3247,6 +3247,248 @@ def main():
             and bridge.call("get_agent_status")["result"]["position"] == diagnostics_position,
         )
 
+    # M28: use an isolated surface and stash whole inventory slots to preserve
+    # qualities, durability and the original character position exactly.
+    m28_surface = "m28_waits_check_line"
+    m28_inventory = bridge.call("get_inventory")["result"]["items"]
+    m28_position = bridge.call("get_agent_status")["result"]["position"]
+    m28_server = create_server(bridge)
+
+    def m28_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;"
+            "local c=state and state.character;assert(c and c.valid);"
+            f'local name="{m28_surface}";local s=game.surfaces[name];'
+            "local inv=c.get_main_inventory();assert(inv);" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m28:" not in raw:
+            raise RuntimeError("M28 fixture failed: " + raw)
+        return json.loads(raw.split("m28:", 1)[1].strip())
+
+    async def m28_tool(operation, params):
+        # Invalid argument exceptions carry the same JSON error as tool results.
+        from mcp.server.mcpserver.exceptions import ToolError
+
+        try:
+            response = await m28_server.call_tool(operation, params)
+        except ToolError as exc:
+            return True, json.loads(str(exc))
+        return response.is_error, json.loads(response.content[0].text)
+
+    def m28_check(x1, y1, x2, y2, item="transport-belt"):
+        is_error, result = asyncio.run(
+            m28_tool(
+                "check_line",
+                {
+                    "item": item,
+                    "surface": m28_surface,
+                    "from_x": x1,
+                    "from_y": y1,
+                    "to_x": x2,
+                    "to_y": y2,
+                },
+            )
+        )
+        assert not is_error, result
+        return result
+
+    try:
+        m28_fixture(
+            "assert(not state.action and not state.craft_action);"
+            "assert(not s and not storage.m28_backup,'M28 fixture already exists');"
+            "local b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv),last_observation=state.last_observation,"
+            "recent_observations=state.recent_observations};storage.m28_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=128,height=128});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},2);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-64,63 do for y=-64,63 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,4.5},s));assert(c.build_distance<13);"
+            "state.last_observation=nil;state.recent_observations={};"
+            'b.belt=s.create_entity{name="transport-belt",position={8.5,0.5},'
+            'direction=4,force="neutral"};assert(b.belt);b.belt.active=false;'
+            'b.opposite=s.create_entity{name="transport-belt",position={3.5,2.5},'
+            "direction=12,force=c.force};assert(b.opposite);b.opposite.active=false;"
+            'b.secret=s.create_entity{name="wooden-chest",position={25.5,-4.5},'
+            "force=c.force};assert(b.secret);"
+            's.set_tiles{{name="water",position={26,-5}}};'
+            'assert(s.create_entity{name="item-on-ground",position={4.5,0.5},'
+            'stack={name="wood",count=2}});'
+            # Trees use mining reach through can_reach_entity, not ordinary reach.
+            # Keep it two tiles away and west of every check_line row and move path.
+            'b.tree=s.create_entity{name="tree-01",position={-1.5,4.5}};assert(b.tree);'
+            "assert(c.can_reach_entity(b.tree),'M28 fixture tree outside mining reach');"
+            "rcon.print('m28:{\"ready\":true}')"
+        )
+        observed = bridge.call("observe_nearby")["result"]
+        baseline = m28_fixture(
+            "rcon.print('m28:'..helpers.table_to_json({count=#s.find_entities(),"
+            "inventory=inv.get_contents()}))"
+        )
+        clear = m28_check(1.5, 0.5, 5.5, 0.5)
+        after_check = m28_fixture(
+            "rcon.print('m28:'..helpers.table_to_json({count=#s.find_entities(),"
+            "inventory=inv.get_contents()}))"
+        )
+        record(
+            "M28 observed clear line ignores ground items and places/consumes nothing",
+            clear.get("complete") is True
+            and clear.get("clear") == clear.get("requested") == 5
+            and clear.get("already_present") == 0
+            and clear.get("problems") == []
+            and clear.get("problem_total") == 0
+            and baseline == after_check
+            and bridge.call("get_inventory")["result"]["items"] in ([], {}),
+            json.dumps(clear),
+        )
+        m28_fixture(
+            'local b=storage.m28_backup;b.obstacle=s.create_entity{name="wooden-chest",'
+            "position={3.5,0.5},force=c.force};assert(b.obstacle);"
+            "rcon.print('m28:{\"obstacle\":true}')"
+        )
+        blocked = m28_check(1.5, 0.5, 5.5, 0.5)
+        problem = next(iter(blocked.get("problems", [])), {})
+        record(
+            "M28 fixture chest is a named blocker at the correct tile",
+            blocked.get("complete") is False
+            and blocked.get("problem_total") == 1
+            and (problem.get("x"), problem.get("y"), problem.get("reason")) == (3.5, 0.5, "blocked")
+            and any(
+                e.get("name") == "wooden-chest" and e.get("target_ref")
+                for e in problem.get("blocking", [])
+            ),
+            json.dumps(blocked),
+        )
+        distant = m28_check(13.5, 4.5, 14.5, 4.5)
+        record(
+            "M28 observed tiles beyond build reach are clear",
+            distant.get("complete") is True and distant.get("clear") == 2,
+            json.dumps(distant),
+        )
+        hidden = m28_check(12.5, -4.5, 44.5, -4.5)
+        expected_hidden = [
+            {"x": x + 0.5, "y": -4.5, "reason": "not_visible"}
+            for x in range(12, 45)
+            if math.hypot(x + 0.5 - observed["position"]["x"], -4.5 - observed["position"]["y"])
+            > observed["radius"]
+        ]
+        record(
+            "M28 unobserved tiles hide fixture chest/water and cap problems at 16",
+            hidden.get("complete") is False
+            and hidden.get("problem_total") == len(expected_hidden)
+            and hidden.get("problems") == expected_hidden[:16],
+            json.dumps(hidden),
+        )
+        opposite = m28_check(1.5, 2.5, 5.5, 2.5)
+        record(
+            "M28 opposite belt reports different_direction",
+            opposite.get("problems")
+            == [{"x": 3.5, "y": 2.5, "reason": "different_direction", "existing_direction": 12}],
+            json.dumps(opposite),
+        )
+        same = m28_check(5.5, 2.5, 1.5, 2.5)
+        record(
+            "M28 matching belt counts as already_present",
+            same.get("complete") is True
+            and same.get("already_present") == 1
+            and same.get("clear") == 4,
+            json.dumps(same),
+        )
+        tree = next(e for e in observed["entities"] if e["name"] == "tree-01")
+        started = bridge.call("mine_entity", {"target_ref": tree["target_ref"], "count": 100})[
+            "result"
+        ]
+        while_mining = m28_check(13.5, 4.5, 14.5, 4.5)
+        mining_status = bridge.call("get_action_status", {"action_id": started["action_id"]})[
+            "result"
+        ]
+        if mining_status["status"] == "running":
+            bridge.call("cancel_action", {"action_id": started["action_id"]})
+        record("M28 check_line works while mining", while_mining.get("complete") is True)
+
+        # An inactive belt makes the final-position check deterministic. Belt drift
+        # itself is covered with fake-clock unit tests, not RCON timing assumptions.
+        action("move_to", {"surface": m28_surface, "x": 8.5, "y": 4.5})
+        # Aim slightly beyond the belt centre along the approach, so the normal
+        # 0.5-tile arrival tolerance leaves the character inside its collision box.
+        is_error, belt_move = asyncio.run(
+            m28_tool("move_to", {"surface": m28_surface, "x": 8.5, "y": 0.3, "wait_seconds": 20})
+        )
+        record(
+            "M28 move_to ending on a neutral belt warns to stand off belts",
+            not is_error
+            and belt_move.get("status") == "succeeded"
+            and belt_move.get("standing_on_belt") is True
+            and "belt" in belt_move.get("hint", ""),
+            json.dumps(belt_move),
+        )
+        started = bridge.call("move_to", {"surface": m28_surface, "x": 0.5, "y": 4.5})["result"]
+        while_walking = m28_check(13.5, 4.5, 14.5, 4.5)
+        is_error, ground_move = asyncio.run(
+            m28_tool("wait_for_action", {"action_id": started["action_id"], "timeout_seconds": 20})
+        )
+        record("M28 check_line works while walking", while_walking.get("complete") is True)
+        record(
+            "M28 wait_for_action move onto ground omits belt warning",
+            not is_error
+            and ground_move.get("status") == "succeeded"
+            and "standing_on_belt" not in ground_move,
+            json.dumps(ground_move),
+        )
+        # Already-within success follows the synchronous move completion path.
+        m28_fixture("assert(c.teleport({8.5,0.5},s));rcon.print('m28:{\"on_belt\":true}')")
+        is_error, immediate = asyncio.run(
+            m28_tool("move_to", {"surface": m28_surface, "x": 8.5, "y": 0.5, "within": 0.5})
+        )
+        record(
+            "M28 immediate move success also warns on belts",
+            not is_error
+            and immediate.get("status") == "succeeded"
+            and immediate.get("standing_on_belt") is True,
+            json.dumps(immediate),
+        )
+        for threshold in (4, 51):
+            is_error, invalid = asyncio.run(
+                m28_tool(
+                    "wait_for_research", {"technology": "automation", "stall_seconds": threshold}
+                )
+            )
+            record(
+                f"M28 wait_for_research rejects stall_seconds={threshold}",
+                is_error and invalid.get("error") == "invalid_input",
+                json.dumps(invalid),
+            )
+    finally:
+        running = bridge.call("get_agent_status")["result"].get("action")
+        if running:
+            bridge.call("cancel_action", {"action_id": running.get("action_id") or running["id"]})
+        m28_fixture(
+            "local b=storage.m28_backup;if b then "
+            "assert(not state.action and not state.craft_action);"
+            "assert(c.teleport(b.position,b.surface),'M28 position restore failed');"
+            # Discard fixture items, including wood mined before cancellation.
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "b.inventory.destroy();state.last_observation=b.last_observation;"
+            "state.recent_observations=b.recent_observations;storage.m28_backup=nil;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil end;"
+            "rcon.print('m28:{\"restored\":true}')"
+        )
+        observed_map_cells.pop(m28_surface, None)
+        record(
+            "M28 fixture restores exact inventory and position",
+            bridge.call("get_inventory")["result"]["items"] == m28_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m28_position,
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
