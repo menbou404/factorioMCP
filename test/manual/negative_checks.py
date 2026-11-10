@@ -4651,6 +4651,47 @@ def main():
         blocked = m32_call("place_entity", error="blocked", **placement_args)
         batch = m32_call("place_entities", items=[placement_args])
         positions = blocked["detail"]["stand_positions"]
+        if not positions:
+            # This is the unrotated furnace at (0, 0), so its prototype box is
+            # already in world coordinates. Mirror the bounded 16-point search
+            # and tick_action's largest default successful arrival radius (1.5).
+            diagnostic = m32_fixture(
+                "local area=prototypes.entity['stone-furnace'].collision_box;"
+                "local box=c.prototype.collision_box;local arrival=1.5;"
+                "local clearance=arrival+0.15;"
+                "local left=area.left_top.x-box.right_bottom.x-clearance;"
+                "local right=area.right_bottom.x-box.left_top.x+clearance;"
+                "local top=area.left_top.y-box.right_bottom.y-clearance;"
+                "local bottom=area.right_bottom.y-box.left_top.y+clearance;"
+                "local reach=c.build_distance;local candidates={};"
+                "local function outside(p) return p and (p.x<=left or p.x>=right "
+                "or p.y<=top or p.y>=bottom) or false end;"
+                "local function dist(a,p) return math.sqrt((a.x-p.x)^2+(a.y-p.y)^2) end;"
+                "local function visible(p) if dist(c.position,p)<=16 then return true end;"
+                "for _,o in ipairs(state.recent_observations) do "
+                "if o.surface==s.name and game.tick-o.tick<=3600 "
+                "and dist(o.position,p)<=(o.radius or 16) then return true end end;"
+                "return false end;"
+                "local function check(p) "
+                "local free=s.find_non_colliding_position(c.name,p,0.5,0.1);"
+                "local distance=dist(p,{x=0,y=0});"
+                "candidates[#candidates+1]={candidate=p,"
+                "can_place=s.can_place_entity{name=c.name,position=p,force=c.force},"
+                "find_non_colliding_position=free or false,outside_box=outside(p),"
+                "search_outside_box=outside(free),distance=distance,"
+                "build_distance=reach or false,build_distance_type=type(reach),"
+                "in_build_distance=type(reach)=='number' and distance<=reach,"
+                "arrival_in_build_distance=type(reach)=='number' and distance+arrival<=reach,"
+                "visible=visible(p)} end;"
+                "for i=0,3 do local t=i/4;check({x=left+(right-left)*t,y=top});"
+                "check({x=right,y=top+(bottom-top)*t});"
+                "check({x=right-(right-left)*t,y=bottom});"
+                "check({x=left,y=bottom-(bottom-top)*t}) end;"
+                "rcon.print('m32:'..helpers.table_to_json({area=area,character_box=box,"
+                "character_position=c.position,surface=s.name,arrival_radius=arrival,"
+                "candidates=candidates}))"
+            )
+            print("M32 stand-position diagnostic " + json.dumps(diagnostic), flush=True)
         record(
             "M32 single, batch and preview return stand positions for character obstruction",
             blocked["detail"]["reason"] == checked["blocked_reason"] == "character_in_the_way"
@@ -4661,9 +4702,16 @@ def main():
             == sorted(math.hypot(p["x"], p["y"]) for p in positions),
             json.dumps(blocked),
         )
-        m32_call("move_to", surface=m32_surface, **positions[0])
-        replaced = m32_call("place_entity", **placement_args)
-        record("M32 move_to suggested stand position then placement succeeds", replaced["ok"])
+        if positions:
+            m32_call("move_to", surface=m32_surface, **positions[0])
+            replaced = m32_call("place_entity", **placement_args)
+            record("M32 move_to suggested stand position then placement succeeds", replaced["ok"])
+        else:
+            record(
+                "M32 move_to suggested stand position then placement succeeds",
+                False,
+                "no stand position returned; see fixture diagnostic above",
+            )
     finally:
         for slot in ("action", "craft_action"):
             pending = m32_fixture(

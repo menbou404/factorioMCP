@@ -12,6 +12,8 @@ local MAP_CELL_SIZE = 8
 local MAX_EXPLORED_CELLS = 16384
 local TARGET_TTL_TICKS = 60 * 60
 local ACTION_TIMEOUT_TICKS = 60 * 120
+local MOVE_ARRIVAL_RADIUS = 0.5
+local MOVE_BLOCKED_ARRIVAL_RADIUS = 1.5
 local ENTITY_STATUS_NAMES = {}
 for name, value in pairs(defines.entity_status) do
   ENTITY_STATUS_NAMES[value] = name
@@ -1902,24 +1904,32 @@ end
 local function placement_stand_positions(state, character, area, position)
   local box = character.prototype.collision_box
   if not box then return {} end
-  -- Expand by the character footprint plus move_to's 0.5-tile arrival
-  -- tolerance and a 0.15 margin, including rotated/asymmetric entity boxes.
-  local left = area.left_top.x - box.right_bottom.x - 0.65
-  local right = area.right_bottom.x - box.left_top.x + 0.65
-  local top = area.left_top.y - box.right_bottom.y - 0.65
-  local bottom = area.right_bottom.y - box.left_top.y + 0.65
+  -- Default move_to can also succeed at the blocked-goal fallback radius.
+  -- Every point in that arrival disk must clear the placement's world-space
+  -- box, including asymmetric character footprints and fixed-point rounding.
+  local arrival = math.max(MOVE_ARRIVAL_RADIUS, MOVE_BLOCKED_ARRIVAL_RADIUS)
+  local clearance = arrival + 0.15
+  local left = area.left_top.x - box.right_bottom.x - clearance
+  local right = area.right_bottom.x - box.left_top.x + clearance
+  local top = area.left_top.y - box.right_bottom.y - clearance
+  local bottom = area.right_bottom.y - box.left_top.y + clearance
+  -- 2.0.77 LuaControl.build_distance is a non-optional uint32 for characters.
+  local reach = character.build_distance - arrival
+  if reach < 0 then return {} end
   local positions = {}
   local function consider(candidate)
-    local free = character.surface.find_non_colliding_position(character.name, candidate, 0.5, 0.1)
-    if not free then return end
-    -- The search may shift back into the proposed entity; check its result too.
-    if not (free.x <= left or free.x >= right or free.y <= top or free.y >= bottom) or
-       distance_squared(free, position) > character.build_distance ^ 2 or
-       not placement_visible(state, character, free) then return end
+    if distance_squared(candidate, position) > reach ^ 2 or
+       not placement_visible(state, character, candidate) then return end
+    -- 2.0.77 LuaSurface.can_place_entity checks terrain/entity collisions at
+    -- the supplied MapPosition for an EntityID, including character prototypes.
+    -- Do not search nearby: a shifted result can lose the arrival clearance.
+    if not character.surface.can_place_entity{
+      name = character.name, position = candidate, force = character.force
+    } then return end
     for _, other in ipairs(positions) do
-      if distance_squared(free, other) < 0.04 then return end
+      if distance_squared(candidate, other) < 0.04 then return end
     end
-    positions[#positions + 1] = {x = free.x, y = free.y}
+    positions[#positions + 1] = {x = candidate.x, y = candidate.y}
   end
   -- Sixteen candidates around a small perimeter; no large area/path searches.
   for i = 0, 3 do
@@ -3302,7 +3312,7 @@ local function tick_action(state, slot)
     if finish_move_within(state) then return end
     if not action.path then return end
     local d = math.sqrt(distance_squared(character.position, action.goal))
-    if d <= 0.5 then
+    if d <= MOVE_ARRIVAL_RADIUS then
       finish_action(state, slot, "succeeded", nil, {position = position_data(character)})
       return
     end
@@ -3323,7 +3333,7 @@ local function tick_action(state, slot)
         action.final_progress_tick = game.tick
       end
       if game.tick - action.final_progress_tick >= 60 then
-        if d <= 1.5 then
+        if d <= MOVE_BLOCKED_ARRIVAL_RADIUS then
           finish_action(state, slot, "succeeded", nil,
             {position = position_data(character), distance = d, goal_blocked = true})
         else

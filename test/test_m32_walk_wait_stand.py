@@ -1,6 +1,9 @@
+import ast
 import copy
 import json
+import math
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from factorio_mcp.bridge import BridgeError, FactorioBridge
@@ -42,6 +45,95 @@ def status(state):
 
 def payload(response):
     return json.loads(response.content[0].text)
+
+
+class StandFixtureTests(unittest.TestCase):
+    def run_stand_fixture(self, positions):
+        # Execute CA and its actual finally block without importing the manual
+        # runner, which reads real RCON credentials via production_line.
+        source = Path(__file__).parent / "manual" / "negative_checks.py"
+        main = next(
+            node
+            for node in ast.parse(source.read_text(encoding="utf-8")).body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        for fixture in ast.walk(main):
+            if not isinstance(fixture, ast.Try) or not fixture.finalbody:
+                continue
+            for index, node in enumerate(fixture.body):
+                if isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == "placement_args"
+                    for target in node.targets
+                ):
+                    section = ast.Try(
+                        body=fixture.body[index:],
+                        handlers=[],
+                        orelse=[],
+                        finalbody=fixture.finalbody,
+                    )
+                    break
+            else:
+                continue
+            break
+        else:
+            self.fail("M32 stand fixture not found")
+        reason = "character_in_the_way"
+        call = Mock(
+            side_effect=[
+                {"blocked_reason": reason, "stand_positions": positions},
+                {"detail": {"reason": reason, "stand_positions": positions}},
+                {"results": [{"detail": {"stand_positions": positions}}]},
+                {},
+                {"ok": True},
+            ]
+        )
+        diagnostic = {"candidates": [{"can_place": False}]}
+        fixture_call = Mock(
+            side_effect=([diagnostic] if not positions else []) + [{}, {}, {"restored": True}]
+        )
+        record = Mock()
+        events = Mock()
+        events.attach_mock(fixture_call, "fixture")
+        events.attach_mock(record, "record")
+        bridge = Mock()
+        bridge.call.side_effect = [{"result": {"items": []}}, {"result": {"position": {}}}]
+        printed = Mock()
+        namespace = {
+            "m32_surface": "fixture",
+            "m32_call": call,
+            "m32_fixture": fixture_call,
+            "record": record,
+            "json": json,
+            "math": math,
+            "print": printed,
+            "observed_map_cells": {},
+            "bridge": bridge,
+            "m32_inventory": [],
+            "m32_position": {},
+        }
+        module = ast.fix_missing_locations(ast.Module(body=[section], type_ignores=[]))
+        exec(compile(module, str(source), "exec"), namespace)
+        return call, record, printed, events
+
+    def test_empty_positions_diagnose_fail_and_restore_without_moving(self):
+        for positions in ([], {}):
+            with self.subTest(positions=positions):
+                call, record, printed, events = self.run_stand_fixture(positions)
+                self.assertEqual(call.call_count, 3)
+                self.assertEqual(
+                    [entry.args[1] for entry in record.call_args_list], [False, False, True]
+                )
+                self.assertEqual(events.mock_calls[0][0], "fixture")
+                self.assertIn("can_place", printed.call_args.args[0])
+                self.assertIn("restores exact inventory", record.call_args.args[0])
+
+    def test_populated_positions_move_then_place_and_restore(self):
+        call, record, printed, _ = self.run_stand_fixture([{"x": -2.85, "y": 0}])
+        self.assertEqual(call.call_args_list[3].args, ("move_to",))
+        self.assertEqual(call.call_args_list[3].kwargs, {"surface": "fixture", "x": -2.85, "y": 0})
+        self.assertEqual(call.call_args_list[4].args, ("place_entity",))
+        self.assertTrue(all(entry.args[1] for entry in record.call_args_list))
+        printed.assert_not_called()
 
 
 class WalkWaitStandTests(unittest.IsolatedAsyncioTestCase):
