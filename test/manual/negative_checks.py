@@ -2846,7 +2846,8 @@ def main():
             "direction=0,force=c.force};assert(b.inserter);b.inserter.active=false;"
             'assert(s.create_entity{name="burner-inserter",position={5.5,3.5},force=c.force});'
             'assert(s.create_entity{name="burner-mining-drill",position={-2,-4},force=c.force});'
-            'assert(s.create_entity{name="small-electric-pole",position={0.5,0.5},force=c.force});'
+            'local pipe=s.create_entity{name="pipe",position={0.5,0.5},force=c.force};'
+            "assert(pipe and c.can_reach_entity(pipe));"
             'assert(s.create_entity{name="electric-mining-drill",position={13.5,3.5},'
             "force=c.force});"
             'assert(s.create_entity{name="inserter",position={6.5,3.5},force="enemy"});'
@@ -2878,13 +2879,13 @@ def main():
 
         near = bridge.call(
             "observe_nearby",
-            {"names": ["electric-mining-drill", "inserter", "small-electric-pole"]},
+            {"names": ["electric-mining-drill", "inserter", "pipe"]},
         )["result"]["entities"]
         drill = next(e for e in near if e["name"] == "electric-mining-drill" and e["x"] < 0)
         far_drill = next(e for e in near if e["name"] == "electric-mining-drill" and e["x"] > 10)
         inserter = next(e for e in near if e["name"] == "inserter" and e["owned"])
         enemy = next(e for e in near if e["name"] == "inserter" and not e["owned"])
-        pole = next(e for e in near if e["name"] == "small-electric-pole")
+        pipe = next(e for e in near if e["name"] == "pipe" and e["owned"])
         refs = [drill["target_ref"], inserter["target_ref"]]
         reads = [bridge.call("get_entity_inventory", {"target_ref": ref})["result"] for ref in refs]
         for entity, result in zip((drill, inserter), reads, strict=True):
@@ -2962,13 +2963,18 @@ def main():
                 errors[label].detail["reason"] == "unsupported_entity",
             )
         for label, entity, code in (
-            ("M26 reachable pole remains unsupported", pole, "invalid_target"),
+            ("M26 reachable pipe remains unsupported", pipe, "invalid_target"),
             ("M26 distant drill remains out of range", far_drill, "out_of_range"),
             ("M26 enemy inserter remains forbidden", enemy, "invalid_target"),
         ):
             expect_error(
                 label, "get_entity_inventory", {"target_ref": entity["target_ref"]}, {code}
             )
+        record(
+            "M26 pipe rejection retains unsupported_entity reason",
+            errors["M26 reachable pipe remains unsupported"].detail.get("reason")
+            == "unsupported_entity",
+        )
         record(
             "M26 enemy inserter rejection retains other_force reason",
             errors["M26 enemy inserter remains forbidden"].detail.get("reason") == "other_force",
@@ -3868,6 +3874,347 @@ def main():
             restored.get("restored") is True
             and bridge.call("get_inventory")["result"]["items"] == m29_inventory
             and bridge.call("get_agent_status")["result"]["position"] == m29_position,
+        )
+
+    # M30: isolate all entities and stash actual inventory stacks, including metadata.
+    m30_surface = "m30-mining-power-fixture"
+    m30_server = create_server(bridge)
+    m30_inventory = bridge.call("get_inventory")["result"]["items"]
+    m30_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m30_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m30_surface}";local s=game.surfaces[name];'
+            "local b=storage.m30_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m30:" not in raw:
+            raise RuntimeError("M30 fixture failed: " + raw)
+        return json.loads(raw.split("m30:", 1)[1].strip())
+
+    async def m30_tool(operation, params):
+        response = await m30_server.call_tool(operation, params)
+        assert not response.is_error, response
+        return json.loads(response.content[0].text)
+
+    def m30_call(operation, **params):
+        return asyncio.run(m30_tool(operation, params))
+
+    # Reproduce the old mining counter: all inventory items plus queued final products.
+    m30_craft_counts = (
+        "local n=0;local total=inv.get_item_count();"
+        "for _,q in ipairs(c.crafting_queue or {}) do "
+        "if q.prerequisite then n=n+q.count else "
+        "for _,p in pairs(c.force.recipes[q.recipe].products) do "
+        "if p.type=='item' then total=total+q.count*(p.amount or 0) end end end end;"
+    )
+
+    try:
+        setup = m30_fixture(
+            "assert(not s and not b,'M30 fixture already exists');"
+            # Refuse before mutation if another test left work in progress: an empty
+            # queue can be restored exactly without restarting partially completed crafts.
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv),mining=c.character_mining_speed_modifier,"
+            "last_observation=state.last_observation,recent_observations=state.recent_observations,"
+            "hand_crafted=helpers.table_to_json(state.hand_crafted),"
+            "recipes={['electronic-circuit']=c.force.recipes['electronic-circuit'].enabled,"
+            "['copper-cable']=c.force.recipes['copper-cable'].enabled},"
+            "selected=c.selected};storage.m30_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=128,height=128});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},2);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-64,63 do for y=-64,63 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,4.5},s));assert(c.reach_distance<12);"
+            "state.last_observation=nil;state.recent_observations={};"
+            'b.rock=s.create_entity{name="big-rock",position={2.5,4.5}};'
+            'b.tree=s.create_entity{name="tree-01",position={-1.5,4.5}};'
+            'b.ore=s.create_entity{name="iron-ore",position={0.5,6.5},amount=100};'
+            # Fixture creation needs no recipe unlocks; only gears are machine crafted.
+            'b.pole=s.create_entity{name="small-electric-pole",position={0.5,0.5},force=c.force};'
+            'b.far=s.create_entity{name="small-electric-pole",position={12.5,4.5},force=c.force};'
+            'b.machine=s.create_entity{name="assembling-machine-1",position={2.5,0.5},'
+            "force=c.force};assert(b.rock and b.tree and b.ore and b.pole and b.far and b.machine);"
+            'b.machine.set_recipe("iron-gear-wheel");'
+            'assert(b.machine.insert{name="iron-plate",count=100}==100);'
+            "b.has_generator=prototypes.entity['electric-energy-interface']~=nil;"
+            "if b.has_generator then "
+            'b.generator=s.create_entity{name="electric-energy-interface",position={-1.5,0.5},'
+            "force=c.force};assert(b.generator);b.generator.power_production=1000000/60;"
+            "b.generator.power_usage=0;b.generator.electric_buffer_size=1000000;"
+            "b.generator.energy=1000000 end;"
+            "assert(c.can_reach_entity(b.pole) and c.can_reach_entity(b.rock));"
+            "assert((c.position.x-b.rock.position.x)^2+(c.position.y-b.rock.position.y)^2 "
+            "<=c.resource_reach_distance^2);"
+            "b.products={};for _,p in pairs(b.rock.prototype.mineable_properties.products) do "
+            "if p.type=='item' then b.products[p.name]=true end end;"
+            # In 2.0.77 electronics unlocks both recipes; restore their exact flags below.
+            "for recipe in pairs(b.recipes) do c.force.recipes[recipe].enabled=true end;"
+            # One circuit needs three cables. Two copper plates make four, leaving
+            # one cable that raises the old mining counter without any rock products.
+            'assert(inv.insert{name="iron-plate",count=1}==1);'
+            'assert(inv.insert{name="copper-plate",count=2}==2);'
+            "rcon.print('m30:'..helpers.table_to_json({has_generator=b.has_generator}))"
+        )
+        observed = m30_call("observe_nearby")
+        refs = {
+            "rock": next(e["target_ref"] for e in observed["entities"] if e["name"] == "big-rock"),
+            "tree": next(e["target_ref"] for e in observed["entities"] if e["name"] == "tree-01"),
+            "ore": next(e["target_ref"] for e in observed["entities"] if e["name"] == "iron-ore"),
+            "pole": next(
+                e["target_ref"]
+                for e in observed["entities"]
+                if e["name"] == "small-electric-pole" and e["x"] == 0.5
+            ),
+            "far": next(
+                e["target_ref"]
+                for e in observed["entities"]
+                if e["name"] == "small-electric-pole" and e["x"] == 12.5
+            ),
+        }
+        craft = m30_call("craft", recipe="electronic-circuit", count=1)
+        queued = m30_fixture(
+            m30_craft_counts
+            + "for product in pairs(b.products) do assert(inv.get_item_count(product)==0) end;"
+            # Measure the actual queue, including partially completed work, before
+            # starting mining. Slow this rock to outlast the entire remaining queue
+            # by three seconds, while staying below the 20 s mining stall timeout.
+            "assert(n>0,'M30 requires unfinished prerequisite crafts');"
+            "assert(total==1 and inv.get_item_count('copper-cable')==0,"
+            "'M30 requires the leftover cable to appear after mining starts');"
+            "local craft_seconds=0;local recipes={};assert(c.crafting_speed>0);"
+            "for i,q in ipairs(c.crafting_queue) do "
+            "local count=q.count-(i==1 and c.crafting_queue_progress or 0);"
+            "local seconds=count*c.force.recipes[q.recipe].energy/c.crafting_speed;"
+            "craft_seconds=craft_seconds+seconds;"
+            "recipes[#recipes+1]={recipe=q.recipe,seconds=seconds,prerequisite=q.prerequisite} end;"
+            "local rock_seconds=math.max(5,craft_seconds+3);"
+            "assert(rock_seconds<18,'M30 craft queue is too slow for mining stall timeout');"
+            "local mining_time=b.rock.prototype.mineable_properties.mining_time;"
+            "local base_speed=c.prototype.mining_speed;assert(mining_time>0 and base_speed>0);"
+            "local original_speed=base_speed*(1+c.force.manual_mining_speed_modifier+b.mining);"
+            "c.character_mining_speed_modifier=mining_time/(base_speed*rock_seconds)"
+            "-1-c.force.manual_mining_speed_modifier;"
+            "local mining_speed=base_speed*(1+c.force.manual_mining_speed_modifier"
+            "+c.character_mining_speed_modifier);assert(mining_speed>0);"
+            "rcon.print('m30:'..helpers.table_to_json({prerequisites=n,total_count=total,"
+            "craft_seconds=craft_seconds,recipes=recipes,mining_time=mining_time,"
+            "original_mining_speed=original_speed,mining_speed=mining_speed,"
+            "rock_seconds=mining_time/mining_speed}))"
+        )
+        assert queued["prerequisites"] > 0, queued
+        started = m30_call("mine_entity", target_ref=refs["rock"], count=1)
+        assert abs(started["estimated_seconds"] - queued["rock_seconds"]) < 0.2, (started, queued)
+        snapshots = []
+        crafted_snapshot = None
+        deadline = time.monotonic() + 30
+        while True:
+            # Normal protocol reads keep the connection heartbeat alive as well as
+            # exercising the public running-detail count during concurrent crafts.
+            live_status = m30_call("get_action_status", action_id=started["action_id"])
+            # Capture existence and action progress atomically, avoiding an RCON race
+            # where the rock disappears between a status read and a fixture read.
+            snapshot = m30_fixture(
+                f"local id={json.dumps(started['action_id'])};"
+                "local a=(state.action and state.action.id==id and state.action) or "
+                "state.completed_actions[id];assert(a);"
+                + m30_craft_counts
+                + "local products=0;for _,item in pairs(inv.get_contents()) do "
+                "if b.products[item.name] then products=products+item.count end end;"
+                "rcon.print('m30:'..helpers.table_to_json({exists=b.rock.valid,status=a.status,"
+                "gained=(a.detail and a.detail.gained) or a.gained,products=products,"
+                "prerequisites=n,total_count=total,queue_size=c.crafting_queue_size,"
+                "circuits=inv.get_item_count('electronic-circuit'),"
+                "cables=inv.get_item_count('copper-cable'),"
+                "plates=inv.get_item_count('iron-plate')+inv.get_item_count('copper-plate')}))"
+            )
+            snapshot["reported_gained"] = live_status["detail"]["gained"]
+            snapshots.append(snapshot)
+            # Preserve the completed circuit and leftover cable while mining still
+            # runs; later samples verify the mine never finishes before removal.
+            if crafted_snapshot is None and snapshot["exists"] and snapshot["queue_size"] == 0:
+                crafted_snapshot = snapshot
+            if snapshot["status"] != "running" or time.monotonic() >= deadline:
+                break
+            time.sleep(1 / 60)
+        record(
+            "M30 rock stays running with zero gained after crafting leaves an extra cable",
+            crafted_snapshot is not None
+            and crafted_snapshot["exists"]
+            and crafted_snapshot["status"] == "running"
+            and crafted_snapshot["gained"] == crafted_snapshot["reported_gained"] == 0
+            and crafted_snapshot["products"] == 0
+            and crafted_snapshot["prerequisites"] == 0
+            and crafted_snapshot["circuits"] == crafted_snapshot["cables"] == 1
+            and crafted_snapshot["plates"] == 0
+            # The leftover cable raises the old counter by one and would finish early.
+            and crafted_snapshot["total_count"] == queued["total_count"] + 1
+            and all(
+                s["status"] == "running" and s["gained"] == s["reported_gained"] == 0
+                for s in snapshots
+                if s["exists"]
+            ),
+            json.dumps({"queued": queued, "crafted": crafted_snapshot, "last": snapshot}),
+        )
+        rock_result = m30_call("get_action_status", action_id=started["action_id"])
+        record(
+            "M30 rock succeeds only after removal; gained is exactly its item products",
+            snapshot["status"] == "succeeded"
+            and not snapshot["exists"]
+            and snapshot["products"] > 1
+            and snapshot["gained"] == snapshot["products"]
+            and rock_result["detail"]["gained"] == snapshot["products"],
+        )
+        crafted = m30_call("wait_for_action", action_id=craft["action_id"], timeout_seconds=30)
+        assert crafted["status"] == "succeeded", crafted
+        m30_fixture(
+            "c.character_mining_speed_modifier=b.mining;rcon.print('m30:{\"normal_speed\":true}')"
+        )
+        for key in ("tree", "ore"):
+            started = m30_call("mine_entity", target_ref=refs[key], count=1)
+            done = m30_call("wait_for_action", action_id=started["action_id"], timeout_seconds=20)
+            exists = m30_fixture(
+                "rcon.print('m30:'..helpers.table_to_json({exists=b." + key + ".valid}))"
+            )["exists"]
+            record(
+                "M30 ordinary " + key + " mine succeeds",
+                done["status"] == "succeeded"
+                and done["detail"]["gained"] >= 1
+                and exists == (key == "ore"),
+                json.dumps(done),
+            )
+
+        # Allow the entire five-second average to fill even with a very fast miner.
+        time.sleep(5.2)
+        pole = m30_call("get_entity_inventory", target_ref=refs["pole"])
+        power = m30_fixture(
+            "rcon.print('m30:'..helpers.table_to_json({id=b.pole.electric_network_id,"
+            "finished=b.machine.products_finished}))"
+        )
+        network = pole.get("electric_network", {})
+
+        def m30_flow_list(entries):
+            return (
+                isinstance(entries, list)
+                and len(entries) <= 10
+                and all(
+                    isinstance(e.get("name"), str)
+                    and isinstance(e.get("kw"), (float, int))
+                    and e["kw"] > 0
+                    and round(e["kw"], 1) == e["kw"]
+                    for e in entries
+                )
+                and [e["kw"] for e in entries] == sorted((e["kw"] for e in entries), reverse=True)
+            )
+
+        record(
+            "M30 nearby pole read has empty inventories and matching electric network statistics",
+            pole["inventories"] == {}
+            and network.get("id") == power.get("id")
+            and power.get("id") is not None
+            and all(
+                isinstance(network.get(k), (int, float)) and network[k] >= 0
+                for k in ("production_kw", "consumption_kw")
+            )
+            and all(m30_flow_list(network.get(k)) for k in ("producers", "consumers")),
+            json.dumps(pole),
+        )
+        if setup["has_generator"]:
+            record(
+                "M30 powered machine consumes power; interface produces power in kW",
+                power["finished"] > 0
+                and 0 < network.get("production_kw", 0) <= 1000
+                and 0 < network.get("consumption_kw", 0) < 1000
+                and any(e["name"] == "electric-energy-interface" for e in network["producers"])
+                and any(e["name"] == "assembling-machine-1" for e in network["consumers"]),
+            )
+        else:
+            record(
+                "M30 no interface prototype: tested zero power and field shape only",
+                network.get("production_kw") == 0 and network.get("producers") == [],
+            )
+        batch = m30_call("get_entity_inventories", target_refs=[refs["pole"], refs["far"]])
+        record(
+            "M30 batch pole read succeeds and distant pole returns out_of_range",
+            batch["results"][0]["ok"]
+            and batch["results"][0]["result"]["electric_network"]["id"] == power["id"]
+            and not batch["results"][1]["ok"]
+            and batch["results"][1]["error"] == "out_of_range",
+        )
+        expect_error(
+            "M30 distant pole single read returns out_of_range",
+            "get_entity_inventory",
+            {"target_ref": refs["far"]},
+            {"out_of_range"},
+        )
+        expect_error(
+            "M30 transfer to pole still rejects unsupported_entity",
+            "transfer_item",
+            {
+                "target_ref": refs["pole"],
+                "direction": "to_entity",
+                "inventory_role": "main",
+                "item": "iron-plate",
+                "count": 1,
+            },
+            {"invalid_target"},
+        )
+        record(
+            "M30 pole transfer preserves the existing unsupported_entity detail",
+            errors["M30 transfer to pole still rejects unsupported_entity"].detail["reason"]
+            == "unsupported_entity",
+        )
+    finally:
+        # Cancel through the mod so mining state, actions and crafting returns are
+        # handled normally, even if a preceding assertion failed mid-action.
+        for slot in ("action", "craft_action"):
+            pending = m30_fixture(
+                f"rcon.print('m30:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m30_fixture(
+            "if b then while c.crafting_queue_size>0 do "
+            "c.cancel_crafting{index=1,count=c.crafting_queue[1].count} end;"
+            "c.character_mining_speed_modifier=b.mining;"
+            "assert(c.character_mining_speed_modifier==b.mining);"
+            "for recipe,enabled in pairs(b.recipes) do "
+            "c.force.recipes[recipe].enabled=enabled;"
+            "assert(c.force.recipes[recipe].enabled==enabled) end;"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            # Clear fixture products, including the circuit and leftover cable,
+            # before swapping the original stacks back into their exact slots.
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();state.hand_crafted=helpers.json_to_table(b.hand_crafted);"
+            "state.last_observation=b.last_observation;"
+            "state.recent_observations=b.recent_observations;"
+            "for ref,entry in pairs(state.targets) do if entry.entity and entry.entity.valid "
+            "and entry.entity.surface==s then if entry.unit_number then "
+            "state.owned_refs[entry.unit_number]=nil end;state.targets[ref]=nil end end;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil;"
+            "storage.m30_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;rcon.print('m30:{\"restored\":true}')"
+        )
+        observed_map_cells.pop(m30_surface, None)
+        record(
+            "M30 restores exact inventory slots, empty queue and position; removes fixture",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m30_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m30_position,
         )
 
     failed = [label for label, passed, _ in results if not passed]
