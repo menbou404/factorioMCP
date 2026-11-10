@@ -3489,6 +3489,387 @@ def main():
             and bridge.call("get_agent_status")["result"]["position"] == m28_position,
         )
 
+    # M29: fixtures live on a disposable surface; no existing inserter is touched.
+    m29_surface = "m29-filter-fixture"
+    m29_server = create_server(bridge)
+    m29_inventory = bridge.call("get_inventory")["result"]["items"]
+    m29_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m29_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;"
+            "local c=state and state.character;assert(c and c.valid);"
+            f'local name="{m29_surface}";local s=game.surfaces[name];'
+            "local inv=c.get_main_inventory();assert(inv);local b=storage.m29_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m29:" not in raw:
+            raise RuntimeError("M29 fixture failed: " + raw)
+        return json.loads(raw.split("m29:", 1)[1].strip())
+
+    async def m29_tool(operation, params):
+        from mcp.server.mcpserver.exceptions import ToolError
+
+        try:
+            response = await m29_server.call_tool(operation, params)
+        except ToolError as exc:
+            return True, json.loads(str(exc))
+        return response.is_error, json.loads(response.content[0].text)
+
+    def m29_call(operation, **params):
+        is_error, value = asyncio.run(m29_tool(operation, params))
+        assert not is_error, value
+        return value
+
+    try:
+        setup = m29_fixture(
+            "assert(not state.action and not state.craft_action);"
+            "assert(not s and not b,'M29 fixture already exists');"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv),last_observation=state.last_observation,"
+            "recent_observations=state.recent_observations};storage.m29_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=128,height=128});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},2);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-64,63 do for y=-64,63 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,4.5},s));assert(c.reach_distance<12);"
+            "state.last_observation=nil;state.recent_observations={};"
+            'b.inserter=s.create_entity{name="inserter",position={1.5,3.5},force=c.force};'
+            'b.burner=s.create_entity{name="burner-inserter",position={-2.5,3.5},'
+            "direction=8,force=c.force};"
+            'b.splitter=s.create_entity{name="splitter",position={3,1.5},force=c.force};'
+            'b.far=s.create_entity{name="inserter",position={12.5,4.5},force=c.force};'
+            'b.enemy=s.create_entity{name="inserter",position={-4.5,3.5},force="enemy"};'
+            "assert(b.inserter and b.burner and b.splitter and b.far and b.enemy);"
+            "b.inserter.active=false;b.burner.active=false;b.far.active=false;b.enemy.active=false;"
+            'b.source=s.create_entity{name="wooden-chest",position=b.burner.pickup_position,'
+            "force=c.force};"
+            'b.dest=s.create_entity{name="wooden-chest",position=b.burner.drop_position,'
+            "force=c.force};assert(b.source and b.dest);"
+            'assert(b.source.insert{name="iron-plate",count=4}==4);'
+            'assert(b.source.insert{name="copper-plate",count=4}==4);'
+            "assert(c.can_reach_entity(b.inserter) and c.can_reach_entity(b.burner) and "
+            "c.can_reach_entity(b.splitter));"
+            "rcon.print('m29:'..helpers.table_to_json({burner_slots=b.burner.filter_slot_count}))"
+        )
+        observed = m29_call("observe_nearby")
+        refs = {
+            "inserter": next(
+                e["target_ref"]
+                for e in observed["entities"]
+                if e["name"] == "inserter" and e["x"] == 1.5
+            ),
+            "burner": next(
+                e["target_ref"] for e in observed["entities"] if e["name"] == "burner-inserter"
+            ),
+            "splitter": next(
+                e["target_ref"] for e in observed["entities"] if e["name"] == "splitter"
+            ),
+            "chest": next(
+                e["target_ref"] for e in observed["entities"] if e["name"] == "wooden-chest"
+            ),
+            "far": next(
+                e["target_ref"]
+                for e in observed["entities"]
+                if e["name"] == "inserter" and e["x"] == 12.5
+            ),
+            "enemy": next(
+                e["target_ref"]
+                for e in observed["entities"]
+                if e["name"] == "inserter" and e["x"] == -4.5
+            ),
+        }
+
+        def m29_contents():
+            return m29_fixture(
+                "local function held(e) local h=e.held_stack;return h and h.valid_for_read and "
+                "{name=h.name,count=h.count,quality=h.quality.name} or nil end;"
+                "rcon.print('m29:'..helpers.table_to_json({inventory=inv.get_contents(),"
+                "source=b.source.get_inventory(defines.inventory.chest).get_contents(),"
+                "dest=b.dest.get_inventory(defines.inventory.chest).get_contents(),"
+                "fuel=b.burner.get_fuel_inventory().get_contents(),"
+                "inserter=held(b.inserter),burner=held(b.burner)}))"
+            )
+
+        initial_contents = m29_contents()
+        desired = ["iron-plate", "copper-plate"]
+        configured = m29_call("set_inserter_filter", target_ref=refs["inserter"], items=desired)
+        read = m29_call("get_entity_inventory", target_ref=refs["inserter"])
+        batch = m29_call("get_entity_inventories", target_refs=[refs["inserter"]])
+        record(
+            "M29 whitelist result, single and batch inventory read-back",
+            configured.get("name") == "inserter"
+            and configured.get("use_filters") is True
+            and configured.get("mode") == "whitelist"
+            and configured.get("filters") == desired
+            and configured.get("position", {}).get("surface") == m29_surface
+            and read.get("filters") == desired
+            and read.get("filter_mode") == "whitelist"
+            and batch["results"][0]["result"].get("filters") == desired,
+            json.dumps(configured),
+        )
+        configured = m29_call(
+            "set_inserter_filter", target_ref=refs["inserter"], items=list(reversed(desired))
+        )
+        record(
+            "M29 existing filter names can be reordered",
+            configured.get("filters") == list(reversed(desired)),
+        )
+        configured = m29_call("set_inserter_filter", target_ref=refs["inserter"], items=[])
+        read = m29_call("get_entity_inventory", target_ref=refs["inserter"])
+        record(
+            "M29 empty list clears slots and disables filtering",
+            configured.get("use_filters") is False
+            and configured.get("filters") == []
+            and configured.get("mode") == "whitelist"
+            and "filters" not in read
+            and "filter_mode" not in read,
+            json.dumps(configured),
+        )
+        configured = m29_call(
+            "set_inserter_filter", target_ref=refs["inserter"], items=["coal"], mode="blacklist"
+        )
+        read = m29_call("get_entity_inventory", target_ref=refs["inserter"])
+        record(
+            "M29 blacklist mode round trip",
+            configured.get("mode") == "blacklist"
+            and read.get("filter_mode") == "blacklist"
+            and read.get("filters") == ["coal"],
+        )
+        expect_error(
+            "M29 unknown inserter items are rejected",
+            "set_inserter_filter",
+            {"target_ref": refs["inserter"], "items": ["m29-unknown-a", "m29-unknown-b"]},
+            {"invalid_input"},
+        )
+        record(
+            "M29 unknown item detail lists every name",
+            errors["M29 unknown inserter items are rejected"].detail.get("unknown_items")
+            == ["m29-unknown-a", "m29-unknown-b"],
+        )
+        for label, invalid_items in (
+            ("six names", ["coal", "iron-plate", "copper-plate", "stone", "wood", "iron-ore"]),
+            ("duplicates", ["coal", "coal"]),
+        ):
+            params = {"target_ref": refs["inserter"], "items": invalid_items}
+            # Exercise both Mod-side validation and server-side validation.
+            expect_error(
+                "M29 Mod rejects " + label, "set_inserter_filter", params, {"invalid_input"}
+            )
+            is_error, value = asyncio.run(m29_tool("set_inserter_filter", params))
+            record(
+                "M29 server rejects " + label, is_error and value.get("error") == "invalid_input"
+            )
+        read = m29_call("get_entity_inventory", target_ref=refs["inserter"])
+        record(
+            "M29 rejected filters leave previous configuration unchanged",
+            read.get("filter_mode") == "blacklist" and read.get("filters") == ["coal"],
+        )
+        for label, key, code in (
+            ("chest", "chest", "invalid_target"),
+            ("distant inserter", "far", "out_of_range"),
+            ("other force", "enemy", "invalid_target"),
+        ):
+            expect_error(
+                "M29 rejects " + label,
+                "set_inserter_filter",
+                {"target_ref": refs[key], "items": ["coal"]},
+                {code},
+            )
+        record(
+            "M29 reach rejection includes distance and reach",
+            all(
+                key in errors["M29 rejects distant inserter"].detail
+                for key in ("distance", "reach")
+            ),
+        )
+
+        if setup["burner_slots"] > 0:
+            configured = m29_call(
+                "set_inserter_filter", target_ref=refs["burner"], items=["iron-plate"]
+            )
+            read = m29_call("get_entity_inventory", target_ref=refs["burner"])
+            record(
+                "M29 burner-inserter accepts filters (expected 5 slots)",
+                setup["burner_slots"] == 5
+                and configured.get("filters") == ["iron-plate"]
+                and read.get("filters") == ["iron-plate"],
+                json.dumps(setup),
+            )
+        else:
+            expect_error(
+                "M29 burner has no slots; settings unsupported in this base data",
+                "set_inserter_filter",
+                {"target_ref": refs["burner"], "items": ["iron-plate"]},
+                {"invalid_target"},
+            )
+
+        default_splitter = next(e for e in observed["entities"] if e["name"] == "splitter")
+        record(
+            "M29 default splitter observation omits settings",
+            all(
+                key not in default_splitter
+                for key in ("input_priority", "output_priority", "filter")
+            ),
+        )
+        configured = m29_call(
+            "set_splitter",
+            target_ref=refs["splitter"],
+            input_priority="right",
+            output_priority="right",
+            filter="iron-plate",
+        )
+        record(
+            "M29 splitter result reads actual priorities and filter",
+            configured.get("name") == "splitter"
+            and configured.get("input_priority") == "right"
+            and configured.get("output_priority") == "right"
+            and configured.get("filter") == "iron-plate"
+            and "hint" not in configured,
+        )
+        for compact in (False, True):
+            observed_splitter = next(
+                e
+                for e in m29_call("observe_nearby", compact=compact)["entities"]
+                if e["name"] == "splitter"
+            )
+            record(
+                f"M29 splitter observation compact={compact}",
+                observed_splitter.get("input_priority") == "right"
+                and observed_splitter.get("output_priority") == "right"
+                and observed_splitter.get("filter") == "iron-plate",
+            )
+        configured = m29_call("set_splitter", target_ref=refs["splitter"], output_priority="none")
+        record(
+            "M29 retained filter with output none becomes left with hint",
+            configured.get("output_priority") == "left"
+            and bool(configured.get("hint"))
+            and configured.get("filter") == "iron-plate"
+            and configured.get("input_priority") == "right",
+        )
+        configured = m29_call(
+            "set_splitter",
+            target_ref=refs["splitter"],
+            filter="",
+            output_priority="none",
+            input_priority="none",
+        )
+        record(
+            "M29 empty string clears splitter filter",
+            "filter" not in configured and configured.get("output_priority") == "none",
+        )
+        configured = m29_call("set_splitter", target_ref=refs["splitter"], filter="coal")
+        record(
+            "M29 new filter with default output becomes left with hint",
+            configured.get("filter") == "coal"
+            and configured.get("output_priority") == "left"
+            and bool(configured.get("hint")),
+        )
+        expect_error(
+            "M29 unknown splitter filter is rejected",
+            "set_splitter",
+            {"target_ref": refs["splitter"], "filter": "m29-unknown", "input_priority": "right"},
+            {"invalid_input"},
+        )
+        configured = m29_call("set_splitter", target_ref=refs["splitter"], output_priority="left")
+        record(
+            "M29 unknown splitter filter changes nothing",
+            configured.get("filter") == "coal"
+            and configured.get("output_priority") == "left"
+            and configured.get("input_priority") == "none",
+        )
+        configured = m29_call(
+            "set_splitter",
+            target_ref=refs["splitter"],
+            filter="",
+            input_priority="none",
+            output_priority="none",
+        )
+        for compact in (False, True):
+            cleared = next(
+                e
+                for e in m29_call("observe_nearby", compact=compact)["entities"]
+                if e["name"] == "splitter"
+            )
+            record(
+                f"M29 cleared splitter omits default fields compact={compact}",
+                all(key not in cleared for key in ("input_priority", "output_priority", "filter")),
+            )
+        expect_error(
+            "M29 non-splitter is rejected",
+            "set_splitter",
+            {"target_ref": refs["chest"], "output_priority": "right"},
+            {"invalid_target"},
+        )
+        is_error, value = asyncio.run(m29_tool("set_splitter", {"target_ref": refs["splitter"]}))
+        record(
+            "M29 splitter requires a setting", is_error and value.get("error") == "invalid_input"
+        )
+        record(
+            "M29 settings preserve character, chest, fuel and held-stack contents",
+            initial_contents == m29_contents(),
+        )
+
+        if setup["burner_slots"] > 0:
+            # No electrical network or production timing dependency: transfer only four plates.
+            m29_fixture(
+                'assert(b.burner.get_fuel_inventory().insert{name="coal",count=5}==5);'
+                "b.burner.active=true;rcon.print('m29:{\"running\":true}')"
+            )
+            deadline = time.monotonic() + 12
+            settled_at = None
+            while True:
+                arrived = m29_fixture(
+                    'rcon.print("m29:"..helpers.table_to_json({'
+                    'iron=b.dest.get_item_count("iron-plate"),'
+                    'copper=b.dest.get_item_count("copper-plate"),'
+                    'source_copper=b.source.get_item_count("copper-plate")}))'
+                )
+                now = time.monotonic()
+                if arrived["iron"] == 4 and settled_at is None:
+                    # Allow another stroke so a broken filter cannot hide a later contaminant.
+                    settled_at = now + 2
+                if (settled_at is not None and now >= settled_at) or now >= deadline:
+                    break
+                time.sleep(0.2)
+            record(
+                "M29 fueled burner whitelist transfers only the selected item",
+                arrived == {"iron": 4, "copper": 0, "source_copper": 4},
+                json.dumps(arrived),
+            )
+    finally:
+        restored = m29_fixture(
+            "if b then assert(not state.action and not state.craft_action);"
+            "assert(c.teleport(b.position,b.surface),'M29 position restore failed');"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            # swap_stack restores each original slot and all its item metadata.
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();state.last_observation=b.last_observation;"
+            "state.recent_observations=b.recent_observations;storage.m29_backup=nil;"
+            "for ref,entry in pairs(state.targets) do if entry.entity and entry.entity.valid and "
+            "entry.entity.surface==s then if entry.unit_number then "
+            "state.owned_refs[entry.unit_number]=nil end;state.targets[ref]=nil end end;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil;"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) "
+            "end;rcon.print('m29:{\"restored\":true}')"
+        )
+        observed_map_cells.pop(m29_surface, None)
+        record(
+            "M29 fixture restores exact inventory slots and position; removes all placed entities",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m29_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m29_position,
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

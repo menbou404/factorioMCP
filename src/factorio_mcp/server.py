@@ -29,6 +29,9 @@ FilterNames = Annotated[
     list[Annotated[str, Field(min_length=1, max_length=200, strict=True)]],
     Field(max_length=32, strict=True),
 ]
+InserterFilters = Annotated[
+    list[Annotated[str, Field(min_length=1, strict=True)]], Field(max_length=5, strict=True)
+]
 
 
 TARGET_REF_DESCRIPTION = (
@@ -138,8 +141,10 @@ INVENTORY_MACHINE_DESCRIPTION = (
     " Owned inserter and mining-drill types without inventory roles also succeed within"
     " interact reach, with empty inventories; other unsupported entities return invalid_target."
     " Inserters include pickup_position, drop_position, and held_stack = {name, quality, count}"
-    " only when holding an item. Mining drills include drop_position and mining_target"
-    " (resource name) when present. Both retain direction and include status when available."
+    " only when holding an item. Inserters using filters also include filters (item names in"
+    " slot order) and filter_mode; these fields are absent when use_filters is false."
+    " Mining drills include drop_position and mining_target (resource name) when present."
+    " Both retain direction and include status when available."
     " These reads do not extend transfer_item support."
 )
 
@@ -373,6 +378,7 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
         "items",
         "ingredients",
         "recipe_products",
+        "unknown_items",
     ):
         if field in detail and not isinstance(detail[field], list):
             detail[field] = []
@@ -444,6 +450,12 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     ):
         if field in result and not isinstance(result[field], list):
             result[field] = []
+    # Observation uses a filters object; inserter results/reads use an array.
+    if operation in ("set_inserter_filter", "get_entity_inventory", "") and (
+        "use_filters" in result or result.get("type") == "inserter"
+    ):
+        if "filters" in result and not isinstance(result["filters"], list):
+            result["filters"] = []
     array_fields = {
         "observe_nearby": ("entities", "blocked_tiles", "resources"),
         "get_explored_map": ("resources", "water", "trees", "rocks", "frontier"),
@@ -701,13 +713,16 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Transport belts, underground-belt, and splitter include belt_items as "
             "{name, quality, count} entries merged across all transport lines. "
             "Underground belts include underground_type and, when paired, neighbour = {x, y}. "
+            "Splitters include input_priority, output_priority and filter only when different "
+            "from defaults (none, none, no filter); these fields survive compact=true. "
             "Inserters, including long-handed-inserter, include pickup_position and drop_position. "
             "Use check_placement for snapped position and valid_directions before building. "
             "Follow offsets for additional pages."
             " Use compact=true when inspecting many belts or machines: it omits bounding boxes"
             " and other per-entity details, and target_ref stays usable. Entity entries keep only"
             " target_ref, name, x, y, direction, status, recipe, belt_items, underground_type,"
-            " neighbour, pickup_position, drop_position, and electric_network_id when present."
+            " neighbour, pickup_position, drop_position, electric_network_id, input_priority,"
+            " output_priority, and filter when present."
             " Counts, paging, resources and blocked_tiles are unchanged; compact defaults to false."
             " Each call also records fully observed 8x8 cells for get_explored_map, "
             "and seen resources in partially observed cells, independent of filters and paging."
@@ -1227,6 +1242,61 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     )
     async def rotate_entity(target_ref: RequiredText, reverse: bool = False) -> CallToolResult:
         return await invoke("rotate_entity", {"target_ref": target_ref, "reverse": reverse})
+
+    @server.tool(
+        description=(
+            "Set filters on an owned observed inserter within interact reach. Filters work on "
+            "every inserter, including burner-inserter. Use whitelist filters to take only "
+            "specific items from a mixed belt, or blacklist to keep contaminants out. "
+            "items is a list of 0-5 unique item names; mode is whitelist (default) or blacklist. "
+            "An empty list clears all slots and disables filters. Returns actual use_filters, "
+            "mode and filters in slot order. Changes settings only; creates or consumes no items."
+        )
+    )
+    async def set_inserter_filter(
+        target_ref: RequiredText,
+        items: InserterFilters,
+        mode: Literal["whitelist", "blacklist"] = "whitelist",
+    ) -> CallToolResult:
+        if len(set(items)) != len(items):
+            return _error_response(
+                BridgeError("invalid_input", "items must not contain duplicates."),
+                "set_inserter_filter",
+            )
+        return await invoke(
+            "set_inserter_filter", {"target_ref": target_ref, "items": items, "mode": mode}
+        )
+
+    @server.tool(
+        description=(
+            "Set an owned observed splitter's settings within interact reach. input_priority "
+            "and output_priority are left, none or right; left and right are relative to the "
+            "belt's travel direction. A filter sends that item to the output priority side "
+            "and everything else to the other side. filter is an item name; an empty string "
+            "clears it. Omitted arguments are unchanged; give at least one setting. A filter "
+            "with output priority none becomes left with a hint, matching the game GUI. "
+            "Returns the actual settings. Changes settings only; creates or consumes no items."
+        )
+    )
+    async def set_splitter(
+        target_ref: RequiredText,
+        input_priority: Literal["left", "none", "right"] | None = None,
+        output_priority: Literal["left", "none", "right"] | None = None,
+        filter: Annotated[str, Field(strict=True)] | None = None,
+    ) -> CallToolResult:
+        params = {"target_ref": target_ref}
+        for field, value in (
+            ("input_priority", input_priority),
+            ("output_priority", output_priority),
+            ("filter", filter),
+        ):
+            if value is not None:
+                params[field] = value
+        if len(params) == 1:
+            return _error_response(
+                BridgeError("invalid_input", "Give at least one splitter setting."), "set_splitter"
+            )
+        return await invoke("set_splitter", params)
 
     @server.tool(
         description=(
