@@ -5,7 +5,8 @@ local MAX_RECENT_OBSERVATIONS = 8
 local OBSERVATION_RADIUS = 16
 local COMPACT_ENTITY_FIELDS = {
   "target_ref", "name", "x", "y", "direction", "status", "recipe", "belt_items",
-  "underground_type", "neighbour", "pickup_position", "drop_position", "electric_network_id"
+  "underground_type", "neighbour", "pickup_position", "drop_position", "electric_network_id",
+  "input_priority", "output_priority", "filter"
 }
 local MAP_CELL_SIZE = 8
 local MAX_EXPLORED_CELLS = 16384
@@ -1181,6 +1182,24 @@ local function do_research_labs(state)
           labs = labs, short_science = short}
 end
 
+-- ItemFilter accepts strings and tables in 2.0.77; read its item name only.
+local function item_filter_name(filter)
+  if type(filter) == "string" then return filter end
+  if not filter then return nil end
+  local name = filter.name
+  if type(name) == "string" then return name end
+  return name and name.name or nil
+end
+
+local function inserter_filters(entity)
+  local filters = {}
+  for slot = 1, entity.filter_slot_count do
+    local name = item_filter_name(entity.get_filter(slot))
+    if name then filters[#filters + 1] = name end
+  end
+  return filters
+end
+
 local function do_observe(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -1305,6 +1324,15 @@ local function do_observe(state, params)
       if recipe then observed.recipe = recipe.name end
     end
     if entity.type == "inserter" then observed.pickup_position = entity.pickup_position end
+    if entity.type == "splitter" then
+      if entity.splitter_input_priority ~= "none" then
+        observed.input_priority = entity.splitter_input_priority
+      end
+      if entity.splitter_output_priority ~= "none" then
+        observed.output_priority = entity.splitter_output_priority
+      end
+      observed.filter = item_filter_name(entity.splitter_filter)
+    end
     if entity.type == "inserter" or entity.type == "mining-drill" then
       observed.drop_position = entity.drop_position
     end
@@ -2365,6 +2393,99 @@ local function do_rotate(state, params)
   return {name = target.name, direction = target.direction, position = position_data(target)}
 end
 
+local function settings_target(state, params, entity_type)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  local target, target_error, detail = target_entity(character, params, character.reach_distance)
+  if not target then return nil, target_error, detail end
+  if target.force ~= character.force then
+    return nil, "invalid_target", {entity = target.name, reason = "other_force"}
+  end
+  if not character.can_reach_entity(target) then
+    return nil, "out_of_range", range_detail(character, target.position, character.reach_distance)
+  end
+  if target.type ~= entity_type then
+    return nil, "invalid_target", {entity = target.name, reason = "wrong_entity_type"}
+  end
+  return target
+end
+
+local function do_set_inserter_filter(state, params)
+  local items, mode = params.items, params.mode
+  if mode == nil then mode = "whitelist" end
+  if type(items) ~= "table" or #items > 5 or
+     (mode ~= "whitelist" and mode ~= "blacklist") then return nil, "invalid_input" end
+  local seen, unknown, count = {}, {}, 0
+  -- Reject sparse arrays and object keys as well as duplicate/non-string names.
+  for index, name in pairs(items) do
+    if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > #items or
+       type(name) ~= "string" or name == "" or seen[name] then
+      return nil, "invalid_input"
+    end
+    seen[name] = true
+    count = count + 1
+  end
+  if count ~= #items then return nil, "invalid_input" end
+  for _, name in ipairs(items) do
+    if not prototypes.item[name] then unknown[#unknown + 1] = name end
+  end
+  if #unknown > 0 then return nil, "invalid_input", {unknown_items = unknown} end
+  local target, err, detail = settings_target(state, params, "inserter")
+  if not target then return nil, err, detail end
+  local slots = target.filter_slot_count
+  if slots <= 0 then
+    return nil, "invalid_target", {entity = target.name, reason = "no_filter_slots"}
+  end
+  if #items > slots then
+    return nil, "invalid_input", {reason = "too_many_filters", filter_slot_count = slots}
+  end
+  -- No inventory changes: all validation precedes the settings writes.
+  target.use_filters = true
+  target.inserter_filter_mode = mode
+  -- Clear first so reordering existing filters never creates transient duplicates.
+  for slot = 1, slots do target.set_filter(slot, nil) end
+  for slot, name in ipairs(items) do target.set_filter(slot, name) end
+  target.use_filters = #items > 0
+  return {name = target.name, use_filters = target.use_filters,
+          mode = target.inserter_filter_mode, filters = inserter_filters(target),
+          position = position_data(target)}
+end
+
+local function do_set_splitter(state, params)
+  local priorities = {left = true, none = true, right = true}
+  if (params.input_priority == nil and params.output_priority == nil and params.filter == nil) or
+     (params.input_priority ~= nil and not priorities[params.input_priority]) or
+     (params.output_priority ~= nil and not priorities[params.output_priority]) or
+     (params.filter ~= nil and type(params.filter) ~= "string") then
+    return nil, "invalid_input"
+  end
+  if params.filter and params.filter ~= "" and not prototypes.item[params.filter] then
+    return nil, "invalid_input", {unknown_items = {params.filter}}
+  end
+  local target, err, detail = settings_target(state, params, "splitter")
+  if not target then return nil, err, detail end
+  local final_filter = target.splitter_filter
+  if params.filter ~= nil then
+    final_filter = params.filter ~= "" and params.filter or nil
+  end
+  local output = params.output_priority or target.splitter_output_priority
+  local hint
+  if final_filter and output == "none" then
+    output = "left"
+    hint = "A splitter filter requires an output priority; output_priority was set to left."
+  end
+  -- Clear first when requested, and establish a priority before setting a filter,
+  -- so no intermediate state depends on undocumented API auto-adjustment.
+  if params.filter == "" then target.splitter_filter = nil end
+  if params.input_priority ~= nil then target.splitter_input_priority = params.input_priority end
+  if params.output_priority ~= nil or hint then target.splitter_output_priority = output end
+  if params.filter ~= nil and params.filter ~= "" then target.splitter_filter = final_filter end
+  return {name = target.name, input_priority = target.splitter_input_priority,
+          output_priority = target.splitter_output_priority,
+          filter = item_filter_name(target.splitter_filter), position = position_data(target),
+          hint = hint}
+end
+
 local function do_set_recipe(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -2559,9 +2680,12 @@ local function do_entity_inventory(state, params)
     end
     table.sort(recipe_products)
   end
-  local pickup_position, drop_position, held_stack, mining_target
+  local pickup_position, drop_position, held_stack, mining_target, filters, filter_mode
   if target.type == "inserter" then
     pickup_position, drop_position = target.pickup_position, target.drop_position
+    if target.use_filters then
+      filters, filter_mode = inserter_filters(target), target.inserter_filter_mode
+    end
     local stack = target.held_stack
     if stack and stack.valid_for_read then
       held_stack = {name = stack.name, quality = stack.quality.name, count = stack.count}
@@ -2578,7 +2702,8 @@ local function do_entity_inventory(state, params)
           recipe_product_amounts = recipe_product_amounts,
           direction = target.direction,
           pickup_position = pickup_position, drop_position = drop_position,
-          held_stack = held_stack, mining_target = mining_target}
+          held_stack = held_stack, mining_target = mining_target,
+          filters = filters, filter_mode = filter_mode}
 end
 
 local function transfer_inventory_contents(inventory)
@@ -2861,6 +2986,8 @@ local handlers = {
   place_entities = function(state, params) return do_batch(state, params, do_place) end,
   check_placement = do_check_placement,
   rotate_entity = do_rotate,
+  set_inserter_filter = do_set_inserter_filter,
+  set_splitter = do_set_splitter,
   transfer_item = do_transfer,
   transfer_items = function(state, params) return do_batch(state, params, do_transfer) end,
   get_action_status = do_action_status,
@@ -2915,6 +3042,7 @@ commands.add_command("ai_mcp", "AI MCP bridge (RCON only)", function(command)
      request.operation == "check_line" or
      request.operation == "transfer_items" or
      request.operation == "rotate_entity" or request.operation == "set_recipe" or
+     request.operation == "set_inserter_filter" or request.operation == "set_splitter" or
      request.operation == "start_research" then
     state.processed[request_id] = response
     state.processed_order[#state.processed_order + 1] = request_id
