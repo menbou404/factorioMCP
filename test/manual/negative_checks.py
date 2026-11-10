@@ -4250,7 +4250,13 @@ def main():
         return asyncio.run(m31_tool(operation, params))
 
     def m31_error(operation, error, **params):
-        return asyncio.run(m31_tool(operation, params, error))
+        # Keep M31's Mod conflict coverage immediate; M32 tests server waits below.
+        try:
+            bridge.call(operation, params)
+        except BridgeError as exc:
+            assert exc.code == error, exc
+            return {"error": exc.code, "detail": exc.detail}
+        raise AssertionError("Expected Mod error: " + error)
 
     try:
         m31_fixture(
@@ -4525,6 +4531,174 @@ def main():
             restored.get("restored") is True
             and bridge.call("get_inventory")["result"]["items"] == m31_inventory
             and bridge.call("get_agent_status")["result"]["position"] == m31_position,
+        )
+
+    # M32: automatic walk waits and actionable character-in-the-way suggestions.
+    m32_surface = "m32-walk-wait-stand-fixture"
+    m32_server = create_server(bridge)
+    m32_inventory = bridge.call("get_inventory")["result"]["items"]
+    m32_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m32_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m32_surface}";local s=game.surfaces[name];'
+            "local b=storage.m32_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m32:" not in raw:
+            raise RuntimeError("M32 fixture failed: " + raw)
+        return json.loads(raw.split("m32:", 1)[1].strip())
+
+    async def m32_tool(operation, params, error):
+        response = await m32_server.call_tool(operation, params)
+        value = json.loads(response.content[0].text)
+        assert bool(response.is_error) == (error is not None), value
+        if error:
+            assert value["error"] == error, value
+        return value
+
+    def m32_call(operation, error=None, **params):
+        return asyncio.run(m32_tool(operation, params, error))
+
+    try:
+        m32_fixture(
+            "assert(not s and not b,'M32 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv),speed=c.character_running_speed_modifier,"
+            "last_observation=state.last_observation,recent_observations=state.recent_observations,"
+            "selected=c.selected};storage.m32_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=256,height=128});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},4);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-128,127 do for y=-64,63 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,4.5},s));c.character_running_speed_modifier=-0.5;"
+            "state.last_observation=nil;state.recent_observations={};"
+            'assert(inv.insert{name="stone-furnace",count=3}==3);'
+            'assert(inv.insert{name="coal",count=10}==10);'
+            'b.chest=s.create_entity{name="wooden-chest",position={18.5,7.5},force=c.force};'
+            'b.ore=s.create_entity{name="iron-ore",position={2.5,4.5},amount=10000};'
+            "assert(b.chest and b.ore);rcon.print('m32:{}')"
+        )
+        short = m32_call("move_to", surface=m32_surface, x=16.5, y=4.5, wait_seconds=1)
+        assert short["status"] == "running", short
+        placed = m32_call("place_entity", item="stone-furnace", surface=m32_surface, x=16, y=8)
+        record(
+            "M32 placement waits for short walk and succeeds at destination",
+            placed["waited_for_walk"]["action_id"] == short["action_id"]
+            and placed["waited_for_walk"]["status"] == "succeeded",
+            json.dumps(placed),
+        )
+        seen = m32_call("observe_nearby")
+        chest_ref = next(e["target_ref"] for e in seen["entities"] if e["name"] == "wooden-chest")
+        # This straight walk takes about 42 seconds at one quarter normal speed.
+        m32_fixture("c.character_running_speed_modifier=-0.75;rcon.print('m32:{}')")
+        long = m32_call("move_to", surface=m32_surface, x=110.5, y=4.5, wait_seconds=1)
+        assert long["status"] == "running", long
+        transfer = m32_call(
+            "transfer_item",
+            error="action_conflict",
+            target_ref=chest_ref,
+            direction="to_entity",
+            inventory_role="main",
+            item="coal",
+            count=1,
+        )
+        record(
+            "M32 long walk transfer times out with wait metadata and remaining distance",
+            transfer["waited_for_walk"]["action_id"] == long["action_id"]
+            and transfer["waited_for_walk"]["status"] == "running"
+            and transfer["waited_for_walk"]["seconds"] >= 15
+            and transfer["detail"]["running_action"]["remaining_distance"] > 0,
+            json.dumps(transfer),
+        )
+        finished = m32_call("wait_for_action", action_id=long["action_id"], timeout_seconds=50)
+        assert finished["status"] == "succeeded", finished
+        m32_fixture("assert(c.teleport({0.5,4.5},s));rcon.print('m32:{}')")
+        seen = m32_call("observe_nearby")
+        ore_ref = next(e["target_ref"] for e in seen["entities"] if e["name"] == "iron-ore")
+        mining = m32_call("mine_entity", target_ref=ore_ref, count=100)
+        started = time.monotonic()
+        busy = m32_call(
+            "place_entity",
+            error="action_conflict",
+            item="stone-furnace",
+            surface=m32_surface,
+            x=0,
+            y=8,
+        )
+        record(
+            "M32 running mine conflicts immediately without walk wait",
+            "waited_for_walk" not in busy
+            and time.monotonic() - started < 5
+            and busy["detail"]["running_action"]["type"] == "mine",
+        )
+        m32_call("cancel_action", action_id=mining["action_id"])
+        m32_fixture(
+            "assert(c.teleport({0,0},s));c.character_running_speed_modifier=b.speed;"
+            "rcon.print('m32:{}')"
+        )
+        placement_args = {"item": "stone-furnace", "surface": m32_surface, "x": 0, "y": 0}
+        checked = m32_call("check_placement", **placement_args)
+        blocked = m32_call("place_entity", error="blocked", **placement_args)
+        batch = m32_call("place_entities", items=[placement_args])
+        positions = blocked["detail"]["stand_positions"]
+        record(
+            "M32 single, batch and preview return stand positions for character obstruction",
+            blocked["detail"]["reason"] == checked["blocked_reason"] == "character_in_the_way"
+            and 1 <= len(positions) <= 3
+            and checked["stand_positions"] == positions
+            and batch["results"][0]["detail"]["stand_positions"] == positions
+            and [math.hypot(p["x"], p["y"]) for p in positions]
+            == sorted(math.hypot(p["x"], p["y"]) for p in positions),
+            json.dumps(blocked),
+        )
+        m32_call("move_to", surface=m32_surface, **positions[0])
+        replaced = m32_call("place_entity", **placement_args)
+        record("M32 move_to suggested stand position then placement succeeds", replaced["ok"])
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = m32_fixture(
+                f"rcon.print('m32:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m32_fixture(
+            "if b then while c.crafting_queue_size>0 do "
+            "c.cancel_crafting{index=1,count=c.crafting_queue[1].count} end;"
+            "c.character_running_speed_modifier=b.speed;"
+            "assert(c.character_running_speed_modifier==b.speed);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();state.last_observation=b.last_observation;"
+            "state.recent_observations=b.recent_observations;"
+            "for ref,entry in pairs(state.targets) do if entry.entity and entry.entity.valid "
+            "and entry.entity.surface==s then if entry.unit_number then "
+            "state.owned_refs[entry.unit_number]=nil end;state.targets[ref]=nil end end;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil;"
+            "storage.m32_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m32:'..helpers.table_to_json({restored=true}))"
+        )
+        observed_map_cells.pop(m32_surface, None)
+        record(
+            "M32 removes all fixture entities and restores exact inventory, queue and position",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m32_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m32_position,
         )
 
     failed = [label for label, passed, _ in results if not passed]

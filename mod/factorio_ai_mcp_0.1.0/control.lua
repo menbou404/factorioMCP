@@ -1899,6 +1899,46 @@ local function placement_mining_area_resources(character, prototype, position, d
   return resources
 end
 
+local function placement_stand_positions(state, character, area, position)
+  local box = character.prototype.collision_box
+  if not box then return {} end
+  -- Expand by the character footprint plus move_to's 0.5-tile arrival
+  -- tolerance and a 0.15 margin, including rotated/asymmetric entity boxes.
+  local left = area.left_top.x - box.right_bottom.x - 0.65
+  local right = area.right_bottom.x - box.left_top.x + 0.65
+  local top = area.left_top.y - box.right_bottom.y - 0.65
+  local bottom = area.right_bottom.y - box.left_top.y + 0.65
+  local positions = {}
+  local function consider(candidate)
+    local free = character.surface.find_non_colliding_position(character.name, candidate, 0.5, 0.1)
+    if not free then return end
+    -- The search may shift back into the proposed entity; check its result too.
+    if not (free.x <= left or free.x >= right or free.y <= top or free.y >= bottom) or
+       distance_squared(free, position) > character.build_distance ^ 2 or
+       not placement_visible(state, character, free) then return end
+    for _, other in ipairs(positions) do
+      if distance_squared(free, other) < 0.04 then return end
+    end
+    positions[#positions + 1] = {x = free.x, y = free.y}
+  end
+  -- Sixteen candidates around a small perimeter; no large area/path searches.
+  for i = 0, 3 do
+    local t = i / 4
+    consider({x = left + (right - left) * t, y = top})
+    consider({x = right, y = top + (bottom - top) * t})
+    consider({x = right - (right - left) * t, y = bottom})
+    consider({x = left, y = bottom - (bottom - top) * t})
+  end
+  table.sort(positions, function(a, b)
+    local da, db = distance_squared(a, character.position), distance_squared(b, character.position)
+    if da ~= db then return da < db end
+    if a.x ~= b.x then return a.x < b.x end
+    return a.y < b.y
+  end)
+  while #positions > 3 do table.remove(positions) end
+  return positions
+end
+
 local function placement_blocking(state, character, prototype, position, direction, observed_only)
   -- Keep the requested position so every alternative direction snaps independently.
   local area = placement_bounding_box(prototype, snapped_position(prototype, position, direction),
@@ -1950,6 +1990,10 @@ local function placement_blocking(state, character, prototype, position, directi
   local detail = {blocking = blocking, tiles = tile_names}
   if character_in_the_way then
     detail.reason = "character_in_the_way"
+    if not observed_only then
+      detail.stand_positions = placement_stand_positions(state, character, area,
+        snapped_position(prototype, position, direction))
+    end
   elseif #blocking == 0 and #tile_names == 0 then
     detail.reason = "placement_rules"
   end
@@ -2189,6 +2233,7 @@ local function do_check_placement(state, params)
           blocking = blocked.blocking, tiles = blocked.tiles,
           valid_directions = blocked.valid_directions, blocked_reason = blocked.reason,
           nearby_positions = blocked.nearby_positions,
+          stand_positions = blocked.stand_positions,
           ground_items = placement and placement.ground_items or blocked.ground_items,
           mining_area_resources = mining_area_resources,
           reason_detail = blocked.reason_detail}

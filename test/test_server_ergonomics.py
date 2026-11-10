@@ -863,9 +863,11 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             "one craft at a time",
             "one walk/mine at a time",
             "crafting can run alongside either",
-            "place_entity, place_entities, place_line and transfer_item(s)",
-            "also return action_conflict while a walk or mine is running",
-            "they are allowed while crafting",
+            "place_entity, place_entities, place_line, transfer_item(s), mine_entity and move_to",
+            "automatically wait up to 15 seconds for a running walk and retry once",
+            "waited_for_walk",
+            "A running mine conflicts immediately",
+            "placement and transfers are allowed while crafting",
             "rotate_entity, set_recipe and the settings tools",
             "set_inserter_filter, set_splitter, set_inventory_limit",
             "work during walks within interact reach",
@@ -1320,7 +1322,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 for text in (
                     field,
                     "character_in_the_way",
-                    "move the character away first",
+                    "stand_positions",
                     "placement_rules",
                     "no blocking entities, tiles, or character",
                 ):
@@ -1476,7 +1478,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(value["hint"], HINTS["blocked"])
         self.assertIn("character_in_the_way", value["hint"])
-        self.assertIn("move the character away first", value["hint"])
+        self.assertIn("stand_positions", value["hint"])
 
     async def test_blocked_placement_preserves_rules_and_direction_advice(self):
         bridge = Mock()

@@ -176,7 +176,9 @@ class LimitWalkPowerTests(unittest.IsolatedAsyncioTestCase):
                 "place_line",
                 "transfer_item(s)",
                 "action_conflict",
-                "Call wait_for_action with this action_id next: walk",
+                "For longer walks, call wait_for_action with this action_id: walk",
+                "automatically waits up to 15 seconds",
+                "waited_for_walk",
                 "walk",
             ):
                 self.assertIn(text, result["hint"])
