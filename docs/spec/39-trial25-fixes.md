@@ -1,0 +1,40 @@
+# 39. 25 回目の試行で見つかった問題の修正（M31）
+
+## 背景
+
+25 回目の試行（[38-trial24-fixes.md](38-trial24-fixes.md)）で、AI はシード 31337 のマップでも、燃料も含めて手で入れない条件を守って目標を達成した。AI は次の問題を挙げた。
+
+| 区分 | 問題 | 原因 |
+| --- | --- | --- |
+| BW | ベルトを溜めるチェストが鉄板を使い続けた。AI はチェストをベルトに置き換えて生産を止めた | チェストの使えるスロット数（ゲームの赤い区切り）を設定する手段が無い |
+| BX | 歩きが待ち時間の内に終わらず、続けて送った設置や移し替えが 4 回 `action_conflict` で失敗した | 歩きが続いている結果に、残りの距離と、次に何をすべきかが書かれていない |
+| BY | 発電機の無い電柱だけの電力網でも、設置の結果が `electric_network_connected: true` になる | `electric_network_connected` は電力網に属することだけを表し、発電の有無を表さない。それが説明に書かれていない |
+
+BX の例：605 手目で `move_to` が 5 秒で時間切れになり、`status: running` を返した。キャラクターは目的地から約 1.2 タイルの所にいた。AI は続けて移し替え、設置 2 回、`place_line` を送り、4 回とも `action_conflict` で失敗した。612 手目の `wait_for_action` で歩きは終わった。
+
+## BW. チェストのスロット数の制限
+
+- 新しいツール `set_inventory_limit` を加える。引数は `target_ref` と `slots` とする。
+- 対象は、手の届く範囲にある自勢力のチェスト（`container` 型）とする。範囲と勢力の確認は `set_inserter_filter` と同じにする。
+- `slots` は 0 からチェストのスロット数までの整数とする。省略するか `null` にすると制限を外す。範囲外の値は、何も変えずに `invalid_params` とする。
+- 制限すると、インサーターは制限を越えるスロットに品を入れなくなる。すでに入っている品はそのまま残る。
+- 結果に、制限 `inventory_limit`（制限が無いときは `null`）とスロット数 `slots` を返す。
+- `get_entity_inventory` と `get_entity_inventories` は、制限があるチェストに `inventory_limit` を加える。`observe_nearby` は、制限のあるチェストにだけ `inventory_limit` を加える。省略表示でも残す。
+- 説明文に、溜めすぎを防ぐ使い方を書く。例：「ベルトを 1 スロット分（100 本）だけ溜めるなら `slots: 1`」。
+
+## BX. 歩きが続いているときの案内
+
+- `move_to` と `wait_for_action` が、続いている歩きを返すとき（`status: running`）に、目的地までの直線距離 `remaining_distance` を加える。
+- 同じ結果に `hint` を加える。内容は、歩きが終わるまで設置（`place_entity`、`place_entities`、`place_line`）と移し替えは `action_conflict` になること、次に `wait_for_action` で歩きの終わりを待つこと、とする。回転、レシピの設定、M29 の設定と `set_inventory_limit` は、今までどおり歩いている間も使える。
+- `action_conflict` の説明文が、回転とレシピの設定も歩いている間は失敗すると書いていた。実際には失敗しないので、説明文を直す。
+- `action_conflict` の `detail.running_action` が歩きのときも、`remaining_distance` を加える。
+
+## BY. 電力網に属することと発電の区別
+
+- 電柱を `place_entity` か `place_entities` で置いたときは、置いた電柱の電力網について、M30 の `electric_network`（直近 5 秒の発電、消費、内訳）を結果に加える。
+- その電力網の `producers` が空なら、`hint` に、直近 5 秒に発電した設備が無いこと、発電機につながっていない電力網かもしれないこと、消費する設備が無いと発電機も発電しないことを書く。
+- `electric_network_connected` の説明を「電力網に属すること。発電があるとは限らない。近くの電柱を `get_entity_inventory` で読むと発電と消費が分かる」とする。
+
+## 効果の確認
+
+M31 のあとの試行も、シード 123 以外のマップで行う。

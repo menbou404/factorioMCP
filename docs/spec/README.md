@@ -49,6 +49,7 @@
 | [36-trial22-fixes.md](36-trial22-fixes.md) | 22 回目の試行で見つかった問題の修正（M28） |
 | [37-trial23-fixes.md](37-trial23-fixes.md) | 23 回目の試行で見つかった問題の修正（M29） |
 | [38-trial24-fixes.md](38-trial24-fixes.md) | 24 回目の試行で見つかった問題の修正（M30） |
+| [39-trial25-fixes.md](39-trial25-fixes.md) | 25 回目の試行で見つかった問題の修正（M31） |
 
 ## 共通の不変条件
 

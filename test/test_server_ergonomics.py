@@ -720,7 +720,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
         description = tools["mine_entity"].description
         self.assertIn("Crafting runs alongside mining", description)
         self.assertIn(
-            "While mining runs, place_entity, transfer_item, rotate_entity, and set_recipe "
+            "While mining runs, place_entity, place_entities, place_line and transfer_item(s) "
             "return action_conflict",
             description,
         )
@@ -863,9 +863,12 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             "one craft at a time",
             "one walk/mine at a time",
             "crafting can run alongside either",
-            "place_entity, transfer_item, rotate_entity, and set_recipe",
+            "place_entity, place_entities, place_line and transfer_item(s)",
             "also return action_conflict while a walk or mine is running",
             "they are allowed while crafting",
+            "rotate_entity, set_recipe and the settings tools",
+            "set_inserter_filter, set_splitter, set_inventory_limit",
+            "work during walks within interact reach",
         ):
             with self.subTest(text=text):
                 self.assertIn(text, hint)
