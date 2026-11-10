@@ -80,7 +80,12 @@ PLACE_DESCRIPTION = (
     " in the snapped mining area, sorted by name, matching check_placement."
     " Electric consumers and electric poles include electric_network_connected (boolean)"
     " and electric_network_id when connected, read from the created entity in the same tick."
-    " Connection means network membership and does not guarantee power generation."
+    " electric_network_connected means the entity belongs to an electric network"
+    " (network membership). It does not mean the network has generation and does not guarantee"
+    " power. Read a nearby electric pole with"
+    " get_entity_inventory to see production and consumption."
+    " Placed electric poles also include electric_network statistics over the last 5 seconds;"
+    " empty producers adds a hint about absent generation and idle generators."
     " Burner and other non-electric entities omit these fields."
     " If electric_network_connected=false, hint advises checking check_placement"
     " electric_coverage and adding a pole."
@@ -142,6 +147,8 @@ MACHINE_STATUS_DESCRIPTION = (
 )
 
 INVENTORY_MACHINE_DESCRIPTION = (
+    " Chests with a slot limit include inventory_limit (usable slots); use set_inventory_limit"
+    " to change or clear it."
     " Owned inserter and mining-drill types without inventory roles also succeed within"
     " interact reach, with empty inventories; other unsupported entities return invalid_target."
     " Inserters include pickup_position, drop_position, and held_stack = {name, quality, count}"
@@ -156,6 +163,30 @@ INVENTORY_MACHINE_DESCRIPTION = (
     " at most 10 each, omitting zero entries. Absent when the pole has no network."
     " These reads do not extend transfer_item support."
 )
+
+RUNNING_WALK_HINT = (
+    "While this walk runs, place_entity, place_entities, place_line and transfer_item(s) "
+    "return action_conflict. Call wait_for_action with this action_id "
+    "next: {action_id}."
+)
+
+NO_GENERATION_HINT = (
+    "No generator produced power on this network in the last 5 seconds; it may not be "
+    "connected to a generator. Generators also produce nothing while nothing consumes."
+)
+
+
+def _append_hint(result: dict[str, Any], hint: str) -> None:
+    existing = result.get("hint")
+    if not existing or hint not in existing:
+        result["hint"] = (existing + " " if existing else "") + hint
+
+
+def _running_walk_guidance(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("status") == "running" and result.get("type") == "move":
+        _append_hint(result, RUNNING_WALK_HINT.format(action_id=result["action_id"]))
+    return result
+
 
 MACHINE_BUFFER_DESCRIPTION = (
     " Assemblers and furnaces stop with full_output once the result slot holds a"
@@ -255,8 +286,10 @@ HINTS = {
     "action_conflict": (
         "Wait for detail.running_action with wait_for_action, or stop it with cancel_action. "
         "Only one craft at a time and one walk/mine at a time; crafting can run alongside either. "
-        "place_entity, transfer_item, rotate_entity, and set_recipe also return action_conflict "
-        "while a walk or mine is running; they are allowed while crafting."
+        "place_entity, place_entities, place_line and transfer_item(s) also return action_conflict "
+        "while a walk or mine is running; they are allowed while crafting. "
+        "rotate_entity, set_recipe and the settings tools (set_inserter_filter, set_splitter, "
+        "set_inventory_limit) work during walks within interact reach."
     ),
     "path_not_found": (
         "Check detail.goal_tiles and detail.goal_entities for obstacles explaining the failure. "
@@ -416,6 +449,11 @@ def _normalize_batch_result(result: dict[str, Any], operation: str | None = None
 
 
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
+    if operation == "set_inventory_limit" or (
+        operation == "" and {"slots", "name", "position", "target_ref"} <= result.keys()
+    ):
+        # Lua omits nil fields; the setter explicitly promises JSON null when cleared.
+        result.setdefault("inventory_limit", None)
     if operation == "check_line" or (operation == "" and "problem_total" in result):
         if not isinstance(result.get("problems"), list):
             result["problems"] = []
@@ -520,10 +558,19 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         if isinstance(coverage, dict) and not isinstance(coverage.get("poles"), list):
             coverage["poles"] = []
     if operation in ("place_entity", "") and result.get("electric_network_connected") is False:
-        result["hint"] = (
-            "Check check_placement electric_coverage at this position and add a pole "
-            "to connect the entity to an electric network."
+        _append_hint(
+            result,
+            (
+                "Check check_placement electric_coverage at this position and add a pole "
+                "to connect the entity to an electric network."
+            ),
         )
+    if (
+        (operation == "place_entity" or (operation == "" and "consumed_item" in result))
+        and isinstance(network, dict)
+        and not network["producers"]
+    ):
+        _append_hint(result, NO_GENERATION_HINT)
     if operation == "get_research_status":
         for technology in result["available"]:
             if not isinstance(technology.get("ingredients"), list):
@@ -593,7 +640,12 @@ class _InputErrorServer(MCPServer):
             ]
             result = _error_response(
                 BridgeError(
-                    "invalid_input", "Tool arguments failed validation.", {"errors": errors}
+                    "invalid_params"
+                    if name == "set_inventory_limit"
+                    and any(error["field"] == "slots" for error in errors)
+                    else "invalid_input",
+                    "Tool arguments failed validation.",
+                    {"errors": errors},
                 ),
                 name,
             )
@@ -668,12 +720,18 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                 running = value.get("status") == "running"
                 if not running or waited >= timeout_seconds:
                     return _response(
-                        {
-                            **(start_value or {}),
-                            **value,
-                            "timed_out": running,
-                            "waited_seconds": waited,
-                        }
+                        _running_walk_guidance(
+                            {
+                                **{
+                                    key: item
+                                    for key, item in (start_value or {}).items()
+                                    if key != "remaining_distance"
+                                },
+                                **value,
+                                "timed_out": running,
+                                "waited_seconds": waited,
+                            }
+                        )
                     )
                 await asyncio.sleep(min(0.25, timeout_seconds - waited))
         except Exception as exc:
@@ -687,7 +745,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         except Exception as exc:
             return _error_response(exc, operation)
         if wait_seconds is None or value.get("status") in {"succeeded", "failed", "cancelled"}:
-            return _response(value)
+            return _response(_running_walk_guidance(value))
         return await wait_action(value["action_id"], wait_seconds, value)
 
     @server.tool(description="Check the connection to the Factorio AI Mod.")
@@ -734,6 +792,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Underground belts include underground_type and, when paired, neighbour = {x, y}. "
             "Splitters include input_priority, output_priority and filter only when different "
             "from defaults (none, none, no filter); these fields survive compact=true. "
+            "Limited chests include inventory_limit (usable slots), kept in compact=true; "
+            "change it with set_inventory_limit. "
             "Inserters, including long-handed-inserter, include pickup_position and drop_position. "
             "Use check_placement for snapped position and valid_directions before building. "
             "Follow offsets for additional pages."
@@ -741,7 +801,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " and other per-entity details, and target_ref stays usable. Entity entries keep only"
             " target_ref, name, x, y, direction, status, recipe, belt_items, underground_type,"
             " neighbour, pickup_position, drop_position, electric_network_id, input_priority,"
-            " output_priority, and filter when present."
+            " output_priority, filter, and inventory_limit when present."
             " Counts, paging, resources and blocked_tiles are unchanged; compact defaults to false."
             " Each call also records fully observed 8x8 cells for get_explored_map, "
             "and seen resources in partially observed cells, independent of filters and paging."
@@ -1010,6 +1070,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "client timeouts. A timeout leaves the action running and returns timed_out=true "
             "and action_id; continue with wait_for_action. Omit wait_seconds to return the "
             "start result immediately."
+            " Running walks include remaining_distance (straight-line tiles, rounded to 2 decimals)"
+            " and a hint to call wait_for_action before placing or transferring."
         )
     )
     async def move_to(
@@ -1036,7 +1098,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "crafting products with those names. Non-resource targets succeed only after "
             "removal and gaining count items; resources can succeed while still present. "
             "Non-resource targets with no item products succeed on removal alone. "
-            "While mining runs, place_entity, transfer_item, rotate_entity, and set_recipe "
+            "While mining runs, place_entity, place_entities, place_line and transfer_item(s) "
             "return action_conflict."
         )
     )
@@ -1323,6 +1385,23 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
 
     @server.tool(
         description=(
+            "Set the usable inventory slots on an owned observed chest (container type) within "
+            "interact reach. slots is an integer from 0 through the chest's total slot count; "
+            "omit it or use null to clear the limit. Prevent overstocking: slots: 1 keeps one "
+            "stack, e.g. 100 belts. Inserters stop inserting into slots beyond the limit; items "
+            "already there stay. Returns inventory_limit (usable slots, or null when no limit), "
+            "slots (total slots), name, position and target_ref. Invalid slots return "
+            "invalid_params without changing anything. Changes settings only; creates or consumes "
+            "no items. Works while walking or mining, within interact reach."
+        )
+    )
+    async def set_inventory_limit(
+        target_ref: RequiredText, slots: NonNegative | None = None
+    ) -> CallToolResult:
+        return await invoke("set_inventory_limit", {"target_ref": target_ref, "slots": slots})
+
+    @server.tool(
+        description=(
             "Read accessible inventory sections of a nearby observed structure."
             + INVENTORY_MACHINE_DESCRIPTION
             + MACHINE_STATUS_DESCRIPTION
@@ -1574,6 +1653,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "to save a call; use wait_for_action to continue waiting after a timeout. "
             "A timeout returns the last running status "
             "and leaves the action running. Running mining reports detail.gained and detail.count; "
+            "running walks include remaining_distance (straight-line tiles, rounded to 2 decimals) "
+            "and a hint to call wait_for_action before placing or transferring. "
             "gained counts only the target's item products; non-resource targets must be "
             "removed before success. "
             "running crafting reports detail.count and detail.remaining. "

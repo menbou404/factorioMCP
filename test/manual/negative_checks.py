@@ -4217,6 +4217,316 @@ def main():
             and bridge.call("get_agent_status")["result"]["position"] == m30_position,
         )
 
+    # M31: real chest automation, long-running walks and pole placement statistics.
+    m31_surface = "m31-limit-walk-power-fixture"
+    m31_server = create_server(bridge)
+    m31_inventory = bridge.call("get_inventory")["result"]["items"]
+    m31_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m31_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m31_surface}";local s=game.surfaces[name];'
+            "local b=storage.m31_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m31:" not in raw:
+            raise RuntimeError("M31 fixture failed: " + raw)
+        return json.loads(raw.split("m31:", 1)[1].strip())
+
+    async def m31_tool(operation, params, error=None):
+        response = await m31_server.call_tool(operation, params)
+        value = json.loads(response.content[0].text)
+        assert bool(response.is_error) == (error is not None), value
+        if error:
+            assert value["error"] == error, value
+        return value
+
+    def m31_call(operation, **params):
+        return asyncio.run(m31_tool(operation, params))
+
+    def m31_error(operation, error, **params):
+        return asyncio.run(m31_tool(operation, params, error))
+
+    try:
+        m31_fixture(
+            "assert(not s and not b,'M31 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv),speed=c.character_running_speed_modifier,"
+            "last_observation=state.last_observation,recent_observations=state.recent_observations,"
+            "selected=c.selected};storage.m31_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=256,height=128});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},4);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-128,127 do for y=-64,63 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,4.5},s));assert(c.reach_distance<12);"
+            "state.last_observation=nil;state.recent_observations={};"
+            'b.chest=s.create_entity{name="wooden-chest",position={2.5,4.5},force=c.force};'
+            'b.source=s.create_entity{name="wooden-chest",position={2.5,2.5},force=c.force};'
+            'b.feeder=s.create_entity{name="burner-inserter",position={2.5,3.5},'
+            "direction=defines.direction.north,force=c.force};"
+            'b.far=s.create_entity{name="wooden-chest",position={12.5,4.5},force=c.force};'
+            "assert(b.chest and b.source and b.feeder and b.far);b.feeder.active=false;"
+            'assert(b.feeder.get_fuel_inventory().insert{name="coal",count=10}==10);'
+            'assert(b.source.insert{name="transport-belt",count=300}==300);'
+            'assert(b.chest.insert{name="transport-belt",count=98}==98);'
+            # Existing contents in red slots must survive setting the limit.
+            'b.chest.get_inventory(defines.inventory.chest)[3].set_stack{name="coal",count=7};'
+            'assert(inv.insert{name="small-electric-pole",count=5}==5);'
+            'assert(inv.insert{name="wooden-chest",count=1}==1);'
+            "rcon.print('m31:'..helpers.table_to_json({ready=true}))"
+        )
+        seen = m31_call("observe_nearby")
+        refs = {
+            key: next(
+                e["target_ref"]
+                for e in seen["entities"]
+                if e["name"] == name and e["x"] == x and e["y"] == y
+            )
+            for key, name, x, y in (
+                ("chest", "wooden-chest", 2.5, 4.5),
+                ("source", "wooden-chest", 2.5, 2.5),
+                ("feeder", "burner-inserter", 2.5, 3.5),
+                ("far", "wooden-chest", 12.5, 4.5),
+            )
+        }
+        limited = m31_call("set_inventory_limit", target_ref=refs["chest"], slots=1)
+        record(
+            "M31 setter returns one usable slot and total chest slots",
+            limited["inventory_limit"] == 1
+            and limited["slots"] == 16
+            and limited["target_ref"] == refs["chest"],
+        )
+        m31_fixture("b.feeder.active=true;rcon.print('m31:{}')")
+        deadline = time.monotonic() + 15
+        while True:
+            snapshot = m31_fixture(
+                "local i=b.chest.get_inventory(defines.inventory.chest);"
+                "rcon.print('m31:'..helpers.table_to_json({bar=i.get_bar(),"
+                "belts=i.get_item_count('transport-belt'),coal=i.get_item_count('coal'),"
+                "source=b.source.get_item_count('transport-belt')}))"
+            )
+            if snapshot["belts"] >= 100 or time.monotonic() >= deadline:
+                break
+            m31_call("factorio_ping")
+            time.sleep(0.25)
+        time.sleep(3)
+        stable = m31_fixture(
+            "rcon.print('m31:'..helpers.table_to_json({belts=b.chest.get_item_count('transport-belt'),"
+            "source=b.source.get_item_count('transport-belt')}))"
+        )
+        record(
+            "M31 real inserter stops at one stack; red-slot contents remain",
+            snapshot["bar"] == 2
+            and snapshot["belts"] == stable["belts"] == 100
+            and snapshot["coal"] == 7
+            and stable["source"] > 100,
+            json.dumps(snapshot),
+        )
+        m31_fixture("b.feeder.active=false;rcon.print('m31:{}')")
+        single = m31_call("get_entity_inventory", target_ref=refs["chest"])
+        batch = m31_call("get_entity_inventories", target_refs=[refs["chest"]])
+        record(
+            "M31 inventory reads preserve inventory_limit",
+            single["inventory_limit"] == batch["results"][0]["result"]["inventory_limit"] == 1,
+        )
+        for compact in (False, True):
+            observed = m31_call("observe_nearby", compact=compact)
+            chest = next(e for e in observed["entities"] if e["target_ref"] == refs["chest"])
+            source = next(e for e in observed["entities"] if e["target_ref"] == refs["source"])
+            record(
+                f"M31 observation compact={compact} retains only actual chest limits",
+                chest["inventory_limit"] == 1 and "inventory_limit" not in source,
+            )
+        for slots in (17, 1.5, -1, False):
+            # Exercise Mod-side validation directly, including non-integer JSON values.
+            expect_error(
+                f"M31 slots={slots!r} is invalid_params",
+                "set_inventory_limit",
+                {"target_ref": refs["chest"], "slots": slots},
+                {"invalid_params"},
+            )
+            unchanged = m31_call("get_entity_inventory", target_ref=refs["chest"])
+            record(
+                f"M31 invalid slots={slots!r} changes nothing", unchanged["inventory_limit"] == 1
+            )
+        expect_error(
+            "M31 non-container rejected",
+            "set_inventory_limit",
+            {"target_ref": refs["feeder"], "slots": 1},
+            {"invalid_target"},
+        )
+        expect_error(
+            "M31 distant chest rejected",
+            "set_inventory_limit",
+            {"target_ref": refs["far"], "slots": 1},
+            {"out_of_range"},
+        )
+        zero = m31_call("set_inventory_limit", target_ref=refs["chest"], slots=0)
+        record("M31 zero usable slots is represented as zero", zero["inventory_limit"] == 0)
+        for args in ({"slots": None}, {}):
+            cleared = m31_call("set_inventory_limit", target_ref=refs["chest"], **args)
+            observed = m31_call("observe_nearby", compact=True)
+            chest = next(e for e in observed["entities"] if e["target_ref"] == refs["chest"])
+            read = m31_call("get_entity_inventory", target_ref=refs["chest"])
+            bar = m31_fixture(
+                "rcon.print('m31:'..helpers.table_to_json({bar=b.chest.get_inventory("
+                "defines.inventory.chest).get_bar()}))"
+            )["bar"]
+            record(
+                f"M31 clear limit with {args} restores no limit",
+                cleared["inventory_limit"] is None
+                and bar == 17
+                and "inventory_limit" not in chest
+                and "inventory_limit" not in read,
+            )
+
+        # No generators exist on the fixture surface during these placements.
+        pole = m31_call(
+            "place_entity", item="small-electric-pole", surface=m31_surface, x=-2.5, y=4.5
+        )
+        poles = m31_call(
+            "place_entities",
+            items=[{"item": "small-electric-pole", "surface": m31_surface, "x": -4.5, "y": 4.5}],
+        )
+        for label, placed in (("single", pole), ("batch", poles["results"][0]["result"])):
+            record(
+                "M31 " + label + " isolated pole reports empty producers and guidance",
+                placed["electric_network"]["producers"] == []
+                and "last 5 seconds" in placed["hint"]
+                and "nothing consumes" in placed["hint"]
+                and "may not be connected" in placed["hint"],
+                json.dumps(placed),
+            )
+
+        # Slow the fixture character so a 64-tile walk outlasts two short waits
+        # and conflict checks even on slow CI. The Mod still moves only by walking.
+        m31_fixture("c.character_running_speed_modifier=-0.5;rcon.print('m31:{}')")
+        walk = m31_call("move_to", surface=m31_surface, x=64.5, y=4.5, wait_seconds=1)
+        record(
+            "M31 move timeout reports remaining distance and next action",
+            walk["status"] == "running"
+            and walk["remaining_distance"] > 0
+            and "wait_for_action" in walk["hint"]
+            and walk["action_id"] in walk["hint"]
+            and "action_conflict" in walk["hint"],
+            json.dumps(walk),
+        )
+        waiting = m31_call("wait_for_action", action_id=walk["action_id"], timeout_seconds=1)
+        record(
+            "M31 wait timeout preserves walk guidance and distance",
+            waiting["status"] == "running"
+            and waiting["remaining_distance"] > 0
+            and "wait_for_action" in waiting["hint"],
+        )
+        conflict = m31_error(
+            "place_entity",
+            "action_conflict",
+            item="wooden-chest",
+            surface=m31_surface,
+            x=0.5,
+            y=7.5,
+        )
+        running = conflict["detail"]["running_action"]
+        record(
+            "M31 placement conflict reports running walk distance",
+            running["type"] == "move"
+            and running["id"] == walk["action_id"]
+            and running["remaining_distance"] > 0,
+        )
+        deadline = time.monotonic() + 100
+        while waiting["status"] == "running" and time.monotonic() < deadline:
+            waiting = m31_call("wait_for_action", action_id=walk["action_id"], timeout_seconds=50)
+        record(
+            "M31 walk eventually succeeds", waiting["status"] == "succeeded", json.dumps(waiting)
+        )
+
+        # Fixture teleport only: put the character back to inspect a powered network.
+        generator = m31_fixture(
+            "assert(c.teleport({0.5,4.5},s));c.character_running_speed_modifier=b.speed;"
+            "local available=prototypes.entity['electric-energy-interface']~=nil;"
+            "if available then "
+            'b.pole=s.create_entity{name="small-electric-pole",position={0.5,-0.5},force=c.force};'
+            'b.machine=s.create_entity{name="assembling-machine-1",position={2.5,-0.5},force=c.force};'
+            'b.generator=s.create_entity{name="electric-energy-interface",position={-1.5,-0.5},'
+            "force=c.force};assert(b.pole and b.machine and b.generator);"
+            'b.machine.set_recipe("iron-gear-wheel");'
+            'assert(b.machine.insert{name="iron-plate",count=100}==100);'
+            "b.generator.power_production=1000000/60;b.generator.power_usage=0;"
+            "b.generator.electric_buffer_size=1000000;b.generator.energy=1000000 end;"
+            "rcon.print('m31:'..helpers.table_to_json({available=available}))"
+        )
+        if generator["available"]:
+            time.sleep(5.2)
+            powered = m31_call(
+                "place_entity", item="small-electric-pole", surface=m31_surface, x=-2.5, y=0.5
+            )
+            powered_batch = m31_call(
+                "place_entities",
+                items=[
+                    {"item": "small-electric-pole", "surface": m31_surface, "x": -4.5, "y": 0.5}
+                ],
+            )
+            for label, placed in (
+                ("single", powered),
+                ("batch", powered_batch["results"][0]["result"]),
+            ):
+                record(
+                    "M31 " + label + " pole joining powered network reports producers",
+                    any(
+                        e["name"] == "electric-energy-interface"
+                        for e in placed["electric_network"]["producers"]
+                    )
+                    and "No generator produced" not in placed.get("hint", ""),
+                    json.dumps(placed),
+                )
+        else:
+            record("M31 no generator prototype: empty-network placements tested only", True)
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = m31_fixture(
+                f"rcon.print('m31:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m31_fixture(
+            "if b then while c.crafting_queue_size>0 do "
+            "c.cancel_crafting{index=1,count=c.crafting_queue[1].count} end;"
+            "c.character_running_speed_modifier=b.speed;"
+            "assert(c.character_running_speed_modifier==b.speed);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();state.last_observation=b.last_observation;"
+            "state.recent_observations=b.recent_observations;"
+            "for ref,entry in pairs(state.targets) do if entry.entity and entry.entity.valid "
+            "and entry.entity.surface==s then if entry.unit_number then "
+            "state.owned_refs[entry.unit_number]=nil end;state.targets[ref]=nil end end;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil;"
+            "storage.m31_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m31:'..helpers.table_to_json({restored=true}))"
+        )
+        observed_map_cells.pop(m31_surface, None)
+        record(
+            "M31 removes fixture and restores exact inventory slots, empty queue and position",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m31_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m31_position,
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

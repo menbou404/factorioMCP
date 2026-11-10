@@ -6,7 +6,7 @@ local OBSERVATION_RADIUS = 16
 local COMPACT_ENTITY_FIELDS = {
   "target_ref", "name", "x", "y", "direction", "status", "recipe", "belt_items",
   "underground_type", "neighbour", "pickup_position", "drop_position", "electric_network_id",
-  "input_priority", "output_priority", "filter"
+  "input_priority", "output_priority", "filter", "inventory_limit"
 }
 local MAP_CELL_SIZE = 8
 local MAX_EXPLORED_CELLS = 16384
@@ -145,8 +145,15 @@ local function range_detail(character, position, reach)
           character_position = {x = character.position.x, y = character.position.y}}
 end
 
-local function conflict_detail(action)
-  return {running_action = action and {id = action.id, type = action.type} or nil}
+local function remaining_walk_distance(action, character)
+  if not action or action.type ~= "move" or not action.goal or
+     not character or not character.valid then return nil end
+  return math.floor(math.sqrt(distance_squared(character.position, action.goal)) * 100 + 0.5) / 100
+end
+
+local function conflict_detail(action, character)
+  return {running_action = action and {id = action.id, type = action.type,
+          remaining_distance = remaining_walk_distance(action, character)} or nil}
 end
 
 local function sorted_keys(values)
@@ -445,7 +452,7 @@ local function target_entity(character, params, max_distance, mining)
 end
 
 local function begin_action(state, slot, action)
-  if state[slot] then return nil, "action_conflict", conflict_detail(state[slot]) end
+  if state[slot] then return nil, "action_conflict", conflict_detail(state[slot], state.character) end
   action.id = tostring(state.next_action_id)
   state.next_action_id = state.next_action_id + 1
   action.status = "running"
@@ -648,7 +655,7 @@ end
 local function do_move(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action, state.character) end
   if type(params.x) ~= "number" or type(params.y) ~= "number" or
      params.x ~= params.x or params.y ~= params.y or
      math.abs(params.x) > 1000000 or math.abs(params.y) > 1000000 then
@@ -697,13 +704,15 @@ local function do_move(state, params)
     finish_action(state, "action", "failed", "path_not_found", detail)
     return nil, "path_not_found", detail
   end
+  result.type = "move"
+  result.remaining_distance = remaining_walk_distance(state.action, character)
   return result
 end
 
 local function do_mine(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action, state.character) end
   local count = params.count or 1
   if type(count) ~= "number" or count < 1 or count > 100 or count % 1 ~= 0 then
     return nil, "invalid_input"
@@ -1219,6 +1228,15 @@ local function inserter_filters(entity)
   return filters
 end
 
+local function inventory_limit(entity)
+  if entity.type ~= "container" then return nil end
+  local inventory = entity.get_inventory(defines.inventory.chest)
+  if not inventory or not inventory.valid or not inventory.supports_bar() then return nil end
+  -- get_bar is the first red slot, not the number of usable slots (2.0.77).
+  local bar = inventory.get_bar()
+  if bar <= #inventory then return bar - 1 end
+end
+
 local function do_observe(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -1307,6 +1325,7 @@ local function do_observe(state, params)
       amount = entity.type == "resource" and entity.amount or nil,
       owned = entity.force == character.force
     }
+    observed.inventory_limit = inventory_limit(entity)
     local roles = INVENTORY_ROLES[entity.name]
     if observed.owned and roles then
       local inventory_roles = sorted_keys(roles)
@@ -1711,7 +1730,7 @@ end
 local function do_craft(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.craft_action then return nil, "action_conflict", conflict_detail(state.craft_action) end
+  if state.craft_action then return nil, "action_conflict", conflict_detail(state.craft_action, state.character) end
   if type(params.recipe) ~= "string" or type(params.count) ~= "number" or
      params.count < 1 or params.count > 100 or params.count % 1 ~= 0 then
     return nil, "invalid_input"
@@ -2175,10 +2194,48 @@ local function do_check_placement(state, params)
           reason_detail = blocked.reason_detail}
 end
 
+local function electric_network_detail(target)
+  if target.type ~= "electric-pole" then return nil end
+  local id = target.electric_network_id
+  if not id then return nil end
+  local statistics = target.electric_network_statistics
+  if not statistics or not statistics.valid then return nil end
+  local function flows(counts, category)
+    local entries, total = {}, 0
+    for name in pairs(counts) do
+      -- Electric-network rates are J/tick. five_seconds without sample_index
+      -- averages the whole last 5 seconds; 60 ticks/s / 1000 converts to kW.
+      local kw = statistics.get_flow_count{
+        name = name, category = category,
+        precision_index = defines.flow_precision_index.five_seconds
+      } * 60 / 1000
+      if kw > 0 then
+        total = total + kw
+        entries[#entries + 1] = {name = name, kw = kw}
+      end
+    end
+    table.sort(entries, function(a, b)
+      if a.kw ~= b.kw then return a.kw > b.kw end
+      return a.name < b.name
+    end)
+    for index = #entries, 11, -1 do entries[index] = nil end
+    for index = #entries, 1, -1 do
+      entries[index].kw = math.floor(entries[index].kw * 10 + 0.5) / 10
+      if entries[index].kw == 0 then table.remove(entries, index) end
+    end
+    return math.floor(total * 10 + 0.5) / 10, entries
+  end
+  -- Unlike item statistics, electric input is consumption, output is production.
+  local production, producers = flows(statistics.output_counts, "output")
+  local consumption, consumers = flows(statistics.input_counts, "input")
+  return {id = id, production_kw = production, consumption_kw = consumption,
+          producers = producers, consumers = consumers}
+end
+
 local function do_place(state, params, line_placement)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action, state.character) end
   local placement, reason, detail = validate_placement(state, character, params, true, line_placement)
   if not placement then return nil, reason, detail end
   local inventory = placement.inventory
@@ -2233,6 +2290,9 @@ local function do_place(state, params, line_placement)
     local network_id = created.electric_network_id
     result.electric_network_connected = network_id ~= nil
     result.electric_network_id = network_id
+  end
+  if created.type == "electric-pole" then
+    result.electric_network = electric_network_detail(created)
   end
   return result
 end
@@ -2322,7 +2382,7 @@ end
 local function do_place_line(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action, state.character) end
   local line, reason, detail = validate_line(character, params)
   if not line then return nil, reason, detail end
   local first, requested, prototype = line.first, line.requested, line.prototype
@@ -2427,6 +2487,28 @@ local function settings_target(state, params, entity_type)
     return nil, "invalid_target", {entity = target.name, reason = "wrong_entity_type"}
   end
   return target
+end
+
+local function do_set_inventory_limit(state, params)
+  local slots = params.slots
+  if slots ~= nil and (type(slots) ~= "number" or slots < 0 or slots % 1 ~= 0) then
+    return nil, "invalid_params"
+  end
+  local target, err, detail = settings_target(state, params, "container")
+  if not target then return nil, err, detail end
+  local inventory = target.get_inventory(defines.inventory.chest)
+  if not inventory or not inventory.valid or not inventory.supports_bar() then
+    return nil, "invalid_target", {entity = target.name, reason = "no_inventory_bar"}
+  end
+  if slots ~= nil and slots > #inventory then
+    return nil, "invalid_params", {slots = #inventory}
+  end
+  -- All validation precedes the write. nil clears; N usable slots means bar N+1.
+  local bar
+  if slots ~= nil then bar = slots + 1 end
+  inventory.set_bar(bar)
+  return {name = target.name, position = position_data(target), target_ref = params.target_ref,
+          slots = #inventory, inventory_limit = inventory_limit(target)}
 end
 
 local function do_set_inserter_filter(state, params)
@@ -2667,44 +2749,6 @@ local function do_entity_feeders(state, params)
   return {feeders = feeders}
 end
 
-local function electric_network_detail(target)
-  if target.type ~= "electric-pole" then return nil end
-  local id = target.electric_network_id
-  if not id then return nil end
-  local statistics = target.electric_network_statistics
-  if not statistics or not statistics.valid then return nil end
-  local function flows(counts, category)
-    local entries, total = {}, 0
-    for name in pairs(counts) do
-      -- Electric-network rates are J/tick. five_seconds without sample_index
-      -- averages the whole last 5 seconds; 60 ticks/s / 1000 converts to kW.
-      local kw = statistics.get_flow_count{
-        name = name, category = category,
-        precision_index = defines.flow_precision_index.five_seconds
-      } * 60 / 1000
-      if kw > 0 then
-        total = total + kw
-        entries[#entries + 1] = {name = name, kw = kw}
-      end
-    end
-    table.sort(entries, function(a, b)
-      if a.kw ~= b.kw then return a.kw > b.kw end
-      return a.name < b.name
-    end)
-    for index = #entries, 11, -1 do entries[index] = nil end
-    for index = #entries, 1, -1 do
-      entries[index].kw = math.floor(entries[index].kw * 10 + 0.5) / 10
-      if entries[index].kw == 0 then table.remove(entries, index) end
-    end
-    return math.floor(total * 10 + 0.5) / 10, entries
-  end
-  -- Unlike item statistics, electric input is consumption, output is production.
-  local production, producers = flows(statistics.output_counts, "output")
-  local consumption, consumers = flows(statistics.input_counts, "input")
-  return {id = id, production_kw = production, consumption_kw = consumption,
-          producers = producers, consumers = consumers}
-end
-
 local function do_entity_inventory(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -2762,6 +2806,7 @@ local function do_entity_inventory(state, params)
           pickup_position = pickup_position, drop_position = drop_position,
           held_stack = held_stack, mining_target = mining_target,
           filters = filters, filter_mode = filter_mode,
+          inventory_limit = inventory_limit(target),
           electric_network = electric_network_detail(target)}
 end
 
@@ -2838,7 +2883,7 @@ end
 local function do_transfer(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state.action) end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action, state.character) end
   if (params.direction ~= "to_entity" and params.direction ~= "from_entity") or
      type(params.item) ~= "string" or type(params.count) ~= "number" or
      params.count < 1 or params.count > 100 or params.count % 1 ~= 0 then
@@ -2978,6 +3023,8 @@ local function do_action_status(state, params)
   end
   return adjusted_goal_detail(action, {
     action_id = action.id, type = action.type, status = action.status,
+    remaining_distance = action.status == "running" and
+                         remaining_walk_distance(action, state.character) or nil,
     error = action.error, detail = detail,
     standing_on_belt = action.standing_on_belt, hint = action.hint,
     position = action.status == "running" and
@@ -3049,6 +3096,7 @@ local handlers = {
   rotate_entity = do_rotate,
   set_inserter_filter = do_set_inserter_filter,
   set_splitter = do_set_splitter,
+  set_inventory_limit = do_set_inventory_limit,
   transfer_item = do_transfer,
   transfer_items = function(state, params) return do_batch(state, params, do_transfer) end,
   get_action_status = do_action_status,
@@ -3104,6 +3152,7 @@ commands.add_command("ai_mcp", "AI MCP bridge (RCON only)", function(command)
      request.operation == "transfer_items" or
      request.operation == "rotate_entity" or request.operation == "set_recipe" or
      request.operation == "set_inserter_filter" or request.operation == "set_splitter" or
+     request.operation == "set_inventory_limit" or
      request.operation == "start_research" then
     state.processed[request_id] = response
     state.processed_order[#state.processed_order + 1] = request_id
