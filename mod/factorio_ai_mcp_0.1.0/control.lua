@@ -189,9 +189,19 @@ local function stop_character(character)
   character.mining_state = {mining = false}
 end
 
-local function mining_inventory_count(character)
+local function mining_inventory_count(character, product_names)
   local inventory = character.get_main_inventory()
-  local count = inventory and inventory.get_item_count() or 0
+  local count = 0
+  if inventory then
+    if product_names then
+      for _, item in pairs(inventory.get_contents()) do
+        if product_names[item.name] then count = count + item.count end
+      end
+    else
+      -- Actions from older saves have no product set and keep total-count behavior.
+      count = inventory.get_item_count()
+    end
+  end
   -- Include pending final products so completing crafts does not count as mining.
   -- Prerequisite products stay in the crafting queue for use by later recipes.
   for _, item in ipairs(character.crafting_queue or {}) do
@@ -199,7 +209,7 @@ local function mining_inventory_count(character)
       local recipe = character.force.recipes[item.recipe]
       if recipe then
         for _, product in pairs(recipe.products) do
-          if product.type == "item" then
+          if product.type == "item" and (not product_names or product_names[product.name]) then
             count = count + item.count * (product.amount or 0)
           end
         end
@@ -212,7 +222,7 @@ end
 local function adjust_mining_inventory(state, before)
   if before and state.action and state.action.type == "mine" then
     state.action.last_inventory_count = state.action.last_inventory_count +
-      mining_inventory_count(state.character) - before
+      mining_inventory_count(state.character, state.action.product_names) - before
   end
 end
 
@@ -259,7 +269,7 @@ local function mine_partial_detail(character, action, detail)
     local inventory = character.get_main_inventory()
     if inventory and inventory.valid then
       -- Cancellation and early tick failures can precede the next progress update.
-      local current = mining_inventory_count(character)
+      local current = mining_inventory_count(character, action.product_names)
       detail.gained = detail.gained + math.max(0, current - (action.last_inventory_count or current))
       detail.inventory = inventory.get_contents()
     end
@@ -717,7 +727,15 @@ local function do_mine(state, params)
   end
   local inventory = character.get_main_inventory()
   if not inventory or inventory.is_full() then return nil, "inventory_full" end
-  local before = mining_inventory_count(character)
+  local product_names = {}
+  local properties = target.prototype.mineable_properties
+  for _, product in pairs(properties and properties.products or {}) do
+    if product.type == "item" then product_names[product.name] = true end
+  end
+  -- Fluid-only resources retain the total-count fallback. Empty non-resource sets
+  -- are saved as empty tables and complete solely when the target disappears.
+  if target.type == "resource" and next(product_names) == nil then product_names = nil end
+  local before = mining_inventory_count(character, product_names)
   character.selected = target
   if character.selected ~= target then
     character.selected = nil
@@ -725,7 +743,8 @@ local function do_mine(state, params)
   end
   local result = begin_action(state, "action", {
     type = "mine", target = target, reach = reach, goal_count = count, gained = 0,
-    last_inventory_count = before,
+    last_inventory_count = before, product_names = product_names,
+    target_is_resource = target.type == "resource",
     last_progress_tick = game.tick
   })
   character.mining_state = {mining = true, position = target.position}
@@ -1719,7 +1738,7 @@ local function do_craft(state, params)
                                                                          params.count)}
   end
   local before = state.action and state.action.type == "mine" and
-                 mining_inventory_count(character) or nil
+                 mining_inventory_count(character, state.action.product_names) or nil
   local started = character.begin_crafting{recipe = params.recipe, count = params.count}
   adjust_mining_inventory(state, before)
   if started ~= params.count then return nil, "craft_failed" end
@@ -2584,7 +2603,8 @@ local function get_entity_inventory(character, params, allow_status_only)
   -- Only inventory reads accept machines without inventories. Transfers retain
   -- the existing unsupported_entity error, including its supported-entity list.
   if not roles and allow_status_only and
-     (target.type == "inserter" or target.type == "mining-drill") then roles = {} end
+     (target.type == "inserter" or target.type == "mining-drill" or
+      target.type == "electric-pole") then roles = {} end
   if not roles then
     return nil, nil, "invalid_target", {entity = target.name, reason = "unsupported_entity",
                                        supported_entities = sorted_keys(INVENTORY_ROLES)}
@@ -2647,6 +2667,44 @@ local function do_entity_feeders(state, params)
   return {feeders = feeders}
 end
 
+local function electric_network_detail(target)
+  if target.type ~= "electric-pole" then return nil end
+  local id = target.electric_network_id
+  if not id then return nil end
+  local statistics = target.electric_network_statistics
+  if not statistics or not statistics.valid then return nil end
+  local function flows(counts, category)
+    local entries, total = {}, 0
+    for name in pairs(counts) do
+      -- Electric-network rates are J/tick. five_seconds without sample_index
+      -- averages the whole last 5 seconds; 60 ticks/s / 1000 converts to kW.
+      local kw = statistics.get_flow_count{
+        name = name, category = category,
+        precision_index = defines.flow_precision_index.five_seconds
+      } * 60 / 1000
+      if kw > 0 then
+        total = total + kw
+        entries[#entries + 1] = {name = name, kw = kw}
+      end
+    end
+    table.sort(entries, function(a, b)
+      if a.kw ~= b.kw then return a.kw > b.kw end
+      return a.name < b.name
+    end)
+    for index = #entries, 11, -1 do entries[index] = nil end
+    for index = #entries, 1, -1 do
+      entries[index].kw = math.floor(entries[index].kw * 10 + 0.5) / 10
+      if entries[index].kw == 0 then table.remove(entries, index) end
+    end
+    return math.floor(total * 10 + 0.5) / 10, entries
+  end
+  -- Unlike item statistics, electric input is consumption, output is production.
+  local production, producers = flows(statistics.output_counts, "output")
+  local consumption, consumers = flows(statistics.input_counts, "input")
+  return {id = id, production_kw = production, consumption_kw = consumption,
+          producers = producers, consumers = consumers}
+end
+
 local function do_entity_inventory(state, params)
   local character, err = require_character(state)
   if not character then return nil, err end
@@ -2703,7 +2761,8 @@ local function do_entity_inventory(state, params)
           direction = target.direction,
           pickup_position = pickup_position, drop_position = drop_position,
           held_stack = held_stack, mining_target = mining_target,
-          filters = filters, filter_mode = filter_mode}
+          filters = filters, filter_mode = filter_mode,
+          electric_network = electric_network_detail(target)}
 end
 
 local function transfer_inventory_contents(inventory)
@@ -2900,7 +2959,8 @@ local function do_action_status(state, params)
   local detail = action.detail
   if action.status == "running" then
     if action.type == "mine" then
-      detail = {gained = action.gained, count = action.goal_count,
+      detail = {gained = mine_partial_detail(state.character, action).gained,
+                count = action.goal_count,
                 estimated_seconds = mining_estimated_seconds(state.character, action)}
     elseif action.type == "craft" then
       local remaining = 0
@@ -2931,7 +2991,8 @@ local function do_cancel(state, params)
   if not slot then return nil, "action_not_found" end
   local action = state[slot]
   if action.type == "craft" and valid_character(state) then
-    local before = mining_inventory_count(state.character)
+    local before = mining_inventory_count(state.character,
+      state.action and state.action.product_names)
     pcall(state.character.cancel_crafting, {count = action.count, index = 1})
     adjust_mining_inventory(state, before)
   end
@@ -3211,19 +3272,25 @@ local function tick_action(state, slot)
       finish_action(state, slot, "failed", "inventory_full")
       return
     end
-    local current = mining_inventory_count(character)
+    local current = mining_inventory_count(character, action.product_names)
     if current > action.last_inventory_count then
       action.gained = action.gained + current - action.last_inventory_count
       action.last_progress_tick = game.tick
     end
     action.last_inventory_count = current
-    if action.gained >= action.goal_count then
+    local target = action.target
+    local target_valid = target and target.valid
+    -- For older actions the resource flag can be recovered while the target lives;
+    -- after removal they still use gained to decide success versus target_gone.
+    local is_resource = action.target_is_resource or (target_valid and target.type == "resource")
+    local no_products = action.product_names and next(action.product_names) == nil
+    if (is_resource or not target_valid) and
+       (action.gained >= action.goal_count or (not is_resource and no_products)) then
       finish_action(state, slot, "succeeded", nil,
         {gained = action.gained, inventory = inventory.get_contents()})
       return
     end
-    local target = action.target
-    if not target or not target.valid then
+    if not target_valid then
       finish_action(state, slot, "failed", "target_gone", {reason = "entity_gone"})
       return
     end

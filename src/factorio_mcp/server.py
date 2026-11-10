@@ -116,6 +116,8 @@ TRANSFER_DESCRIPTION = (
     "when available and recipe for assemblers/furnaces (idle furnaces use previous_recipe). "
     "For an empty entity source, fix no_fuel, no_power, item_ingredient_shortage, or "
     "no_ingredients first, then wait with wait_for_items. "
+    "For no_power or low_power, read a nearby electric pole with get_entity_inventory "
+    "to see production and consumption. "
     "item_not_accepted means the entity rejects the item: assembler source accepts only "
     "current recipe ingredients; detail includes item, entity, inventory_role, recipe, and "
     "ingredients (names), or reason=no_recipe when unset. Insert only detail.ingredients "
@@ -135,6 +137,8 @@ MACHINE_STATUS_DESCRIPTION = (
     " full_output means the output buffer limit was reached and the machine stopped;"
     " take products out (transfer from result) or add an output inserter."
     " waiting_for_space_in_destination for inserters means their target is full."
+    " For low_power or no_power, read a nearby electric pole with get_entity_inventory"
+    " to see production and consumption."
 )
 
 INVENTORY_MACHINE_DESCRIPTION = (
@@ -145,6 +149,11 @@ INVENTORY_MACHINE_DESCRIPTION = (
     " slot order) and filter_mode; these fields are absent when use_filters is false."
     " Mining drills include drop_position and mining_target (resource name) when present."
     " Both retain direction and include status when available."
+    " Owned electric-pole types also succeed within interact reach with empty inventories."
+    " Connected poles include electric_network = {id, production_kw, consumption_kw,"
+    " producers, consumers}: average kW over the last 5 seconds, rounded to one decimal."
+    " producers and consumers list {name, kw} per prototype, sorted by kw descending,"
+    " at most 10 each, omitting zero entries. Absent when the pole has no network."
     " These reads do not extend transfer_item support."
 )
 
@@ -197,7 +206,10 @@ ITEMS_STALLED_HINTS = {
     "missing_required_fluid": "Supply the required mining fluid.",
     "missing_science_packs": "Supply the required science packs to the lab.",
     "no_fuel": "Supply fuel to the machine's fuel inventory.",
-    "no_power": "Connect the machine to a working power supply.",
+    "no_power": (
+        "Connect the machine to a working power supply. Read a nearby electric pole with "
+        "get_entity_inventory to see production and consumption."
+    ),
     "no_recipe": "Set a recipe on the assembler.",
     "no_research_in_progress": "Start research for the lab to work on.",
     "no_minable_resources": "Place the drill over mineable resources.",
@@ -283,6 +295,8 @@ HINTS = {
         "For an entity source, check detail.status and detail.recipe: fix no_fuel (supply fuel), "
         "no_power (restore power), or item_ingredient_shortage/no_ingredients (supply recipe "
         "ingredients) first, then wait with wait_for_items before taking products."
+        " For no_power or low_power, read a nearby electric pole with get_entity_inventory"
+        " to see production and consumption."
     ),
 }
 
@@ -456,6 +470,11 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     ):
         if "filters" in result and not isinstance(result["filters"], list):
             result["filters"] = []
+    network = result.get("electric_network")
+    if isinstance(network, dict):
+        for field in ("producers", "consumers"):
+            if not isinstance(network.get(field), list):
+                network[field] = []
     array_fields = {
         "observe_nearby": ("entities", "blocked_tiles", "resources"),
         "get_explored_map": ("resources", "water", "trees", "rocks", "frontier"),
@@ -1013,6 +1032,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "estimate that can change if mining is interrupted or the target is depleted. "
             "Use it to pick wait_for_action timeout_seconds (maximum 50). "
             "Crafting runs alongside mining. Only one walk/mine at a time. "
+            "gained counts only the target's item products, compensating for pending final "
+            "crafting products with those names. Non-resource targets succeed only after "
+            "removal and gaining count items; resources can succeed while still present. "
+            "Non-resource targets with no item products succeed on removal alone. "
             "While mining runs, place_entity, transfer_item, rotate_entity, and set_recipe "
             "return action_conflict."
         )
@@ -1339,6 +1362,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             + ". Working states and containers without status never stall. "
             "For full_output, take products out or add an output inserter; "
             "for ingredient shortages, supply materials; for no_fuel/no_power, supply fuel/power."
+            " For low_power or no_power, read a nearby electric pole with get_entity_inventory"
+            " to see production and consumption."
             " When reached=false (timed out or stalled), includes feeders: up to 16 owned "
             "inserters whose drop_target is the target, sorted by x then y, with name, x, y, "
             "status and pickup_target (source entity name, omitted when none). "
@@ -1549,6 +1574,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "to save a call; use wait_for_action to continue waiting after a timeout. "
             "A timeout returns the last running status "
             "and leaves the action running. Running mining reports detail.gained and detail.count; "
+            "gained counts only the target's item products; non-resource targets must be "
+            "removed before success. "
             "running crafting reports detail.count and detail.remaining. "
             "Successful moves ending on a belt include standing_on_belt=true and a hint "
             "to stand off belts before the next action. "
