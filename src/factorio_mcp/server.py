@@ -14,7 +14,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import CallToolResult, InputRequiredResult, TextContent
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, BeforeValidator, Field, ValidationError
 
 from .bridge import BridgeError, FactorioBridge
 
@@ -32,6 +32,15 @@ FilterNames = Annotated[
 InserterFilters = Annotated[
     list[Annotated[str, Field(min_length=1, strict=True)]], Field(max_length=5, strict=True)
 ]
+
+
+def _strict_direction(value: Any) -> int:
+    if type(value) is not int:
+        raise ValueError("direction must be an integer: 0, 4, 8, or 12.")
+    return value
+
+
+RotationDirection = Annotated[Literal[0, 4, 8, 12], BeforeValidator(_strict_direction)]
 
 
 TARGET_REF_DESCRIPTION = (
@@ -301,7 +310,7 @@ class PlaceEntry(BaseModel):
 HINTS = {
     "invalid_input": (
         "Check the tool's input schema and argument values. "
-        "When present, detail.errors lists each invalid field."
+        "Unknown arguments are rejected. When present, detail.errors lists each invalid field."
     ),
     "target_gone": (
         TARGET_REF_DESCRIPTION
@@ -409,6 +418,8 @@ OPERATION_HINTS = {
     ),
     ("rotate_entity", "invalid_target"): (
         "Choose an owned rotatable entity in observe_nearby; check detail.reason."
+        " For direction_unreachable, the original direction is restored;"
+        " choose one of detail.reachable_directions."
     ),
     ("set_recipe", "invalid_target"): "Choose an owned assembling machine in observe_nearby.",
     ("set_recipe", "inventory_full"): (
@@ -652,10 +663,50 @@ def _success_value(operation: str, response: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _argument_errors(exc: ValidationError) -> list[dict[str, str]]:
+    return [
+        {
+            "field": ".".join(str(part) for part in error["loc"]),
+            "type": error["type"],
+            "message": error["msg"],
+        }
+        for error in exc.errors(include_url=False, include_context=False, include_input=False)
+    ]
+
+
 class _InputErrorServer(MCPServer):
     async def call_tool(
         self, name: str, arguments: dict[str, Any], context: Context | None = None
     ) -> CallToolResult | InputRequiredResult:
+        tool = self._tool_manager.get_tool(name)
+        accepted = tool.parameters.get("properties", {}) if tool is not None else {}
+        unknown = sorted(arguments.keys() - accepted.keys()) if tool is not None else []
+        if unknown:
+            errors = [
+                {
+                    "field": field,
+                    "type": "unexpected_argument",
+                    "message": f"Unknown argument: {field}.",
+                }
+                for field in unknown
+            ]
+            # Validate without calling the body: collect ordinary errors too, but
+            # never let the SDK silently discard extras and execute a tool.
+            try:
+                tool.fn_metadata.validate_arguments(arguments)
+            except ValidationError as exc:
+                errors.extend(_argument_errors(exc))
+            result = _error_response(
+                BridgeError(
+                    "invalid_input", "Tool arguments failed validation.", {"errors": errors}
+                ),
+                name,
+            )
+            value = json.loads(result.content[0].text)
+            _append_hint(
+                value, "Accepted arguments: " + (", ".join(sorted(accepted)) or "(none)") + "."
+            )
+            raise ToolError(_response(value, error=True).content[0].text)
         try:
             return await super().call_tool(name, arguments, context)
         except ToolError as exc:
@@ -666,16 +717,7 @@ class _InputErrorServer(MCPServer):
                 exc.__cause__, ValidationError
             ):
                 raise
-            errors = [
-                {
-                    "field": ".".join(str(part) for part in error["loc"]),
-                    "type": error["type"],
-                    "message": error["msg"],
-                }
-                for error in exc.__cause__.errors(
-                    include_url=False, include_context=False, include_input=False
-                )
-            ]
+            errors = _argument_errors(exc.__cause__)
             result = _error_response(
                 BridgeError(
                     "invalid_params"
@@ -1453,11 +1495,30 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await invoke("check_placement", params)
 
     @server.tool(
-        description="Rotate an owned observed entity within reach by 90 degrees."
+        description=(
+            "Rotate an owned observed entity within reach by 90 degrees (reverse for backwards)."
+            " With direction=0/4/8/12 (north/east/south/west), rotate forwards up to 3 times"
+            " to that absolute direction. direction cannot be combined with reverse=true."
+            " Returns rotations: 1 for a plain rotate, 0 if already at the requested direction."
+            " If unreachable, returns invalid_target with detail.reason=direction_unreachable,"
+            " detail.direction (restored original direction)"
+            " and sorted detail.reachable_directions."
+        )
         + INSERTER_DIRECTION_DESCRIPTION
     )
-    async def rotate_entity(target_ref: RequiredText, reverse: bool = False) -> CallToolResult:
-        return await invoke("rotate_entity", {"target_ref": target_ref, "reverse": reverse})
+    async def rotate_entity(
+        target_ref: RequiredText,
+        reverse: bool = False,
+        direction: RotationDirection | None = None,
+    ) -> CallToolResult:
+        if direction is not None and reverse:
+            return _error_response(
+                BridgeError("invalid_input", "direction cannot be combined with reverse=true.")
+            )
+        params = {"target_ref": target_ref, "reverse": reverse}
+        if direction is not None:
+            params["direction"] = direction
+        return await invoke("rotate_entity", params)
 
     @server.tool(
         description=(

@@ -2513,6 +2513,13 @@ local function do_rotate(state, params)
   if params.reverse ~= nil and type(params.reverse) ~= "boolean" then
     return nil, "invalid_input"
   end
+  local direction = params.direction
+  if direction ~= nil and
+     (type(direction) ~= "number" or
+      (direction ~= 0 and direction ~= 4 and direction ~= 8 and direction ~= 12) or
+      params.reverse == true) then
+    return nil, "invalid_input"
+  end
   local target, target_error, detail = target_entity(character, params, character.reach_distance)
   if not target then return nil, target_error, detail end
   if target.force ~= character.force then
@@ -2521,10 +2528,34 @@ local function do_rotate(state, params)
   if not character.can_reach_entity(target) then
     return nil, "out_of_range", range_detail(character, target.position, character.reach_distance)
   end
-  if not target.rotate{reverse = params.reverse or false} then
-    return nil, "invalid_target", {entity = target.name, reason = "not_rotatable"}
+  local rotations = 0
+  if direction == nil then
+    if not target.rotate{reverse = params.reverse or false} then
+      return nil, "invalid_target", {entity = target.name, reason = "not_rotatable"}
+    end
+    rotations = 1
+  else
+    local original = target.direction
+    local seen = {[original] = true}
+    while target.direction ~= direction and rotations < 3 do
+      if not target.rotate{reverse = false} then break end
+      rotations = rotations + 1
+      local current = target.direction
+      if seen[current] then break end
+      seen[current] = true
+    end
+    if target.direction ~= direction then
+      -- Writing the saved direction restores even non-cardinal originals exactly.
+      if target.direction ~= original then target.direction = original end
+      local reachable = {}
+      for value in pairs(seen) do reachable[#reachable + 1] = value end
+      table.sort(reachable)
+      return nil, "invalid_target", {reason = "direction_unreachable",
+        direction = target.direction, reachable_directions = reachable}
+    end
   end
-  return {name = target.name, direction = target.direction, position = position_data(target)}
+  return {name = target.name, direction = target.direction, position = position_data(target),
+          rotations = rotations}
 end
 
 local function settings_target(state, params, entity_type)
