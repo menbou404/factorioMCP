@@ -43,6 +43,17 @@ def _strict_direction(value: Any) -> int:
 RotationDirection = Annotated[Literal[0, 4, 8, 12], BeforeValidator(_strict_direction)]
 
 
+LINE_END_DIRECTION_DESCRIPTION = (
+    " Optional end_direction=0/4/8/12 (north/east/south/west) changes only the last belt;"
+    " all other tiles keep the line direction. For example, a westward line with"
+    " end_direction 0 makes its last belt face north, so the next northward line connects"
+    " without rotate_entity. Start that next line on the tile north of the corner."
+    " The exact opposite of the line direction and non-belt items (including pipe)"
+    " are rejected with invalid_input. Results include end_direction when given;"
+    " direction stays the line direction."
+)
+
+
 TARGET_REF_DESCRIPTION = (
     "Owned-structure target refs (your force, with a unit_number) are stable across observations "
     "and do not expire while the entity exists. Other refs expire after 60 seconds. "
@@ -1334,6 +1345,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "reports whether the whole line finished. Summary includes requested, placed, "
             "already_present, direction, first_position, last_position (if any), next_position "
             "and stopped/detail/hint on stop, and merged collected_items when picked up."
+            + LINE_END_DIRECTION_DESCRIPTION
             + WALK_WAIT_DESCRIPTION
         )
     )
@@ -1344,8 +1356,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         from_y: LineCoordinate,
         to_x: LineCoordinate,
         to_y: LineCoordinate,
+        end_direction: RotationDirection | None = None,
     ) -> CallToolResult:
-        return await invoke_line("place_line", item, surface, from_x, from_y, to_x, to_y)
+        return await invoke_line(
+            "place_line", item, surface, from_x, from_y, to_x, to_y, end_direction
+        )
 
     @server.tool(
         description=(
@@ -1362,7 +1377,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "not block. Returns requested, clear, already_present, direction, complete, "
             "first_position, last_position, problems (at most 16, in line order), and "
             "problem_total. Blocked problems include blocking entities with name and "
-            "target_ref and/or blocking tile names."
+            "target_ref and/or blocking tile names." + LINE_END_DIRECTION_DESCRIPTION
         )
     )
     async def check_line(
@@ -1372,8 +1387,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         from_y: LineCoordinate,
         to_x: LineCoordinate,
         to_y: LineCoordinate,
+        end_direction: RotationDirection | None = None,
     ) -> CallToolResult:
-        return await invoke_line("check_line", item, surface, from_x, from_y, to_x, to_y)
+        return await invoke_line(
+            "check_line", item, surface, from_x, from_y, to_x, to_y, end_direction
+        )
 
     async def invoke_line(
         operation: str,
@@ -1383,6 +1401,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         from_y: float,
         to_x: float,
         to_y: float,
+        end_direction: int | None,
     ) -> CallToolResult:
         dx, dy = math.floor(to_x) - math.floor(from_x), math.floor(to_y) - math.floor(from_y)
         if (dx and dy) or not 2 <= abs(dx) + abs(dy) + 1 <= 64:
@@ -1392,17 +1411,32 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                 ),
                 operation,
             )
-        return await invoke(
-            operation,
-            {
-                "item": item,
-                "surface": surface,
-                "from_x": from_x,
-                "from_y": from_y,
-                "to_x": to_x,
-                "to_y": to_y,
-            },
-        )
+        direction = 4 if dx > 0 else 12 if dx < 0 else 8 if dy > 0 else 0
+        if end_direction == (direction + 8) % 16:
+            message = "end_direction cannot be the exact opposite of the line direction."
+            return _error_response(
+                BridgeError(
+                    "invalid_input",
+                    message,
+                    {
+                        "errors": [
+                            {"field": "end_direction", "type": "value_error", "message": message}
+                        ]
+                    },
+                ),
+                operation,
+            )
+        params = {
+            "item": item,
+            "surface": surface,
+            "from_x": from_x,
+            "from_y": from_y,
+            "to_x": to_x,
+            "to_y": to_y,
+        }
+        if end_direction is not None:
+            params["end_direction"] = end_direction
+        return await invoke(operation, params)
 
     @server.tool(
         description=(

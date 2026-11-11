@@ -4920,6 +4920,241 @@ def main():
             and bridge.call("get_agent_status")["result"]["position"] == m33_position,
         )
 
+    # M34 CD/CE: a fresh path around a newly built assembler, and belt corners.
+    # Use a disposable, entirely clear surface so the short detour is always free.
+    m34_surface = "m34-fresh-path-corner-fixture"
+    m34_server = create_server(bridge)
+    m34_inventory = bridge.call("get_inventory")["result"]["items"]
+    m34_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m34_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m34_surface}";local s=game.surfaces[name];'
+            "local b=storage.m34_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m34:" not in raw:
+            raise RuntimeError("M34 fixture failed: " + raw)
+        return json.loads(raw.split("m34:", 1)[1].strip())
+
+    async def m34_tool(name, arguments, *, error=None):
+        try:
+            response = await m34_server.call_tool(name, arguments)
+        except ToolError as exc:
+            value = json.loads(str(exc))
+            is_error = True
+        else:
+            value = json.loads(response.content[0].text)
+            is_error = bool(response.is_error)
+        assert is_error == (error is not None), value
+        if error:
+            assert value["error"] == error, value
+        return value
+
+    try:
+        m34_fixture(
+            "assert(not s and not b,'M34 fixture already exists');"
+            # Refuse an active queue before changing anything; preserve it on failure.
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv),selected=c.selected,"
+            "last_observation=state.last_observation,recent_observations=state.recent_observations};"
+            "storage.m34_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=160,height=64});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},3);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-80,79 do for y=-32,31 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({-29.5,0.5},s));"
+            "state.last_observation=nil;state.recent_observations={};"
+            "assert(inv.insert{name='transport-belt',count=16}==16);"
+            "assert(inv.insert{name='pipe',count=3}==3);rcon.print('m34:{}')"
+        )
+        # Use 60 tiles to reliably warm the cache: defaults set
+        # long_cache_min_cacheable_distance=30, while short paths need 50 algorithm
+        # steps. A short clear walk is never cached; even 40 tiles missed the bug.
+        # Warm A->B, teleport back to exact A, then put a 3x3 assembler across
+        # its middle. Both sides have plenty of room for the short detour.
+        goal = {"surface": m34_surface, "x": 30.5, "y": 0.5}
+        action("move_to", goal)
+        # Identical start/goal, using default arrival (no within) for both walks.
+        # The assembler is 30 tiles from A, so create it outside build reach.
+        assembler = m34_fixture(
+            "assert(c.teleport({-29.5,0.5},s));"
+            'assert(s.create_entity{name="assembling-machine-1",position={0.5,0.5},force=c.force});'
+            "local e=s.find_entity('assembling-machine-1',{0.5,0.5});assert(e);"
+            "rcon.print('m34:'..helpers.table_to_json({position=e.position}))"
+        )
+        record(
+            "M34 CD assembler stands across the warmed route's middle",
+            assembler["position"]["x"] == 0.5 and assembler["position"]["y"] == 0.5,
+        )
+        walked = action("move_to", goal)
+        arrived = bridge.call("get_agent_status")["result"]["position"]
+        record(
+            "M34 CD warmed route avoids newly built assembler and arrives",
+            walked["status"] == "succeeded"
+            # Match move_to's default successful arrival radius.
+            and math.hypot(arrived["x"] - goal["x"], arrived["y"] - goal["y"]) <= 0.5,
+            json.dumps({"walked": walked, "position": arrived}),
+        )
+        m34_fixture(
+            "local e=s.find_entity('assembling-machine-1',{0.5,0.5});assert(e);e.destroy();"
+            "assert(c.teleport({0.5,5.5},s));rcon.print('m34:{}')"
+        )
+        line = {
+            "item": "transport-belt",
+            "surface": m34_surface,
+            "from_x": 2.5,
+            "from_y": 2.5,
+            "to_x": 0.5,
+            "to_y": 2.5,
+            "end_direction": 0,
+        }
+        corner = asyncio.run(m34_tool("place_line", line))
+        directions = m34_fixture(
+            "local ds={};for _,x in ipairs({2.5,1.5,0.5}) do "
+            "local e=s.find_entity('transport-belt',{x,2.5});assert(e);ds[#ds+1]=e.direction end;"
+            "rcon.print('m34:'..helpers.table_to_json(ds))"
+        )
+        record(
+            "M34 CE westward line turns only its last belt north",
+            corner["placed"] == 3
+            and corner["complete"]
+            and corner["direction"] == 12
+            and corner["end_direction"] == 0
+            and directions == [12, 12, 0],
+            json.dumps(corner),
+        )
+        north = asyncio.run(
+            m34_tool(
+                "place_line",
+                {
+                    "item": "transport-belt",
+                    "surface": m34_surface,
+                    "from_x": 0.5,
+                    "from_y": 1.5,
+                    "to_x": 0.5,
+                    "to_y": -0.5,
+                },
+            )
+        )
+        connected = m34_fixture(
+            "local corner=s.find_entity('transport-belt',{0.5,2.5});assert(corner);"
+            "local ds={};for _,y in ipairs({1.5,0.5,-0.5}) do "
+            "local e=s.find_entity('transport-belt',{0.5,y});assert(e);ds[#ds+1]=e.direction end;"
+            "rcon.print('m34:'..helpers.table_to_json({corner=corner.direction,north=ds}))"
+        )
+        record(
+            "M34 CE northward continuation starts at corner output without rotation",
+            north["placed"] == 3
+            and north["complete"]
+            and connected == {"corner": 0, "north": [0, 0, 0]},
+        )
+        repeated = asyncio.run(m34_tool("place_line", line))
+        preview = asyncio.run(m34_tool("check_line", line))
+        record(
+            "M34 CE repeat and matching preview count all three belts already present",
+            repeated["already_present"] == preview["already_present"] == 3
+            and repeated["placed"] == preview["clear"] == 0
+            and repeated["complete"]
+            and preview["complete"]
+            and repeated["end_direction"] == preview["end_direction"] == 0
+            and repeated["direction"] == preview["direction"] == 12,
+        )
+        mismatched = {**line, "end_direction": 8}
+        preview = asyncio.run(m34_tool("check_line", mismatched))
+        stopped = asyncio.run(m34_tool("place_line", mismatched))
+        record(
+            "M34 CE different final direction reports the corner's existing direction",
+            preview["already_present"] == stopped["already_present"] == 2
+            and preview["direction"] == stopped["direction"] == 12
+            and preview["end_direction"] == stopped["end_direction"] == 8
+            and preview["problem_total"] == 1
+            and preview["problems"]
+            == [
+                {
+                    "x": 0.5,
+                    "y": 2.5,
+                    "reason": "different_direction",
+                    "existing_direction": 0,
+                }
+            ]
+            and stopped["stopped"] == "blocked"
+            and stopped["detail"]["reason"] == "different_direction"
+            and stopped["detail"]["existing_direction"] == 0,
+        )
+        before_rejections = items()
+        for tool in ("place_line", "check_line"):
+            opposite = {**line, "from_y": 8.5, "to_y": 8.5, "end_direction": 4}
+            value = asyncio.run(m34_tool(tool, opposite, error="invalid_input"))
+            record(
+                f"M34 CE {tool} rejects opposite end_direction in Python",
+                any(e["field"] == "end_direction" for e in value["detail"]["errors"]),
+            )
+            # The Mod also defends direct callers, before any tile is placed.
+            expect_error(
+                f"M34 CE direct {tool} rejects opposite", tool, opposite, {"invalid_input"}
+            )
+            pipe = {**opposite, "item": "pipe", "end_direction": 0}
+            value = asyncio.run(m34_tool(tool, pipe, error="invalid_input"))
+            record(
+                f"M34 CE {tool} rejects pipe end_direction in Mod",
+                value["detail"]["reason"] == "end_direction_requires_transport_belt",
+            )
+        remaining = m34_fixture(
+            "rcon.print('m34:'..helpers.table_to_json({"
+            "belts=s.count_entities_filtered{type='transport-belt'},"
+            "pipes=s.count_entities_filtered{type='pipe'},"
+            "assemblers=s.count_entities_filtered{type='assembling-machine'}}))"
+        )
+        record(
+            "M34 CE rejected calls place nothing and consume nothing; CD assembler removed",
+            items() == before_rejections and remaining == {"belts": 6, "pipes": 0, "assemblers": 0},
+        )
+    finally:
+        # Cancel only actions started after the backup. No fixture crafts, and
+        # setup requires an empty queue, so queue restoration is exact.
+        for slot in ("action", "craft_action"):
+            pending = m34_fixture(
+                f"rcon.print('m34:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m34_fixture(
+            "if b then assert(c.crafting_queue_size==0);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();state.last_observation=b.last_observation;"
+            "state.recent_observations=b.recent_observations;"
+            "for ref,entry in pairs(state.targets) do if entry.entity and entry.entity.valid "
+            "and entry.entity.surface==s then if entry.unit_number then "
+            "state.owned_refs[entry.unit_number]=nil end;state.targets[ref]=nil end end;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil;"
+            "storage.m34_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m34:'..helpers.table_to_json({restored=true}))"
+        )
+        observed_map_cells.pop(m34_surface, None)
+        record(
+            "M34 removes fixtures and restores exact inventory, empty queue and position",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m34_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m34_position,
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
