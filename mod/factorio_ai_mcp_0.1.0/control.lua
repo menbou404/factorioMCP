@@ -12,6 +12,8 @@ local MAP_CELL_SIZE = 8
 local MAX_EXPLORED_CELLS = 16384
 local TARGET_TTL_TICKS = 60 * 60
 local ACTION_TIMEOUT_TICKS = 60 * 120
+local MOVE_ARRIVAL_RADIUS = 0.5
+local MOVE_BLOCKED_ARRIVAL_RADIUS = 1.5
 local ENTITY_STATUS_NAMES = {}
 for name, value in pairs(defines.entity_status) do
   ENTITY_STATUS_NAMES[value] = name
@@ -1899,6 +1901,54 @@ local function placement_mining_area_resources(character, prototype, position, d
   return resources
 end
 
+local function placement_stand_positions(state, character, area, position)
+  local box = character.prototype.collision_box
+  if not box then return {} end
+  -- Default move_to can also succeed at the blocked-goal fallback radius.
+  -- Every point in that arrival disk must clear the placement's world-space
+  -- box, including asymmetric character footprints and fixed-point rounding.
+  local arrival = math.max(MOVE_ARRIVAL_RADIUS, MOVE_BLOCKED_ARRIVAL_RADIUS)
+  local clearance = arrival + 0.15
+  local left = area.left_top.x - box.right_bottom.x - clearance
+  local right = area.right_bottom.x - box.left_top.x + clearance
+  local top = area.left_top.y - box.right_bottom.y - clearance
+  local bottom = area.right_bottom.y - box.left_top.y + clearance
+  -- 2.0.77 LuaControl.build_distance is a non-optional uint32 for characters.
+  local reach = character.build_distance - arrival
+  if reach < 0 then return {} end
+  local positions = {}
+  local function consider(candidate)
+    if distance_squared(candidate, position) > reach ^ 2 or
+       not placement_visible(state, character, candidate) then return end
+    -- 2.0.77 LuaSurface.can_place_entity checks terrain/entity collisions at
+    -- the supplied MapPosition for an EntityID, including character prototypes.
+    -- Do not search nearby: a shifted result can lose the arrival clearance.
+    if not character.surface.can_place_entity{
+      name = character.name, position = candidate, force = character.force
+    } then return end
+    for _, other in ipairs(positions) do
+      if distance_squared(candidate, other) < 0.04 then return end
+    end
+    positions[#positions + 1] = {x = candidate.x, y = candidate.y}
+  end
+  -- Sixteen candidates around a small perimeter; no large area/path searches.
+  for i = 0, 3 do
+    local t = i / 4
+    consider({x = left + (right - left) * t, y = top})
+    consider({x = right, y = top + (bottom - top) * t})
+    consider({x = right - (right - left) * t, y = bottom})
+    consider({x = left, y = bottom - (bottom - top) * t})
+  end
+  table.sort(positions, function(a, b)
+    local da, db = distance_squared(a, character.position), distance_squared(b, character.position)
+    if da ~= db then return da < db end
+    if a.x ~= b.x then return a.x < b.x end
+    return a.y < b.y
+  end)
+  while #positions > 3 do table.remove(positions) end
+  return positions
+end
+
 local function placement_blocking(state, character, prototype, position, direction, observed_only)
   -- Keep the requested position so every alternative direction snaps independently.
   local area = placement_bounding_box(prototype, snapped_position(prototype, position, direction),
@@ -1950,6 +2000,10 @@ local function placement_blocking(state, character, prototype, position, directi
   local detail = {blocking = blocking, tiles = tile_names}
   if character_in_the_way then
     detail.reason = "character_in_the_way"
+    if not observed_only then
+      detail.stand_positions = placement_stand_positions(state, character, area,
+        snapped_position(prototype, position, direction))
+    end
   elseif #blocking == 0 and #tile_names == 0 then
     detail.reason = "placement_rules"
   end
@@ -2189,6 +2243,7 @@ local function do_check_placement(state, params)
           blocking = blocked.blocking, tiles = blocked.tiles,
           valid_directions = blocked.valid_directions, blocked_reason = blocked.reason,
           nearby_positions = blocked.nearby_positions,
+          stand_positions = blocked.stand_positions,
           ground_items = placement and placement.ground_items or blocked.ground_items,
           mining_area_resources = mining_area_resources,
           reason_detail = blocked.reason_detail}
@@ -3257,7 +3312,7 @@ local function tick_action(state, slot)
     if finish_move_within(state) then return end
     if not action.path then return end
     local d = math.sqrt(distance_squared(character.position, action.goal))
-    if d <= 0.5 then
+    if d <= MOVE_ARRIVAL_RADIUS then
       finish_action(state, slot, "succeeded", nil, {position = position_data(character)})
       return
     end
@@ -3278,7 +3333,7 @@ local function tick_action(state, slot)
         action.final_progress_tick = game.tick
       end
       if game.tick - action.final_progress_tick >= 60 then
-        if d <= 1.5 then
+        if d <= MOVE_BLOCKED_ARRIVAL_RADIUS then
           finish_action(state, slot, "succeeded", nil,
             {position = position_data(character), distance = d, goal_blocked = true})
         else

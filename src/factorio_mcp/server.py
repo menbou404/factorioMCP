@@ -54,6 +54,30 @@ INSERTER_DIRECTION_DESCRIPTION = (
     " 12 picks up from west and drops east."
 )
 
+WALK_WAIT_SECONDS = 15.0
+WALK_WAIT_OPERATIONS = {
+    "place_entity",
+    "place_entities",
+    "place_line",
+    "transfer_item",
+    "transfer_items",
+    "mine_entity",
+    "move_to",
+}
+WALK_WAIT_DESCRIPTION = (
+    " A running walk is automatically waited for up to 15 seconds, then the call is retried once."
+    " Returns waited_for_walk = {action_id, status, seconds} whenever it waited;"
+    " seconds is rounded to 2 decimals. A still-running walk returns action_conflict;"
+    " for longer walks call wait_for_action. Running mines conflict immediately;"
+    " crafting is allowed."
+)
+STAND_DESCRIPTION = (
+    " For character_in_the_way, stand_positions lists up to 3 free, visible positions"
+    " within build reach of the placement, nearest to the character first (possibly empty)."
+    " Use move_to one of stand_positions, then place again;"
+    " placement waits for the walk automatically."
+)
+
 
 PLACE_DESCRIPTION = (
     "Place a supported entity within build reach, consuming one real inventory item."
@@ -95,7 +119,8 @@ PLACE_DESCRIPTION = (
     " Each detail.blocking entry includes a target_ref usable with mine_entity. "
     + TARGET_REF_DESCRIPTION
     + " detail.reason is character_in_the_way when the character blocks placement"
-    " (move the character away first), or placement_rules when no blocking entities,"
+    " (detail.stand_positions suggests where to stand), or placement_rules when no"
+    " blocking entities,"
     " tiles, or character explain the failure."
     " For placement_rules, detail.nearby_positions lists up to 3 placeable centres"
     " and directions within 8 tiles of the requested position."
@@ -103,6 +128,8 @@ PLACE_DESCRIPTION = (
     " For mining drills, detail.mining_area_resources lists mineable resources as {name, tiles}"
     " in the snapped mining area, sorted by name; an empty list also sets"
     " detail.reason_detail to no_resources_in_mining_area."
+    + WALK_WAIT_DESCRIPTION
+    + STAND_DESCRIPTION
 )
 
 TRANSFER_DESCRIPTION = (
@@ -135,6 +162,7 @@ TRANSFER_DESCRIPTION = (
     "slots, empty_slots, and insertable count for the item. "
     "For accepted items, insertable uses the inventory capacity estimate; Factorio may "
     "overestimate assembler filtered slots. moved is the actual inserted count."
+    + WALK_WAIT_DESCRIPTION
 )
 
 MACHINE_STATUS_DESCRIPTION = (
@@ -165,9 +193,10 @@ INVENTORY_MACHINE_DESCRIPTION = (
 )
 
 RUNNING_WALK_HINT = (
-    "While this walk runs, place_entity, place_entities, place_line and transfer_item(s) "
-    "return action_conflict. Call wait_for_action with this action_id "
-    "next: {action_id}."
+    "The next placement (place_entity, place_entities, place_line), transfer_item(s), "
+    "mine_entity or move_to automatically waits up to 15 seconds for this walk to finish, "
+    "returning waited_for_walk; a still-running walk returns action_conflict. "
+    "For longer walks, call wait_for_action with this action_id: {action_id}."
 )
 
 NO_GENERATION_HINT = (
@@ -286,8 +315,10 @@ HINTS = {
     "action_conflict": (
         "Wait for detail.running_action with wait_for_action, or stop it with cancel_action. "
         "Only one craft at a time and one walk/mine at a time; crafting can run alongside either. "
-        "place_entity, place_entities, place_line and transfer_item(s) also return action_conflict "
-        "while a walk or mine is running; they are allowed while crafting. "
+        "place_entity, place_entities, place_line, transfer_item(s), mine_entity and move_to "
+        "automatically wait up to 15 seconds for a running walk and retry once, returning "
+        "waited_for_walk = {action_id, status, seconds}. Longer walks need wait_for_action. "
+        "A running mine conflicts immediately; placement and transfers are allowed while crafting. "
         "rotate_entity, set_recipe and the settings tools (set_inserter_filter, set_splitter, "
         "set_inventory_limit) work during walks within interact reach."
     ),
@@ -307,7 +338,8 @@ HINTS = {
     "blocked": (
         "Check valid_directions for another orientation, mine or recover blocking entities, "
         "or find another position with check_placement. "
-        "If reason is character_in_the_way, move the character away first. "
+        "If reason is character_in_the_way, move_to one of detail.stand_positions, then place "
+        "again; placement waits for the walk automatically. "
         "For ground_items_inventory_full, free inventory space for ground_items and retry. "
         "For placement_rules, nearby_positions lists up to 3 placeable centres and directions "
         "within 8 tiles of the requested position. They may be out of reach; "
@@ -426,6 +458,7 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
         "ingredients",
         "recipe_products",
         "unknown_items",
+        "stand_positions",
     ):
         if field in detail and not isinstance(detail[field], list):
             detail[field] = []
@@ -499,6 +532,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         "spilled_items",
         "recipe_products",
         "mining_area_resources",
+        "stand_positions",
     ):
         if field in result and not isinstance(result[field], list):
             result[field] = []
@@ -588,7 +622,9 @@ def _response(value: dict[str, Any], *, error: bool = False) -> CallToolResult:
     )
 
 
-def _error_response(exc: Exception, operation: str | None = None) -> CallToolResult:
+def _error_response(
+    exc: Exception, operation: str | None = None, waited_for_walk: dict[str, Any] | None = None
+) -> CallToolResult:
     code = exc.code if isinstance(exc, BridgeError) else "internal_error"
     detail = exc.detail if isinstance(exc, BridgeError) else None
     value: dict[str, Any] = {"ok": False, "error": code, "message": str(exc)}
@@ -603,6 +639,8 @@ def _error_response(exc: Exception, operation: str | None = None) -> CallToolRes
     hint = _hint(operation, code)
     if hint is not None:
         value["hint"] = hint
+    if waited_for_walk:
+        value["waited_for_walk"] = waited_for_walk
     return _response(value, error=True)
 
 
@@ -665,10 +703,78 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await asyncio.to_thread(bridge.call, operation, params)
 
     async def invoke(operation: str, params: dict[str, Any] | None = None) -> CallToolResult:
+        waited: dict[str, Any] = {}
         try:
-            return _response(_success_value(operation, await call(operation, params)))
+            response, _ = await call_after_walk(operation, params, waited)
+            value = _success_value(operation, response)
+            if waited:
+                value["waited_for_walk"] = waited
+            return _response(value)
         except Exception as exc:
-            return _error_response(exc, operation)
+            return _error_response(exc, operation, waited)
+
+    def conflicting_walk(entry: dict[str, Any]) -> dict[str, Any] | None:
+        detail = entry.get("detail")
+        running = detail.get("running_action") if isinstance(detail, dict) else None
+        if (
+            entry.get("error") == "action_conflict"
+            and isinstance(running, dict)
+            and running.get("type") == "move"
+            and running.get("id")
+        ):
+            return running
+        return None
+
+    async def call_after_walk(
+        operation: str, params: dict[str, Any] | None, waited: dict[str, Any]
+    ) -> tuple[dict[str, Any], float]:
+        conflict = None
+        response = None
+        try:
+            response = await call(operation, params)
+        except BridgeError as exc:
+            if operation not in WALK_WAIT_OPERATIONS:
+                raise
+            running = conflicting_walk({"error": exc.code, "detail": exc.detail})
+            if not running:
+                raise
+            conflict = exc
+        else:
+            if operation not in {"place_entities", "transfer_items"}:
+                return response, 0
+            entries = (response.get("result") or {}).get("results")
+            if not isinstance(entries, list) or not entries:
+                return response, 0
+            walks = [
+                conflicting_walk(entry) if entry.get("ok") is False else None for entry in entries
+            ]
+            running = walks[0]
+            if not running or any(walk is None or walk["id"] != running["id"] for walk in walks):
+                return response, 0
+
+        action_id = running["id"]
+        started = time.monotonic()
+        waited.update(action_id=action_id, status="running", seconds=0)
+        try:
+            value, seconds = await poll_action(action_id, WALK_WAIT_SECONDS)
+            waited.update(status=value["status"], seconds=round(seconds, 2))
+        except Exception:
+            waited["seconds"] = round(time.monotonic() - started, 2)
+            raise
+        if value["status"] == "running":
+            # Preserve the original conflict, refreshing its measured distance after waiting.
+            if "remaining_distance" in value:
+                running["remaining_distance"] = value["remaining_distance"]
+                if response:
+                    for entry in response["result"]["results"]:
+                        entry["detail"]["running_action"]["remaining_distance"] = value[
+                            "remaining_distance"
+                        ]
+            if conflict:
+                raise conflict
+            return response, seconds
+        # A new bridge.call creates a new request ID, bypassing the processed-request cache.
+        return await call(operation, params), seconds
 
     async def read_position() -> dict[str, float] | None:
         try:
@@ -708,43 +814,52 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                 )
         return _response(result)
 
+    async def poll_action(action_id: str, timeout_seconds: float) -> tuple[dict[str, Any], float]:
+        started = time.monotonic()
+        while True:
+            response = await call("get_action_status", {"action_id": action_id})
+            value = _success_value("get_action_status", response)
+            waited = time.monotonic() - started
+            if value.get("status") != "running" or waited >= timeout_seconds:
+                return value, waited
+            await asyncio.sleep(min(0.25, timeout_seconds - waited))
+
     async def wait_action(
         action_id: str, timeout_seconds: float, start_value: dict[str, Any] | None = None
     ) -> CallToolResult:
-        started = time.monotonic()
         try:
-            while True:
-                response = await call("get_action_status", {"action_id": action_id})
-                value = _success_value("get_action_status", response)
-                waited = time.monotonic() - started
-                running = value.get("status") == "running"
-                if not running or waited >= timeout_seconds:
-                    return _response(
-                        _running_walk_guidance(
-                            {
-                                **{
-                                    key: item
-                                    for key, item in (start_value or {}).items()
-                                    if key != "remaining_distance"
-                                },
-                                **value,
-                                "timed_out": running,
-                                "waited_seconds": waited,
-                            }
-                        )
-                    )
-                await asyncio.sleep(min(0.25, timeout_seconds - waited))
+            value, waited = await poll_action(action_id, timeout_seconds)
+            return _response(
+                _running_walk_guidance(
+                    {
+                        **{
+                            key: item
+                            for key, item in (start_value or {}).items()
+                            if key != "remaining_distance"
+                        },
+                        **value,
+                        "timed_out": value.get("status") == "running",
+                        "waited_seconds": waited,
+                    }
+                )
+            )
         except Exception as exc:
-            return _error_response(exc)
+            return _error_response(exc, waited_for_walk=(start_value or {}).get("waited_for_walk"))
 
     async def start_action(
         operation: str, params: dict[str, Any], wait_seconds: float | None
     ) -> CallToolResult:
+        waited: dict[str, Any] = {}
         try:
-            value = _success_value(operation, await call(operation, params))
+            response, seconds = await call_after_walk(operation, params, waited)
+            value = _success_value(operation, response)
+            if waited:
+                value["waited_for_walk"] = waited
+            if wait_seconds is not None:
+                wait_seconds = min(wait_seconds, max(0, 50 - seconds))
         except Exception as exc:
-            return _error_response(exc, operation)
-        if wait_seconds is None or value.get("status") in {"succeeded", "failed", "cancelled"}:
+            return _error_response(exc, operation, waited)
+        if not wait_seconds or value.get("status") in {"succeeded", "failed", "cancelled"}:
             return _response(_running_walk_guidance(value))
         return await wait_action(value["action_id"], wait_seconds, value)
 
@@ -1069,9 +1184,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Prefer wait_seconds (1-50) to start and wait in one call, under common 60-second "
             "client timeouts. A timeout leaves the action running and returns timed_out=true "
             "and action_id; continue with wait_for_action. Omit wait_seconds to return the "
-            "start result immediately."
+            "start result immediately. Automatic walk wait plus wait_seconds"
+            " is capped at 50 seconds."
             " Running walks include remaining_distance (straight-line tiles, rounded to 2 decimals)"
-            " and a hint to call wait_for_action before placing or transferring."
+            " and a hint about the automatic walk wait before placing or transferring."
+            + WALK_WAIT_DESCRIPTION
         )
     )
     async def move_to(
@@ -1093,17 +1210,28 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "When computable, estimated_seconds in the start result and running detail is an "
             "estimate that can change if mining is interrupted or the target is depleted. "
             "Use it to pick wait_for_action timeout_seconds (maximum 50). "
+            "Prefer wait_seconds (1-50) to start and wait in one call, under common 60-second "
+            "client timeouts. A timeout leaves the action running and returns timed_out=true "
+            "and action_id; continue with wait_for_action. Omit wait_seconds to return the "
+            "start result immediately. Automatic walk wait plus wait_seconds is capped at "
+            "50 seconds. "
             "Crafting runs alongside mining. Only one walk/mine at a time. "
             "gained counts only the target's item products, compensating for pending final "
             "crafting products with those names. Non-resource targets succeed only after "
             "removal and gaining count items; resources can succeed while still present. "
             "Non-resource targets with no item products succeed on removal alone. "
             "While mining runs, place_entity, place_entities, place_line and transfer_item(s) "
-            "return action_conflict."
+            "return action_conflict." + WALK_WAIT_DESCRIPTION
         )
     )
-    async def mine_entity(target_ref: RequiredText, count: Count = 1) -> CallToolResult:
-        return await invoke("mine_entity", {"target_ref": target_ref, "count": count})
+    async def mine_entity(
+        target_ref: RequiredText,
+        count: Count = 1,
+        wait_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] | None = None,
+    ) -> CallToolResult:
+        return await start_action(
+            "mine_entity", {"target_ref": target_ref, "count": count}, wait_seconds
+        )
 
     @server.tool(
         description=(
@@ -1159,11 +1287,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Same-name belts of different direction stop with blocked/different_direction; "
             "pipes ignore direction for already_present. To turn a corner, start the next line "
             "on the tile that the previous line's last belt points at. Use place_entity for "
-            "single tiles and undergrounds. Walking/mining causes action_conflict for the "
+            "single tiles and undergrounds. Mining causes action_conflict for the "
             "whole call; crafting is allowed. Returns ok: true even if placed=0; complete "
             "reports whether the whole line finished. Summary includes requested, placed, "
             "already_present, direction, first_position, last_position (if any), next_position "
             "and stopped/detail/hint on stop, and merged collected_items when picked up."
+            + WALK_WAIT_DESCRIPTION
         )
     )
     async def place_line(
@@ -1238,10 +1367,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Place 1-10 entities in order in one tick without walking. "
             "Each entry follows place_entity rules: "
             + PLACE_DESCRIPTION
-            + " Walking or mining causes action_conflict for each entry; crafting is allowed. "
+            + " Mining causes action_conflict for each entry; crafting is allowed. "
             "Failures do not stop later entries. Returns results with 1-based index, ok, "
             "and result or error/detail/hint using the same error codes as place_entity, "
-            "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
+            "plus succeeded and failed counts. The batch retries only when every entry failed "
+            "with a conflict from the same walk. The batch itself is ok: true when it ran, "
             "even if all entries failed."
         )
     )
@@ -1291,7 +1421,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             + TARGET_REF_DESCRIPTION
             + " "
             "blocked_reason is character_in_the_way when the character blocks placement "
-            "(move the character away first), or placement_rules when no blocking entities, "
+            "(stand_positions suggests where to stand), or placement_rules when no blocking "
+            "entities, "
             "tiles, or character explain the failure. "
             "For placement_rules, nearby_positions lists up to 3 placeable centres and "
             "directions within 8 tiles of the requested position. "
@@ -1299,7 +1430,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " For mining drills, mining_area_resources lists mineable resources as {name, tiles} "
             "in the snapped mining area, sorted by name, including when placeable=true; "
             "successful placements return it too. For placement_rules, an empty list also "
-            "sets reason_detail to no_resources_in_mining_area."
+            "sets reason_detail to no_resources_in_mining_area." + STAND_DESCRIPTION
         )
     )
     async def check_placement(
@@ -1583,7 +1714,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and within reach. " + TARGET_REF_DESCRIPTION + " "
             "Failures do not stop later entries. Returns results with 1-based index, ok, "
             "and result or error/detail/hint using the same error codes as get_entity_inventory, "
-            "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
+            "plus succeeded and failed counts. The batch retries only when every entry failed "
+            "with a conflict from the same walk. The batch itself is ok: true when it ran, "
             "even if all entries failed."
             + INVENTORY_MACHINE_DESCRIPTION
             + MACHINE_STATUS_DESCRIPTION
@@ -1623,10 +1755,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             + " "
             + TARGET_REF_DESCRIPTION
             + " Targets must be owned and within reach. "
-            "Walking or mining causes action_conflict for each entry; crafting is allowed. "
+            "Mining causes action_conflict for each entry; crafting is allowed. "
             "Failures do not stop later entries. Returns results with 1-based index, ok, "
             "and result or error/detail/hint using the same error codes as transfer_item, "
-            "plus succeeded and failed counts. The batch itself is ok: true when it ran, "
+            "plus succeeded and failed counts. The batch retries only when every entry failed "
+            "with a conflict from the same walk. The batch itself is ok: true when it ran, "
             "even if all entries failed."
         )
     )
@@ -1654,7 +1787,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "A timeout returns the last running status "
             "and leaves the action running. Running mining reports detail.gained and detail.count; "
             "running walks include remaining_distance (straight-line tiles, rounded to 2 decimals) "
-            "and a hint to call wait_for_action before placing or transferring. "
+            "and a hint about the automatic walk wait before placing or transferring. "
+            "The next placement, transfer, mine or move waits up to 15 seconds for this walk "
+            "and reports waited_for_walk; use wait_for_action for longer walks. "
             "gained counts only the target's item products; non-resource targets must be "
             "removed before success. "
             "running crafting reports detail.count and detail.remaining. "

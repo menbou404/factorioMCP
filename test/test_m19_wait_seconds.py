@@ -14,6 +14,7 @@ def payload(result):
 
 CASES = (
     ("move_to", {"surface": "nauvis", "x": 2, "y": 3, "within": 1}, {"within": 1}),
+    ("mine_entity", {"target_ref": "ore", "count": 1}, {"count": 1}),
     ("craft", {"recipe": "iron-gear-wheel", "count": 1}, {"started": 1}),
 )
 
@@ -75,7 +76,7 @@ class WaitSecondsTests(unittest.IsolatedAsyncioTestCase):
                 }
                 final = {
                     "action_id": "action-1",
-                    "type": "move" if operation == "move_to" else "craft",
+                    "type": {"move_to": "move", "mine_entity": "mine", "craft": "craft"}[operation],
                     "status": "succeeded",
                     "detail": {"finished": True},
                     "position": {"x": 2, "y": 3},
@@ -250,8 +251,7 @@ class WaitSecondsTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(ToolError):
                         await server.call_tool(operation, {**arguments, "wait_seconds": seconds})
             bridge.call.assert_not_called()
-        self.assertNotIn("wait_seconds", tools["mine_entity"].input_schema["properties"])
-        for operation in ("move_to", "craft", "wait_for_action"):
+        for operation in ("move_to", "mine_entity", "craft", "wait_for_action"):
             for text in (
                 "wait_seconds",
                 "Prefer" if operation != "wait_for_action" else "prefer",
