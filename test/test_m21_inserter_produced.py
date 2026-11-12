@@ -122,26 +122,52 @@ class ProducedItemsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload(result)["current"], 2)
 
     async def test_stalls_on_production_even_when_inventory_changes(self):
-        result, elapsed, _ = await self.wait_with_clock(
-            lambda t: machine(
-                status="no_ingredients",
-                inventories={"result": [{"name": "transport-belt", "count": int(t) % 2}]},
-            )
-        )
-        value = payload(result)
-        self.assertFalse(result.is_error)
-        self.assertTrue(value["produced"])
-        self.assertTrue(value["stalled"])
-        self.assertFalse(value["reached"])
-        self.assertFalse(value["timed_out"])
-        self.assertEqual(value["current"], 0)
-        self.assertEqual(value["stalled_seconds"], 10)
-        self.assertEqual(elapsed, 10)
-        self.assertIn("materials", value["hint"])
+        for status, seconds, hint in (
+            ("no_ingredients", 10, "materials"),
+            ("full_output", 3, "output inserter"),
+        ):
+            with self.subTest(status=status):
+                result, elapsed, _ = await self.wait_with_clock(
+                    lambda t, status=status: machine(
+                        status=status,
+                        inventories={"result": [{"name": "transport-belt", "count": int(t) % 2}]},
+                    )
+                )
+                value = payload(result)
+                self.assertFalse(result.is_error)
+                self.assertTrue(value["produced"])
+                self.assertTrue(value["stalled"])
+                self.assertFalse(value["reached"])
+                self.assertFalse(value["timed_out"])
+                self.assertEqual(value["current"], 0)
+                self.assertEqual(value["stalled_seconds"], seconds)
+                self.assertEqual(elapsed, seconds)
+                self.assertIn(hint, value["hint"])
+
+    async def test_transient_full_output_allows_production_to_reach_target(self):
+        for inventory_at, count in (
+            (lambda t: machine(40 + int(t / 2), "full_output"), 3),
+            (
+                lambda t: machine(
+                    40 + (t >= 6), "full_output" if int(t / 2) % 2 == 0 else "working"
+                ),
+                1,
+            ),
+        ):
+            with self.subTest(inventory_at=inventory_at):
+                result, elapsed, _ = await self.wait_with_clock(inventory_at, count=count)
+                value = payload(result)
+                self.assertFalse(result.is_error)
+                self.assertTrue(value["reached"])
+                self.assertTrue(value["produced"])
+                self.assertFalse(value["stalled"])
+                self.assertFalse(value["timed_out"])
+                self.assertNotIn("output_full", value)
+                self.assertEqual(elapsed, 6)
 
     async def test_progress_and_working_status_reset_stall_timer(self):
         for inventory_at in (
-            lambda t: machine(40 + (t >= 8), "full_output"),
+            lambda t: machine(40 + (t >= 8), "no_ingredients"),
             lambda t: machine(40, "working" if 4 <= t < 8 else "no_power"),
         ):
             with self.subTest(inventory_at=inventory_at):
