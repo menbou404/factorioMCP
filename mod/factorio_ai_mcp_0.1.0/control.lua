@@ -631,6 +631,8 @@ local function request_path(state, character, goal, explicit_start)
     force = character.force,
     radius = action.within, -- double; nil preserves the API's default radius of 1.
     entity_to_ignore = character,
+    -- Cached paths can still cross structures built since the previous request.
+    pathfind_flags = {cache = false},
     can_open_gates = true
   }
   state.path_request_id = id
@@ -2369,13 +2371,26 @@ local function validate_line(character, params)
   end
   local item_proto = type(params.item) == "string" and prototypes.item[params.item] or nil
   local prototype = item_proto and item_proto.place_result
+  local direction = dx > 0 and 4 or (dx < 0 and 12 or (dy > 0 and 8 or 0))
+  local end_direction = params.end_direction
+  if end_direction ~= nil then
+    if type(end_direction) ~= "number" or
+       (end_direction ~= 0 and end_direction ~= 4 and end_direction ~= 8 and end_direction ~= 12) then
+      return nil, "invalid_input", {reason = "invalid_end_direction"}
+    end
+    if end_direction == (direction + 8) % 16 then
+      return nil, "invalid_input", {reason = "opposite_end_direction"}
+    end
+    if not prototype or prototype.type ~= "transport-belt" then
+      return nil, "invalid_input", {reason = "end_direction_requires_transport_belt"}
+    end
+  end
   if not prototype or (prototype.type ~= "transport-belt" and prototype.type ~= "pipe") then
     return nil, "invalid_target", {reason = "not_line_placeable"}
   end
-  local direction = dx > 0 and 4 or (dx < 0 and 12 or (dy > 0 and 8 or 0))
   local step_x, step_y = dx == 0 and 0 or dx / math.abs(dx), dy == 0 and 0 or dy / math.abs(dy)
   return {first = first, last = last, requested = requested, prototype = prototype,
-          direction = direction, step_x = step_x, step_y = step_y}
+          direction = direction, end_direction = end_direction, step_x = step_x, step_y = step_y}
 end
 
 local function do_check_line(state, params)
@@ -2385,9 +2400,11 @@ local function do_check_line(state, params)
   if not line then return nil, reason, detail end
   local prototype = line.prototype
   local result = {requested = line.requested, clear = 0, already_present = 0,
-                  direction = line.direction, first_position = line.first,
+                  direction = line.direction, end_direction = line.end_direction,
+                  first_position = line.first,
                   last_position = line.last, problems = {}, problem_total = 0}
   for index = 0, line.requested - 1 do
+    local direction = index == line.requested - 1 and line.end_direction or line.direction
     local position = {x = line.first.x + index * line.step_x,
                       y = line.first.y + index * line.step_y}
     local problem
@@ -2405,7 +2422,7 @@ local function do_check_line(state, params)
         end
       end
       if existing then
-        if prototype.type == "pipe" or existing.direction == line.direction then
+        if prototype.type == "pipe" or existing.direction == direction then
           result.already_present = result.already_present + 1
         else
           problem = {x = position.x, y = position.y, reason = "different_direction",
@@ -2414,13 +2431,13 @@ local function do_check_line(state, params)
       -- LuaSurface::can_place_entity checks terrain/entity collisions, without
       -- LuaControl::can_place_entity's character build restrictions (2.0.77).
       elseif character.surface.can_place_entity{
-        name = prototype.name, position = position, direction = line.direction,
+        name = prototype.name, position = position, direction = direction,
         force = character.force, build_check_type = defines.build_check_type.manual
       } then
         result.clear = result.clear + 1
       else
         local blocked = placement_blocking(state, character, prototype, position,
-                                            line.direction, true)
+                                            direction, true)
         problem = {x = position.x, y = position.y, reason = "blocked",
                    blocking = blocked.blocking, tiles = blocked.tiles}
       end
@@ -2443,6 +2460,7 @@ local function do_place_line(state, params)
   local first, requested, prototype = line.first, line.requested, line.prototype
   local direction, step_x, step_y = line.direction, line.step_x, line.step_y
   local result = {item = params.item, name = prototype.name, direction = direction,
+                  end_direction = line.end_direction,
                   requested = requested, placed = 0, already_present = 0,
                   complete = false, first_position = first}
   local collected = {}
@@ -2454,6 +2472,7 @@ local function do_place_line(state, params)
     end
   end
   for index = 0, requested - 1 do
+    local tile_direction = index == requested - 1 and line.end_direction or direction
     local position = {x = first.x + index * step_x, y = first.y + index * step_y}
     local existing
     for _, entity in ipairs(character.surface.find_entities_filtered{
@@ -2465,7 +2484,7 @@ local function do_place_line(state, params)
       end
     end
     if existing then
-      if prototype.type == "pipe" or existing.direction == direction then
+      if prototype.type == "pipe" or existing.direction == tile_direction then
         result.already_present = result.already_present + 1
       else
         result.stopped = "blocked"
@@ -2475,7 +2494,7 @@ local function do_place_line(state, params)
       -- Keep earlier progress even if a placement handler raises, as do_batch does.
       local ok, placed, reason, detail = pcall(do_place, state, {
         item = params.item, surface = params.surface, x = position.x, y = position.y,
-        direction = direction
+        direction = tile_direction
       }, true)
       if not ok then
         log("AI MCP line handler error: " .. tostring(placed))
