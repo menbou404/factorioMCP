@@ -188,6 +188,78 @@ local function placement_visible(state, character, position)
   return false
 end
 
+local function is_belt(entity)
+  return entity.type == "transport-belt" or entity.type == "underground-belt" or
+         entity.type == "splitter"
+end
+
+local function belt_contents(entity, include_lanes)
+  if not is_belt(entity) then return nil, nil end
+  -- 2.0.77 defines.transport_line names the side relative to travel. Merge
+  -- underground segments and both splitter channels (including split segments)
+  -- into that side. Some constants alias indices on different belt types.
+  local lines = defines.transport_line
+  local sides = {[lines.left_line] = "left", [lines.right_line] = "right",
+                 [lines.left_underground_line] = "left", [lines.right_underground_line] = "right",
+                 [lines.secondary_left_line] = "left", [lines.secondary_right_line] = "right",
+                 [lines.left_split_line] = "left", [lines.right_split_line] = "right",
+                 [lines.secondary_left_split_line] = "left",
+                 [lines.secondary_right_split_line] = "right"}
+  local merged, lanes = {}, include_lanes and {left = {}, right = {}} or nil
+  local function add(counts, item)
+    counts[item.name] = counts[item.name] or {}
+    counts[item.name][item.quality] = (counts[item.name][item.quality] or 0) + item.count
+  end
+  local function items(counts)
+    local output = {}
+    for _, name in ipairs(sorted_keys(counts)) do
+      for _, quality in ipairs(sorted_keys(counts[name])) do
+        output[#output + 1] = {name = name, quality = quality, count = counts[name][quality]}
+      end
+    end
+    return output
+  end
+  for index = 1, entity.get_max_transport_line_index() do
+    local line = entity.get_transport_line(index)
+    if line and line.valid then
+      for _, item in pairs(line.get_contents()) do
+        add(merged, item)
+        if lanes and sides[index] then add(lanes[sides[index]], item) end
+      end
+    end
+  end
+  if lanes then lanes.left, lanes.right = items(lanes.left), items(lanes.right) end
+  return items(merged), lanes
+end
+
+local function inserter_drop_lane(entity)
+  if entity.type ~= "inserter" then return nil end
+  local drop = entity.drop_position
+  local belt = entity.drop_target
+  if not belt or not belt.valid or not is_belt(belt) then
+    -- Newly placed, unfuelled or sleeping inserters may have no drop_target.
+    -- Resolve the belt at the drop point afresh, including belts placed later.
+    belt = nil
+    for _, candidate in pairs(entity.surface.find_entities_filtered{
+      position = drop, type = {"transport-belt", "underground-belt", "splitter"}
+    }) do
+      if candidate.valid and is_belt(candidate) then belt = candidate; break end
+    end
+  end
+  if not belt then return nil end
+  local vectors = {[0] = {x = 0, y = -1}, [4] = {x = 1, y = 0},
+                   [8] = {x = 0, y = 1}, [12] = {x = -1, y = 0}}
+  local travel = vectors[belt.direction]
+  if not travel then return nil end
+  local dx, dy = drop.x - belt.position.x, drop.y - belt.position.y
+  local side = -travel.y * dx + travel.x * dy
+  -- Positive is right looking along belt travel (world y increases south).
+  -- Use the actual drop point, which is offset towards the far lane.
+  -- Omit the collinear case rather than guessing for head-on belt insertion.
+  if math.abs(side) < 0.001 then return nil end
+  return side > 0 and "right" or "left"
+end
+
 local function valid_character(state)
   return state.character and state.character.valid and state.character.health > 0
 end
@@ -1402,26 +1474,8 @@ local function do_observe(state, params)
         observed.neighbour = {x = neighbour.position.x, y = neighbour.position.y}
       end
     end
-    if entity.type == "transport-belt" or entity.type == "underground-belt" or
-       entity.type == "splitter" then
-      local merged = {}
-      local items = {}
-      for line = 1, entity.get_max_transport_line_index() do
-        for _, item in pairs(entity.get_transport_line(line).get_contents()) do
-          merged[item.name] = merged[item.name] or {}
-          local entry = merged[item.name][item.quality]
-          if not entry then
-            entry = {name = item.name, quality = item.quality, count = 0}
-            merged[item.name][item.quality] = entry
-            items[#items + 1] = entry
-          end
-          entry.count = entry.count + item.count
-        end
-      end
-      table.sort(items, function(a, b)
-        if a.name ~= b.name then return a.name < b.name end
-        return a.quality < b.quality
-      end)
+    if is_belt(entity) then
+      local items = belt_contents(entity, false)
       if #items > 0 then observed.belt_items = items end
     end
     if filters.compact then
@@ -1903,6 +1957,13 @@ local function placement_mining_area_resources(character, prototype, position, d
   return resources
 end
 
+local function placement_stand_clear(state, character, candidate)
+  return placement_visible(state, character, candidate) and
+    character.surface.can_place_entity{
+      name = character.name, position = candidate, force = character.force
+    }
+end
+
 local function placement_stand_positions(state, character, area, position)
   local box = character.prototype.collision_box
   if not box then return {} end
@@ -1920,14 +1981,11 @@ local function placement_stand_positions(state, character, area, position)
   if reach < 0 then return {} end
   local positions = {}
   local function consider(candidate)
-    if distance_squared(candidate, position) > reach ^ 2 or
-       not placement_visible(state, character, candidate) then return end
+    if distance_squared(candidate, position) > reach ^ 2 then return end
     -- 2.0.77 LuaSurface.can_place_entity checks terrain/entity collisions at
     -- the supplied MapPosition for an EntityID, including character prototypes.
     -- Do not search nearby: a shifted result can lose the arrival clearance.
-    if not character.surface.can_place_entity{
-      name = character.name, position = candidate, force = character.force
-    } then return end
+    if not placement_stand_clear(state, character, candidate) then return end
     for _, other in ipairs(positions) do
       if distance_squared(candidate, other) < 0.04 then return end
     end
@@ -1949,6 +2007,67 @@ local function placement_stand_positions(state, character, area, position)
   end)
   while #positions > 3 do table.remove(positions) end
   return positions
+end
+
+local function line_stand_position(state, character, line, next_index)
+  local box = character.prototype.collision_box
+  if not box then return nil end
+  local arrival = math.max(MOVE_ARRIVAL_RADIUS, MOVE_BLOCKED_ARRIVAL_RADIUS)
+  local clearance = arrival + 0.15
+  local reach = character.build_distance - arrival
+  if reach < 0 then return nil end
+  -- Exclude the entire line's tile footprint, including already placed belts.
+  -- Preserve M32's clearance for the whole move_to arrival disk.
+  local left = math.min(line.first.x, line.last.x) - 0.5 - box.right_bottom.x - clearance
+  local right = math.max(line.first.x, line.last.x) + 0.5 - box.left_top.x + clearance
+  local top = math.min(line.first.y, line.last.y) - 0.5 - box.right_bottom.y - clearance
+  local bottom = math.max(line.first.y, line.last.y) + 0.5 - box.left_top.y + clearance
+  local next_position = {x = line.first.x + next_index * line.step_x,
+                         y = line.first.y + next_index * line.step_y}
+  local best, best_count, best_distance = nil, 0, math.huge
+  local function consider(candidate)
+    -- A continuation must reach its first tile as well as maximizing coverage.
+    if distance_squared(candidate, next_position) > reach ^ 2 or
+       not placement_stand_clear(state, character, candidate) then return end
+    -- Belts do not collide with characters. Explicitly reject entity footprints
+    -- as well, so the suggestion cannot stand on a belt and be carried away.
+    for _, entity in pairs(character.surface.find_entities_filtered{
+      area = {{candidate.x + box.left_top.x, candidate.y + box.left_top.y},
+              {candidate.x + box.right_bottom.x, candidate.y + box.right_bottom.y}}
+    }) do
+      if entity.valid and entity ~= character then return end
+    end
+    local count = 0
+    for index = next_index, line.requested - 1 do
+      local position = {x = line.first.x + index * line.step_x,
+                        y = line.first.y + index * line.step_y}
+      if distance_squared(candidate, position) <= reach ^ 2 then count = count + 1 end
+    end
+    local distance = distance_squared(candidate, character.position)
+    if count > best_count or (count == best_count and distance < best_distance) then
+      best, best_count, best_distance = candidate, count, distance
+    end
+  end
+  -- At most 2*64+2 candidates and 64 distance checks per candidate. No path
+  -- searches or entity queries outside the normal placement visibility check.
+  for index = next_index, line.requested - 1 do
+    local x, y = line.first.x + index * line.step_x, line.first.y + index * line.step_y
+    if line.step_x ~= 0 then
+      consider({x = x, y = top})
+      consider({x = x, y = bottom})
+    else
+      consider({x = left, y = y})
+      consider({x = right, y = y})
+    end
+  end
+  if line.step_x ~= 0 then
+    consider({x = left, y = line.first.y})
+    consider({x = right, y = line.first.y})
+  else
+    consider({x = line.first.x, y = top})
+    consider({x = line.first.x, y = bottom})
+  end
+  return best -- nil deliberately omits stand_position when no candidate fits.
 end
 
 local function placement_blocking(state, character, prototype, position, direction, observed_only)
@@ -2334,6 +2453,7 @@ local function do_place(state, params, line_placement)
           target_ref = register_target(state, created),
           direction = created.direction, consumed_item = params.item,
           pickup_position = created.type == "inserter" and created.pickup_position or nil,
+          drop_lane = inserter_drop_lane(created),
           drop_position = (created.type == "inserter" or created.type == "mining-drill") and
                           created.drop_position or nil,
           fluid_connections = placed_fluid_connections(created), collected_items = collected_items,
@@ -2510,6 +2630,9 @@ local function do_place_line(state, params)
     end
     if result.stopped then
       result.next_position = position
+      if result.stopped == "out_of_range" then
+        result.stand_position = line_stand_position(state, character, line, index)
+      end
       break
     end
     result.last_position = position
@@ -2791,7 +2914,7 @@ local function get_entity_inventory(character, params, allow_status_only)
   -- the existing unsupported_entity error, including its supported-entity list.
   if not roles and allow_status_only and
      (target.type == "inserter" or target.type == "mining-drill" or
-      target.type == "electric-pole") then roles = {} end
+      target.type == "electric-pole" or is_belt(target)) then roles = {} end
   if not roles then
     return nil, nil, "invalid_target", {entity = target.name, reason = "unsupported_entity",
                                        supported_entities = sorted_keys(INVENTORY_ROLES)}
@@ -2865,6 +2988,7 @@ local function do_entity_inventory(state, params)
     if inventory and inventory.valid then inventories[role] = inventory.get_contents() end
   end
   local status, recipe = inventory_entity_state(target)
+  local belt_items, belt_lanes = belt_contents(target, true)
   local products_finished, products_since_recipe, recipe_products, recipe_product_amounts
   if target.type == "assembling-machine" or target.type == "furnace" then
     products_finished = target.products_finished
@@ -2909,6 +3033,7 @@ local function do_entity_inventory(state, params)
           recipe_product_amounts = recipe_product_amounts,
           direction = target.direction,
           pickup_position = pickup_position, drop_position = drop_position,
+          drop_lane = inserter_drop_lane(target), belt_items = belt_items, belt_lanes = belt_lanes,
           held_stack = held_stack, mining_target = mining_target,
           filters = filters, filter_mode = filter_mode,
           inventory_limit = inventory_limit(target),

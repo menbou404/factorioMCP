@@ -5155,6 +5155,330 @@ def main():
             and bridge.call("get_agent_status")["result"]["position"] == m34_position,
         )
 
+    # M35 CF/CG/CH: lane contents, real inserter drops, line continuation and
+    # three-second full-output waits. All spawned items/entities stay on this surface.
+    m35_surface = "m35-lanes-line-reach-fixture"
+    m35_server = create_server(bridge)
+    m35_inventory = bridge.call("get_inventory")["result"]["items"]
+    m35_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m35_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m35_surface}";local s=game.surfaces[name];'
+            "local b=storage.m35_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m35:" not in raw:
+            raise RuntimeError("M35 fixture failed: " + raw)
+        return json.loads(raw.split("m35:", 1)[1].strip())
+
+    async def m35_tool(name, arguments):
+        response = await m35_server.call_tool(name, arguments)
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    def m35_read(target_ref):
+        return asyncio.run(m35_tool("get_entity_inventory", {"target_ref": target_ref}))
+
+    def m35_ref(name, x, y):
+        observed = bridge.call("observe_nearby", {"names": [name]})["result"]["entities"]
+        return next(
+            e["target_ref"] for e in observed if abs(e["x"] - x) < 0.01 and abs(e["y"] - y) < 0.01
+        )
+
+    try:
+        m35_fixture(
+            "assert(not s and not b,'M35 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv),selected=c.selected,"
+            "last_observation=state.last_observation,recent_observations=state.recent_observations};"
+            "storage.m35_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=160,height=64});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},3);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-80,79 do for y=-32,31 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,0.5},s));"
+            "state.last_observation=nil;state.recent_observations={};"
+            "assert(inv.insert{name='transport-belt',count=64}==64);"
+            "assert(inv.insert{name='burner-inserter',count=4}==4);"
+            'b.north=s.create_entity{name="transport-belt",position={-3.5,-2.5},'
+            "direction=0,force=c.force};assert(b.north);"
+            'b.east=s.create_entity{name="transport-belt",position={3.5,-2.5},'
+            "direction=4,force=c.force};assert(b.east);"
+            'b.underground=s.create_entity{name="underground-belt",position={0.5,-4.5},'
+            "direction=4,type='input',force=c.force};assert(b.underground);"
+            "for _,e in ipairs({b.north,b.east}) do "
+            "assert(e.get_transport_line(defines.transport_line.left_line).insert_at_back"
+            "{name='coal',count=1});"
+            "assert(e.get_transport_line(defines.transport_line.right_line).insert_at_back"
+            "{name='iron-ore',count=1}) end;"
+            # Check the lane constants against world coordinates as well.
+            "local n=b.north.get_line_item_position(defines.transport_line.left_line,0.5);"
+            "local e=b.east.get_line_item_position(defines.transport_line.left_line,0.5);"
+            "assert(n.x<b.north.position.x and e.y<b.east.position.y);"
+            "rcon.print('m35:{}')"
+        )
+        belt_refs = [m35_ref("transport-belt", x, -2.5) for x in (-3.5, 3.5)]
+        underground_ref = m35_ref("underground-belt", 0.5, -4.5)
+        batch = asyncio.run(
+            m35_tool("get_entity_inventories", {"target_refs": [*belt_refs, underground_ref]})
+        )
+        expected_lanes = {
+            "left": [{"name": "coal", "quality": "normal", "count": 1}],
+            "right": [{"name": "iron-ore", "quality": "normal", "count": 1}],
+        }
+        for label, ref, entry in zip(("north", "east"), belt_refs, batch["results"], strict=False):
+            single = m35_read(ref)
+            record(
+                f"M35 CF {label}-facing belt reports left/right lane contents",
+                entry["ok"]
+                and entry["result"]["belt_lanes"] == single["belt_lanes"] == expected_lanes
+                and single["belt_items"] == expected_lanes["left"] + expected_lanes["right"],
+                json.dumps(single),
+            )
+        underground = batch["results"][2]
+        record(
+            "M35 CF empty underground lanes are lists",
+            underground["ok"] and underground["result"]["belt_lanes"] == {"left": [], "right": []},
+        )
+        observed = bridge.call("observe_nearby", {"names": ["transport-belt"]})["result"]
+        record(
+            "M35 CF observe_nearby keeps only merged belt_items",
+            all("belt_lanes" not in e and "drop_lane" not in e for e in observed["entities"]),
+        )
+
+        m35_fixture(
+            "assert(c.teleport({3.5,5.5},s));"
+            'b.drop_belt=s.create_entity{name="transport-belt",position={0.5,5.5},'
+            "direction=4,force=c.force};assert(b.drop_belt);rcon.print('m35:{}')"
+        )
+        placement = {"item": "burner-inserter", "surface": m35_surface, "x": 0.5}
+        north = asyncio.run(m35_tool("place_entity", {**placement, "y": 4.5, "direction": 0}))
+        south_batch = asyncio.run(
+            m35_tool("place_entities", {"items": [{**placement, "y": 6.5, "direction": 8}]})
+        )
+        assert south_batch["results"][0]["ok"], south_batch
+        south = south_batch["results"][0]["result"]
+        record(
+            "M35 CF opposite-side inserters report opposite far lanes",
+            north.get("drop_lane") == "right"
+            and south.get("drop_lane") == "left"
+            and m35_read(north["target_ref"]).get("drop_lane") == north.get("drop_lane")
+            and m35_read(south["target_ref"]).get("drop_lane") == south.get("drop_lane"),
+            json.dumps({"north": north, "south": south}),
+        )
+        # Reverse the build order too: neither unfuelled inserter has a belt yet.
+        later_placement = {**placement, "x": 4.5}
+        later_north = asyncio.run(
+            m35_tool("place_entity", {**later_placement, "y": 4.5, "direction": 0})
+        )
+        later_south_batch = asyncio.run(
+            m35_tool("place_entities", {"items": [{**later_placement, "y": 6.5, "direction": 8}]})
+        )
+        assert later_south_batch["results"][0]["ok"], later_south_batch
+        later_south = later_south_batch["results"][0]["result"]
+        before_belt = [m35_read(e["target_ref"]) for e in (later_north, later_south)]
+        asyncio.run(
+            m35_tool(
+                "place_entity",
+                {
+                    "item": "transport-belt",
+                    "surface": m35_surface,
+                    "x": 4.5,
+                    "y": 5.5,
+                    "direction": 4,
+                },
+            )
+        )
+        after_belt = [m35_read(e["target_ref"]) for e in (later_north, later_south)]
+        after_belt_batch = asyncio.run(
+            m35_tool(
+                "get_entity_inventories",
+                {"target_refs": [later_north["target_ref"], later_south["target_ref"]]},
+            )
+        )
+        record(
+            "M35 CF belt placed after unfuelled inserters updates inventory drop lanes",
+            all("drop_lane" not in e for e in (later_north, later_south, *before_belt))
+            and [e.get("drop_lane") for e in after_belt] == ["right", "left"]
+            and all(e["ok"] for e in after_belt_batch["results"])
+            and [e["result"].get("drop_lane") for e in after_belt_batch["results"]]
+            == ["right", "left"],
+            json.dumps({"before": before_belt, "after": after_belt, "batch": after_belt_batch}),
+        )
+        m35_fixture(
+            "b.inserters={s.find_entity('burner-inserter',{0.5,4.5}),"
+            "s.find_entity('burner-inserter',{0.5,6.5})};"
+            "for i,e in ipairs(b.inserters) do assert(e);"
+            "local chest=s.create_entity{name='wooden-chest',position=e.pickup_position,"
+            "force=c.force};assert(chest);assert(chest.insert"
+            "{name=i==1 and 'iron-plate' or 'copper-plate',count=1}==1);"
+            "assert(e.get_fuel_inventory().insert{name='coal',count=1}==1) end;"
+            "rcon.print('m35:{}')"
+        )
+        drop_ref = m35_ref("transport-belt", 0.5, 5.5)
+        deadline = time.monotonic() + 8
+        while True:
+            dropped = m35_read(drop_ref)
+            landed = all(
+                any(stack["name"] == item for stack in dropped["belt_lanes"].get(lane, []))
+                for lane, item in (
+                    (north.get("drop_lane"), "iron-plate"),
+                    (south.get("drop_lane"), "copper-plate"),
+                )
+            )
+            if landed or time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+        record(
+            "M35 CF real burner inserter items land on the reported lanes",
+            landed,
+            json.dumps(dropped),
+        )
+
+        # Teleport only to position this independent fixture; continuation uses walking.
+        m35_fixture("assert(c.teleport({-15.5,12.5},s));rcon.print('m35:{}')")
+        line_args = {
+            "item": "transport-belt",
+            "surface": m35_surface,
+            "from_x": -14.5,
+            "from_y": 10.5,
+            "to_x": 10.5,
+            "to_y": 10.5,
+            "end_direction": 0,
+        }
+        first = asyncio.run(m35_tool("place_line", line_args))
+        record(
+            "M35 CG long line stops out_of_range with a standing position",
+            first.get("stopped") == "out_of_range" and bool(first.get("stand_position")),
+            json.dumps(first),
+        )
+        assert first.get("stand_position"), first
+        stand = first["stand_position"]
+        safe = m35_fixture(
+            f"local p={{x={stand['x']},y={stand['y']}}};"
+            "rcon.print('m35:'..helpers.table_to_json({fits=s.can_place_entity"
+            "{name=c.name,position=p,force=c.force}}))"
+        )
+        record(
+            "M35 CG suggested position fits the character off the line",
+            safe["fits"] and abs(stand["y"] - 10.5) > 1.5,
+        )
+        walked = action("move_to", {"surface": m35_surface, **stand})
+        second = asyncio.run(
+            m35_tool(
+                "place_line",
+                {
+                    **line_args,
+                    "from_x": first["next_position"]["x"],
+                    "from_y": first["next_position"]["y"],
+                },
+            )
+        )
+        record(
+            "M35 CG walk to stand_position allows the continuation to complete or place more",
+            walked["status"] == "succeeded"
+            and (second["complete"] or second["placed"] > first["placed"]),
+            json.dumps(second),
+        )
+
+        m35_fixture(
+            "assert(c.teleport({20.5,4.5},s));"
+            "b.machine=s.create_entity{name='assembling-machine-1',position={20.5,0.5},"
+            "force=c.force};assert(b.machine);b.machine.set_recipe('iron-gear-wheel');"
+            "local generator=s.create_entity{name='electric-energy-interface',"
+            "position={24.5,2.5},force=c.force};assert(generator);"
+            "generator.power_production=1000000/60;generator.power_usage=0;"
+            "generator.electric_buffer_size=1000000;generator.energy=1000000;"
+            "assert(s.create_entity{name='small-electric-pole',position={22.5,2.5},force=c.force});"
+            "assert(b.machine.get_output_inventory().insert{name='iron-gear-wheel',count=100}==100);"
+            "assert(b.machine.get_inventory(defines.inventory.assembling_machine_input).insert"
+            "{name='iron-plate',count=20}==20);rcon.print('m35:{}')"
+        )
+        machine_ref = m35_ref("assembling-machine-1", 20.5, 0.5)
+        deadline = time.monotonic() + 5
+        while True:
+            full = m35_read(machine_ref)
+            if full.get("status") == "full_output" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        assert full.get("status") == "full_output", full
+        current = sum(stack["count"] for stack in full["inventories"]["result"])
+        started = time.monotonic()
+        waited = asyncio.run(
+            m35_tool(
+                "wait_for_items",
+                {
+                    "target_ref": machine_ref,
+                    "item": "iron-gear-wheel",
+                    "count": current + 1,
+                    "inventory_role": "result",
+                    "timeout_seconds": 20,
+                },
+            )
+        )
+        elapsed = time.monotonic() - started
+        record(
+            "M35 CH full_output returns after 3 seconds with output_full and guidance",
+            3 <= elapsed < 6
+            and 3 <= waited["waited_seconds"] < 5
+            and 3 <= waited["stalled_seconds"] < 5
+            and waited.get("output_full") is True
+            and waited["stalled"]
+            and not waited["reached"]
+            and not waited["timed_out"]
+            and waited["current"] == current
+            and waited["status"] == "full_output"
+            and waited.get("feeders") == []
+            and all(
+                t in waited["hint"] for t in ("current count", "only after", "output inserter")
+            ),
+            json.dumps({"elapsed": elapsed, "result": waited}),
+        )
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = m35_fixture(
+                f"rcon.print('m35:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m35_fixture(
+            "if b then assert(c.crafting_queue_size==0);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();state.last_observation=b.last_observation;"
+            "state.recent_observations=b.recent_observations;"
+            "for ref,entry in pairs(state.targets) do if entry.entity and entry.entity.valid "
+            "and entry.entity.surface==s then if entry.unit_number then "
+            "state.owned_refs[entry.unit_number]=nil end;state.targets[ref]=nil end end;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil;"
+            "storage.m35_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m35:'..helpers.table_to_json({restored=true}))"
+        )
+        observed_map_cells.pop(m35_surface, None)
+        record(
+            "M35 removes fixtures and restores inventory, queue, position and observation",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m35_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m35_position,
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))
