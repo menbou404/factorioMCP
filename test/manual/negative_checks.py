@@ -6149,7 +6149,11 @@ def main():
             and "ground" in empty.get("hint", "")
             and "placed next" in empty.get("hint", "")
             and read.get("pickup_target") == insertion.get("pickup_target")
-            and read.get("drop_target") == insertion.get("drop_target")
+            and all(
+                read.get("drop_target", {}).get(key) == value
+                for key, value in insertion["drop_target"].items()
+            )
+            and isinstance(read.get("drop_target", {}).get("status"), str)
             and empty_read.get("no_drop_target") is True
             and "drop_target" not in empty_read,
             json.dumps({"empty": empty, "read": read, "empty_read": empty_read}),
@@ -6336,6 +6340,297 @@ def main():
             restored.get("restored") is True
             and bridge.call("get_inventory")["result"]["items"] == m38_inventory
             and bridge.call("get_agent_status")["result"]["position"] == m38_position,
+        )
+
+    # M39 CQ/CR/CS: only this RCON fixture supplies items or teleports characters.
+    m39_surface = "m39-line-approach-belt-wait-fixture"
+    m39_server = create_server(bridge)
+    m39_inventory = bridge.call("get_inventory")["result"]["items"]
+    m39_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m39_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m39_surface}";local s=game.surfaces[name];'
+            "local b=storage.m39_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m39:" not in raw:
+            raise RuntimeError("M39 fixture failed: " + raw)
+        return json.loads(raw.split("m39:", 1)[1].strip())
+
+    async def m39_tool(name, args):
+        response = await m39_server.call_tool(name, args)
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    def m39_line(args):
+        value = asyncio.run(m39_tool("place_line", {**args, "walk": True, "wait_seconds": 20}))
+        if value.get("status") == "running":
+            value = asyncio.run(
+                m39_tool(
+                    "wait_for_action", {"action_id": value["action_id"], "timeout_seconds": 50}
+                )
+            )
+        assert value.get("status") != "running", value
+        return value
+
+    def m39_refs(names):
+        entities = bridge.call("observe_nearby", {"names": names})["result"]["entities"]
+        return {(e["name"], e["x"], e["y"]): e["target_ref"] for e in entities}
+
+    def m39_read_until(target_ref, predicate):
+        deadline = time.monotonic() + 15
+        while True:
+            value = asyncio.run(m39_tool("get_entity_inventory", {"target_ref": target_ref}))
+            if predicate(value) or time.monotonic() >= deadline:
+                return value
+            time.sleep(0.1)
+
+    try:
+        m39_fixture(
+            "assert(not s and not b,'M39 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,selected=c.selected,"
+            "electronic_circuit_enabled=c.force.recipes['electronic-circuit'].enabled,"
+            "inventory=game.create_inventory(#inv),saved={},fields={'targets','owned_refs',"
+            "'recipe_baselines','last_observation','recent_observations','explored_map',"
+            "'last_action','completed_actions','completed_order','processed','processed_order',"
+            "'next_target_id','next_action_id','path_request_id','last_heartbeat_tick'}};storage.m39_backup=b;"
+            "for _,key in ipairs(b.fields) do b.saved[key]=state[key] end;"
+            "for _,key in ipairs({'targets','owned_refs','recipe_baselines','recent_observations',"
+            "'explored_map','completed_actions','completed_order','processed','processed_order'}) "
+            "do state[key]={} end;state.last_observation=nil;state.last_action=nil;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=192,height=96});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},3);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-96,95 do for y=-48,47 do "
+            "tiles[#tiles+1]={name='grass-1',position={x,y}} end end;s.set_tiles(tiles);"
+            "assert(inv.insert{name='transport-belt',count=30}==30);"
+            "assert(c.teleport({-20.5,-16.5},s));rcon.print('m39:{}')"
+        )
+        distant_line = {
+            "item": "transport-belt",
+            "surface": m39_surface,
+            "from_x": 10.5,
+            "from_y": -20.5,
+            "to_x": 22.5,
+            "to_y": -20.5,
+        }
+        no_walk = asyncio.run(m39_tool("place_line", distant_line))
+        record(
+            "M39 CQ distant walk=false preserves the synchronous out_of_range result",
+            no_walk.get("placed") == 0 and no_walk.get("stopped") == "out_of_range",
+            json.dumps(no_walk),
+        )
+        line = m39_line(distant_line)
+        measured = m39_fixture(
+            "local n=0;for x=10,22 do local e=s.find_entity('transport-belt',{x+0.5,-20.5});"
+            "if e and e.valid then n=n+1 end end;"
+            "rcon.print('m39:'..helpers.table_to_json({belts=n,remaining="
+            "inv.get_item_count('transport-belt'),idle=state.action==nil}))"
+        )
+        record(
+            "M39 CQ start thirty tiles away approaches and places the entire line",
+            line.get("status") == "succeeded"
+            and line.get("complete") is True
+            and line.get("placed") == 13
+            and measured == {"belts": 13, "remaining": 17, "idle": True},
+            json.dumps({"line": line, "measured": measured}),
+        )
+        # All geometrically eligible stand candidates are occupied, but the line
+        # itself is empty. A distant approach can reach build range outside the wall.
+        m39_fixture(
+            "for x=-3,8 do for y=5,12 do if not(y==8 and x>=0 and x<=4) then "
+            "assert(s.create_entity{name='stone-wall',position={x+0.5,y+0.5},force=c.force}) "
+            "end end end;rcon.print('m39:{}')"
+        )
+        enclosed_line = {
+            "item": "transport-belt",
+            "surface": m39_surface,
+            "from_x": 0.5,
+            "from_y": 8.5,
+            "to_x": 4.5,
+            "to_y": 8.5,
+        }
+        # Vanilla 2.0.77 build reach is 10; the near case must still be outside it.
+        for start_x, label in ((-13.5, "near"), (-29.5, "distant")):
+            m39_fixture(
+                f"assert(c.teleport({{{start_x},8.5}},s));"
+                "state.last_observation=nil;state.recent_observations={};rcon.print('m39:{}')"
+            )
+            enclosed = m39_line(enclosed_line)
+            measured = m39_fixture(
+                "rcon.print('m39:'..helpers.table_to_json({idle=state.action==nil,"
+                "remaining=inv.get_item_count('transport-belt'),x=c.position.x,y=c.position.y}))"
+            )
+            record(
+                f"M39 CQ {label} enclosed start stops without looping or consuming items",
+                enclosed.get("status") == "succeeded"
+                and enclosed.get("complete") is False
+                and enclosed.get("placed") == 0
+                and enclosed.get("detail", {}).get("reason") == "stand_position_not_found"
+                and measured.get("idle") is True
+                and measured.get("remaining") == 17
+                and (label != "near" or (measured["x"], measured["y"]) == (start_x, 8.5)),
+                json.dumps({"line": enclosed, "measured": measured}),
+            )
+        m39_fixture(
+            "assert(c.teleport({-60.5,-20.5},s));state.recent_observations={};"
+            "state.last_observation=nil;rcon.print('m39:{}')"
+        )
+        too_far = m39_line({**distant_line, "from_x": 80.5, "to_x": 81.5})
+        record(
+            "M39 CQ approach retains the shared 128 tile limit",
+            too_far.get("status") == "failed"
+            and too_far.get("error") == "out_of_range"
+            and too_far.get("placed") == 0,
+            json.dumps(too_far),
+        )
+        # CR: seed real transport lines; no downstream belt can remove the items.
+        for kind, x in (("transport-belt", -4.5), ("underground-belt", 0.5), ("splitter", 4.5)):
+            seeded = m39_fixture(
+                f"assert(c.teleport({{{x},3.5}},s));"
+                f"local e=s.create_entity{{name='{kind}',position={{{x},0.5}},"
+                "direction=4,force=c.force};assert(e);e.active=false;"
+                "for i=1,2 do assert(e.get_transport_line(i).insert_at_back"
+                "{name='coal',count=1}) end;"
+                "local n=0;for i=1,e.get_max_transport_line_index() do "
+                "local l=e.get_transport_line(i);if l and l.valid then "
+                "n=n+l.get_item_count('coal') end end;"
+                "rcon.print('m39:'..helpers.table_to_json({count=n,x=e.position.x,y=e.position.y}))"
+            )
+            target_ref = m39_refs([kind])[(kind, seeded["x"], seeded["y"])]
+            args = {"target_ref": target_ref, "item": "coal", "count": 2, "timeout_seconds": 1}
+            waited = asyncio.run(m39_tool("wait_for_items", args))
+            record(
+                f"M39 CR {kind} wait counts items on transport lines and reaches the count",
+                seeded["count"] >= 2
+                and waited.get("belt") is True
+                and waited.get("current") == seeded["count"]
+                and waited.get("reached") is True,
+                json.dumps(waited),
+            )
+            for extra in ({"produced": True}, {"inventory_role": "main"}):
+                response = asyncio.run(m39_server.call_tool("wait_for_items", {**args, **extra}))
+                value = json.loads(response.content[0].text)
+                record(
+                    f"M39 CR {kind} rejects {next(iter(extra))}",
+                    response.is_error and value.get("error") == "invalid_input",
+                    json.dumps(value),
+                )
+        # CS: power both machines. A held plate cannot enter an assembler with no
+        # recipe, or one already holding enough plates while copper cable is missing.
+        # Keep the source and both consumers within the pole's supply area.
+        m39_fixture(
+            "assert(c.teleport({3.5,18.5},s));"
+            "b.machine=s.create_entity{name='assembling-machine-1',position={0.5,16.5},"
+            "force=c.force};assert(b.machine);"
+            "b.inserter=s.create_entity{name='inserter',position={0.5,14.5},"
+            "direction=0,force=c.force};assert(b.inserter);"
+            "assert(b.inserter.held_stack.set_stack{name='iron-plate',count=1});"
+            "local generator=s.create_entity{name='electric-energy-interface',"
+            "position={4.5,14.5},force=c.force};assert(generator);"
+            "generator.power_production=1000000/60;generator.power_usage=0;"
+            "generator.electric_buffer_size=1000000;generator.energy=1000000;"
+            "assert(s.create_entity{name='small-electric-pole',position={2.5,14.5},force=c.force});"
+            "rcon.print('m39:{}')"
+        )
+        refs = m39_refs(["inserter", "assembling-machine-1"])
+        inserter_ref = refs[("inserter", 0.5, 14.5)]
+        assembler_ref = refs[("assembling-machine-1", 0.5, 16.5)]
+        no_recipe = m39_read_until(
+            inserter_ref,
+            lambda value: (
+                value.get("drop_target", {}).get("status") == "no_recipe"
+                and value.get("status") == "waiting_for_space_in_destination"
+            ),
+        )
+        record(
+            "M39 CS single inventory read shows inserter destination no_recipe",
+            no_recipe.get("drop_target", {}).get("target_ref") == assembler_ref
+            and no_recipe.get("drop_target", {}).get("status") == "no_recipe"
+            and no_recipe.get("status") == "waiting_for_space_in_destination",
+            json.dumps(no_recipe),
+        )
+        m39_fixture(
+            "c.force.recipes['electronic-circuit'].enabled=true;"
+            "assert(b.machine.set_recipe('electronic-circuit'));"
+            "local input=b.machine.get_inventory(defines.inventory.crafter_input);input.clear();"
+            "assert(input.insert{name='iron-plate',count=100}==100);"
+            "assert(b.machine.get_output_inventory().insert{name='electronic-circuit',count=200}==200);"
+            "assert(b.inserter.held_stack.set_stack{name='iron-plate',count=1});rcon.print('m39:{}')"
+        )
+        shortage = m39_read_until(
+            inserter_ref,
+            lambda value: (
+                value.get("drop_target", {}).get("status") == "item_ingredient_shortage"
+                and value.get("status") == "waiting_for_space_in_destination"
+            ),
+        )
+        missing = [{"name": "copper-cable", "count": 3}]
+        batch = asyncio.run(m39_tool("get_entity_inventories", {"target_refs": [inserter_ref]}))
+        batch_record = batch["results"][0]["result"]
+        record(
+            "M39 CS single and batch reads show corrected destination shortage and missing items",
+            all(
+                value.get("drop_target", {}).get("status") == "item_ingredient_shortage"
+                and value.get("drop_target", {}).get("missing_ingredients") == missing
+                and value.get("status") == "waiting_for_space_in_destination"
+                for value in (shortage, batch_record)
+            ),
+            json.dumps({"single": shortage, "batch": batch}),
+        )
+        record(
+            "M39 CS waiting_for_space inserter explains destination diagnostics",
+            shortage.get("status") == "waiting_for_space_in_destination"
+            and all(
+                phrase in shortage.get("hint", "")
+                for phrase in (
+                    "drop_target.status",
+                    "no_recipe",
+                    "full_output",
+                    "missing_ingredients",
+                )
+            ),
+            json.dumps(shortage),
+        )
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = m39_fixture(
+                f"rcon.print('m39:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m39_fixture(
+            "if b then assert(c.crafting_queue_size==0);"
+            "c.force.recipes['electronic-circuit'].enabled=b.electronic_circuit_enabled;"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();if s then assert(game.delete_surface(s)) end;"
+            "for _,key in ipairs(b.fields) do state[key]=b.saved[key] end;"
+            "storage.m39_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m39:'..helpers.table_to_json({restored=true}))"
+        )
+        observed_map_cells.pop(m39_surface, None)
+        record(
+            "M39 removes fixtures and restores inventory, queue, position and observation state",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m39_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m39_position,
         )
 
     failed = [label for label, passed, _ in results if not passed]

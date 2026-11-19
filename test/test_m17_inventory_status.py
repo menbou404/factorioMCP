@@ -136,7 +136,8 @@ class InventoryStatusTests(unittest.IsolatedAsyncioTestCase):
                     "and the machine stopped",
                     "transfer from result",
                     "add an output inserter",
-                    "waiting_for_space_in_destination for inserters means their target is full",
+                    "When an inserter stops, check drop_target.status",
+                    "waiting_for_space_in_destination inserters include a hint",
                     "omitted when the entity has no status",
                 ):
                     self.assertIn(text, tools[name].description)
