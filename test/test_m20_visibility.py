@@ -43,8 +43,8 @@ class PlacementVisibilityTests(unittest.IsolatedAsyncioTestCase):
         for name in ("get_entity_inventory", "get_entity_inventories", "wait_for_items"):
             with self.subTest(name=name):
                 for text in (
-                    "Assemblers and furnaces stop with full_output",
-                    "result slot holds a recipe-dependent amount",
+                    "full_output means the result is full",
+                    "about one stack per product",
                     "Inserters fill machine and lab inputs only up to a small buffer",
                     "a few crafts or research units",
                     "labs may hold only about 2 packs of a type from inserters",

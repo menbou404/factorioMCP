@@ -191,8 +191,11 @@ TRANSFER_DESCRIPTION = (
 
 MACHINE_STATUS_DESCRIPTION = (
     " status uses the same names as observe_nearby and is omitted when the entity has no status."
-    " full_output means the output buffer limit was reached and the machine stopped;"
+    " full_output means the result is full (about one stack per product) and the machine stopped;"
     " take products out (transfer from result) or add an output inserter."
+    " With enough ingredients an assembler keeps crafting until then."
+    " item_ingredient_shortage with missing_ingredients = [{name, count}] means add those"
+    " items for one more craft; fluid ingredients are excluded and qualities are combined."
     " waiting_for_space_in_destination for inserters means their target is full."
     " For low_power or no_power, read a nearby electric pole with get_entity_inventory"
     " to see production and consumption."
@@ -246,14 +249,16 @@ def _append_hint(result: dict[str, Any], hint: str) -> None:
 
 
 def _running_walk_guidance(result: dict[str, Any]) -> dict[str, Any]:
-    if result.get("status") == "running" and result.get("type") == "move":
+    if result.get("status") == "running" and result.get("type") in {"move", "place_line"}:
         _append_hint(result, RUNNING_WALK_HINT.format(action_id=result["action_id"]))
     return result
 
 
 MACHINE_BUFFER_DESCRIPTION = (
-    " Assemblers and furnaces stop with full_output once the result slot holds a"
-    " recipe-dependent amount. Inserters fill machine and lab inputs only up to a small buffer"
+    " full_output means the result is full (about one stack per product). With enough"
+    " ingredients an assembler keeps crafting until then. Add items listed in"
+    " missing_ingredients when status is item_ingredient_shortage."
+    " Inserters fill machine and lab inputs only up to a small buffer"
     " (a few crafts or research units), so labs may hold only about 2 packs of a type"
     " from inserters."
     " To stock more, insert by hand with transfer_item."
@@ -292,13 +297,17 @@ ROLE_ALIASES = {
 # low_power is not stopped: a machine may still make progress at reduced speed.
 ITEMS_STALLED_HINTS = {
     "full_output": (
-        "The machine has stopped making products at the current count. "
+        "The result is full (about one stack per product); the machine has stopped "
+        "making products at the current count. "
         "Take products out or add an output inserter; more are made only after products "
         "are taken out or an output inserter removes them."
     ),
     "full_burnt_result_output": "Take spent fuel out of the burnt result inventory.",
     "no_ingredients": "Supply materials to the machine's input inventory.",
-    "item_ingredient_shortage": "Supply missing materials to the machine's input inventory.",
+    "item_ingredient_shortage": (
+        "Supply missing materials to the machine's input inventory; add the items and counts "
+        "listed in missing_ingredients when present."
+    ),
     "fluid_ingredient_shortage": "Supply the missing ingredient fluids.",
     "no_input_fluid": "Supply the required input fluid.",
     "missing_required_fluid": "Supply the required mining fluid.",
@@ -534,7 +543,9 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
             for field in ("blocking", "tiles"):
                 if field in problem and not isinstance(problem[field], list):
                     problem[field] = []
-    if operation in ("place_line", "") and "next_position" in result and result.get("stopped"):
+    if (operation in ("place_line", "") or result.get("type") == "place_line") and (
+        "next_position" in result and result.get("stopped")
+    ):
         if isinstance(result.get("detail"), dict):
             result["detail"] = _normalize_error_detail(result["detail"])
         hint = _hint("place_line", result["stopped"])
@@ -802,7 +813,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         if (
             entry.get("error") == "action_conflict"
             and isinstance(running, dict)
-            and running.get("type") == "move"
+            and running.get("type") in {"move", "place_line"}
             and running.get("id")
         ):
             return running
@@ -919,6 +930,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                             key: item
                             for key, item in (start_value or {}).items()
                             if key != "remaining_distance"
+                            and (
+                                (start_value or {}).get("type") != "place_line"
+                                or key == "waited_for_walk"
+                            )
                         },
                         **value,
                         "timed_out": value.get("status") == "running",
@@ -943,6 +958,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         except Exception as exc:
             return _error_response(exc, operation, waited)
         if not wait_seconds or value.get("status") in {"succeeded", "failed", "cancelled"}:
+            if operation == "place_line":
+                value["waited_seconds"] = 0
             return _response(_running_walk_guidance(value))
         return await wait_action(value["action_id"], wait_seconds, value)
 
@@ -1363,8 +1380,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Place a straight line of transport-belt or pipe items, 2-64 tiles inclusive. "
             "Endpoints are snapped to tile centres and must share a row or column. "
             "Direction follows travel from start to end: east 4, south 8, west 12, north 0. "
-            "It does not walk and uses the same reach, observation and inventory checks as "
-            "place_entity. Build reach is 10 tiles in a circle, so standing near the middle "
+            "walk=false (default) uses the same reach, observation and inventory checks as "
+            "place_entity and does not walk. Build reach is 10 tiles in a circle, so standing near "
+            "the middle "
             "of the segment reliably places about 19 tiles per call. "
             "The call stops at the first tile it cannot place "
             "and keeps earlier tiles. On stop, resolve stopped/detail, walk near next_position "
@@ -1377,7 +1395,18 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "reports whether the whole line finished. Summary includes requested, placed, "
             "already_present, direction, first_position, last_position (if any), next_position "
             "and stopped/detail/hint on stop, and merged collected_items when picked up."
-            " On out_of_range, stand_position suggests a visible, clear character standing"
+            " With walk=true, place a long line in one call by walking along it: place reachable"
+            " tiles, walk to stand_position using the same pathfinding as move_to, and repeat."
+            " Shares the walk/mine slot; never places outside build reach."
+            " wait_seconds requires walk=true (1-50, omitted for an immediate return) and"
+            " starts and waits like move_to;"
+            " automatic walk wait plus wait_seconds is capped at 50 seconds."
+            " Returns action_id, type=place_line, status, waited_seconds and progress (placed,"
+            " next_position). If still running, continue with wait_for_action; final results"
+            " from it or get_action_status retain all line summary fields. Cancellation retains"
+            " progress. Walk failures stop out_of_range with the failure in detail."
+            " For walk=false, on out_of_range, stand_position suggests a visible, clear character"
+            " standing"
             " position reaching the most remaining tiles among bounded candidates along both"
             " sides and around the ends, with ties nearest the character. Candidates must reach"
             " next_position and allow move_to arrival clearance; omitted when none fits."
@@ -1395,9 +1424,20 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         to_x: LineCoordinate,
         to_y: LineCoordinate,
         end_direction: RotationDirection | None = None,
+        walk: Annotated[bool, Field(strict=True)] = False,
+        wait_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] | None = None,
     ) -> CallToolResult:
         return await invoke_line(
-            "place_line", item, surface, from_x, from_y, to_x, to_y, end_direction
+            "place_line",
+            item,
+            surface,
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            end_direction,
+            walk=walk,
+            wait_seconds=wait_seconds,
         )
 
     @server.tool(
@@ -1440,7 +1480,24 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         to_x: float,
         to_y: float,
         end_direction: int | None,
+        *,
+        walk: bool = False,
+        wait_seconds: float | None = None,
     ) -> CallToolResult:
+        if wait_seconds is not None and not walk:
+            message = "wait_seconds requires walk=true."
+            return _error_response(
+                BridgeError(
+                    "invalid_input",
+                    message,
+                    {
+                        "errors": [
+                            {"field": "wait_seconds", "type": "value_error", "message": message}
+                        ]
+                    },
+                ),
+                operation,
+            )
         dx, dy = math.floor(to_x) - math.floor(from_x), math.floor(to_y) - math.floor(from_y)
         if (dx and dy) or not 2 <= abs(dx) + abs(dy) + 1 <= 64:
             return _error_response(
@@ -1474,6 +1531,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         }
         if end_direction is not None:
             params["end_direction"] = end_direction
+        if walk:
+            params["walk"] = True
+            return await start_action(operation, params, wait_seconds)
         return await invoke(operation, params)
 
     @server.tool(
@@ -1711,7 +1771,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "The machine has stopped making products at the current count; more are made only "
             "after products are taken out or an output inserter removes them. "
             "Take products out or add an output inserter; "
-            "for ingredient shortages, supply materials; for no_fuel/no_power, supply fuel/power."
+            "for item_ingredient_shortage, add the items in missing_ingredients (when present); "
+            "this uses the 10-second stall rule. For no_fuel/no_power, supply fuel/power."
             " For low_power or no_power, read a nearby electric pole with get_entity_inventory"
             " to see production and consumption."
             " When reached=false (timed out or stalled), includes feeders: up to 16 owned "
@@ -1823,6 +1884,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                         result["produced"] = True
                     if role is not None:
                         result["inventory_role"] = role
+                    if value.get("missing_ingredients") is not None:
+                        result["missing_ingredients"] = value["missing_ingredients"]
                     if stalled:
                         result["stalled_seconds"] = stalled_seconds
                         result["hint"] = ITEMS_STALLED_HINTS[status]
@@ -1919,7 +1982,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
 
     @server.tool(
         description=(
-            "Get the status of a walking, mining, or crafting action. "
+            "Get the status of a walking, place_line, mining, or crafting action. "
+            "Walking lines include progress and all final line fields. "
             "Running mining reports detail.gained and detail.count; "
             "detail.estimated_seconds estimates the remaining mining time when computable; "
             "running crafting reports detail.count and detail.remaining."
@@ -1930,8 +1994,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
 
     @server.tool(
         description=(
-            "Wait for a walking, mining, or crafting action to finish. Prefer this over polling "
-            "get_action_status. For move_to and craft, prefer their wait_seconds argument "
+            "Wait for a walking, place_line, mining, or crafting action to finish. "
+            "Walking lines retain all final line fields. Prefer this over polling "
+            "get_action_status. For move_to, place_line with walk=true, and craft, prefer their "
+            "wait_seconds argument "
             "to save a call; use wait_for_action to continue waiting after a timeout. "
             "A timeout returns the last running status "
             "and leaves the action running. Running mining reports detail.gained and detail.count; "
@@ -1956,7 +2022,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     ) -> CallToolResult:
         return await wait_action(action_id, timeout_seconds)
 
-    @server.tool(description="Stop an ongoing walking, mining, or crafting action.")
+    @server.tool(
+        description=(
+            "Stop an ongoing walking, place_line, mining, or crafting action, retaining progress."
+        )
+    )
     async def cancel_action(action_id: RequiredText) -> CallToolResult:
         return await invoke("cancel_action", {"action_id": action_id})
 

@@ -144,7 +144,10 @@ class PathCornerTests(unittest.IsolatedAsyncioTestCase):
         tools = {t.name: t for t in await create_server(None).list_tools()}
         for name in TOOLS:
             tool = tools[name]
-            self.assertEqual(set(tool.input_schema["properties"]), {*LINE, "end_direction"})
+            optional = {"walk", "wait_seconds"} if name == "place_line" else set()
+            self.assertEqual(
+                set(tool.input_schema["properties"]), {*LINE, "end_direction", *optional}
+            )
             self.assertEqual(set(tool.input_schema["required"]), set(LINE))
             schema = tool.input_schema["properties"]["end_direction"]
             self.assertIsNone(schema["default"])
