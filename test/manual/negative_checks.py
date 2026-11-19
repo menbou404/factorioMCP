@@ -5479,6 +5479,276 @@ def main():
             and bridge.call("get_agent_status")["result"]["position"] == m35_position,
         )
 
+    # M36 CI/CJ: shortage hidden by full_output, and lines placed while walking.
+    # Fixture-only RCON creates/stashes items and teleports to each test's start.
+    m36_surface = "m36-status-walk-line-fixture"
+    m36_server = create_server(bridge)
+    m36_inventory = bridge.call("get_inventory")["result"]["items"]
+    m36_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m36_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m36_surface}";local s=game.surfaces[name];'
+            "local b=storage.m36_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m36:" not in raw:
+            raise RuntimeError("M36 fixture failed: " + raw)
+        return json.loads(raw.split("m36:", 1)[1].strip())
+
+    async def m36_tool(name, arguments):
+        response = await m36_server.call_tool(name, arguments)
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    def m36_read(target_ref):
+        return asyncio.run(m36_tool("get_entity_inventory", {"target_ref": target_ref}))
+
+    async def m36_line(y):
+        value = await m36_tool(
+            "place_line",
+            {
+                "item": "transport-belt",
+                "surface": m36_surface,
+                "from_x": 1.5,
+                "from_y": y,
+                "to_x": 40.5,
+                "to_y": y,
+                "end_direction": 0,
+                "walk": True,
+                "wait_seconds": 50,
+            },
+        )
+        if value.get("status") == "running":
+            value = await m36_tool(
+                "wait_for_action", {"action_id": value["action_id"], "timeout_seconds": 50}
+            )
+        assert value.get("status") != "running", value
+        assert value.get("type") == "place_line" and value.get("requested") == 40, value
+        return value
+
+    try:
+        m36_fixture(
+            "assert(not s and not b,'M36 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,"
+            "inventory=game.create_inventory(#inv),selected=c.selected,"
+            "last_observation=state.last_observation,recent_observations=state.recent_observations};"
+            "storage.m36_backup=b;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=160,height=96});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},3);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-80,79 do for y=-48,47 do "
+            'tiles[#tiles+1]={name="grass-1",position={x,y}} end end;s.set_tiles(tiles);'
+            "assert(c.teleport({0.5,4.5},s));"
+            "state.last_observation=nil;state.recent_observations={};"
+            "b.machine=s.create_entity{name='assembling-machine-1',position={0.5,0.5},"
+            "force=c.force};assert(b.machine);b.machine.set_recipe('iron-gear-wheel');"
+            "local generator=s.create_entity{name='electric-energy-interface',"
+            "position={4.5,2.5},force=c.force};assert(generator);"
+            "generator.power_production=1000000/60;generator.power_usage=0;"
+            "generator.electric_buffer_size=1000000;generator.energy=1000000;"
+            "assert(s.create_entity{name='small-electric-pole',position={2.5,2.5},force=c.force});"
+            "assert(b.machine.get_inventory(defines.inventory.crafter_input).insert"
+            "{name='iron-plate',count=6}==6);rcon.print('m36:{}')"
+        )
+        observed = bridge.call("observe_nearby", {"names": ["assembling-machine-1"]})["result"]
+        machine_ref = next(e["target_ref"] for e in observed["entities"] if e["x"] == 0.5)
+        deadline = time.monotonic() + 15
+        while True:
+            shortage = m36_read(machine_ref)
+            gears = sum(stack["count"] for stack in shortage["inventories"]["result"])
+            if (
+                gears == 3 and shortage.get("status") == "item_ingredient_shortage"
+            ) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        missing = [{"name": "iron-plate", "count": 2}]
+        record(
+            "M36 CI three gears from six plates reports shortage of two plates",
+            gears == 3
+            and shortage.get("status") == "item_ingredient_shortage"
+            and shortage.get("missing_ingredients") == missing,
+            json.dumps(shortage),
+        )
+        for compact in (False, True):
+            observed = asyncio.run(
+                m36_tool("observe_nearby", {"names": ["assembling-machine-1"], "compact": compact})
+            )["entities"]
+            record(
+                f"M36 CI observe_nearby compact={compact} includes shortage details",
+                len(observed) == 1
+                and observed[0].get("status") == "item_ingredient_shortage"
+                and observed[0].get("missing_ingredients") == missing,
+                json.dumps(observed),
+            )
+        waited = asyncio.run(
+            m36_tool(
+                "wait_for_items",
+                {
+                    "target_ref": machine_ref,
+                    "item": "iron-gear-wheel",
+                    "count": 5,
+                    "inventory_role": "result",
+                    "timeout_seconds": 20,
+                },
+            )
+        )
+        record(
+            "M36 CI shortage waits ten seconds and stalls without output_full",
+            waited.get("status") == "item_ingredient_shortage"
+            and waited.get("missing_ingredients") == missing
+            and waited["stalled"]
+            and not waited.get("output_full")
+            and not waited["timed_out"]
+            and waited["current"] == 3
+            and 10 <= waited["waited_seconds"] < 13,
+            json.dumps(waited),
+        )
+        m36_fixture(
+            "b.machine.get_output_inventory().clear();"
+            "assert(b.machine.get_output_inventory().insert{name='iron-gear-wheel',count=100}==100);"
+            "assert(b.machine.get_inventory(defines.inventory.crafter_input).insert"
+            "{name='iron-plate',count=100}==100);rcon.print('m36:{}')"
+        )
+        deadline = time.monotonic() + 5
+        while True:
+            full = m36_read(machine_ref)
+            if full.get("status") == "full_output" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        record(
+            "M36 CI full stack with ample ingredients stays full_output",
+            full.get("status") == "full_output" and "missing_ingredients" not in full,
+            json.dumps(full),
+        )
+        waited = asyncio.run(
+            m36_tool(
+                "wait_for_items",
+                {
+                    "target_ref": machine_ref,
+                    "item": "iron-gear-wheel",
+                    "count": 101,
+                    "inventory_role": "result",
+                    "timeout_seconds": 20,
+                },
+            )
+        )
+        record(
+            "M36 CI genuine full output still returns output_full after three seconds",
+            waited.get("status") == "full_output"
+            and waited.get("output_full") is True
+            and waited["stalled"]
+            and "missing_ingredients" not in waited
+            and 3 <= waited["waited_seconds"] < 6,
+            json.dumps(waited),
+        )
+
+        m36_fixture(
+            "for ref,entry in pairs(state.targets) do if entry.entity and entry.entity.valid "
+            "and entry.entity.surface==s then if entry.unit_number then "
+            "state.owned_refs[entry.unit_number]=nil end;state.targets[ref]=nil end end;"
+            "for _,e in pairs(s.find_entities()) do if e~=c then e.destroy() end end;"
+            "assert(c.teleport({0.5,4.5},s));"
+            "assert(inv.insert{name='transport-belt',count=100}==100);rcon.print('m36:{}')"
+        )
+        line = asyncio.run(m36_line(0.5))
+        measured = m36_fixture(
+            "local correct=0;for i=1,40 do local e=s.find_entity('transport-belt',{i+0.5,0.5});"
+            "if e and e.direction==(i==40 and 0 or 4) then correct=correct+1 end end;"
+            "rcon.print('m36:'..helpers.table_to_json({correct=correct,"
+            "x=c.position.x,y=c.position.y,belts=inv.get_item_count('transport-belt')}))"
+        )
+        cached_line = asyncio.run(m36_tool("get_action_status", {"action_id": line["action_id"]}))
+        record(
+            "M36 CJ forty belts complete by walking with correct final corner and action fields",
+            line.get("complete") is True
+            and line["placed"] == 40
+            and line["already_present"] == 0
+            and line.get("end_direction") == 0
+            and line.get("last_position") == {"x": 40.5, "y": 0.5}
+            and cached_line.get("placed") == 40
+            and cached_line.get("complete") is True
+            and measured["correct"] == 40
+            and measured["belts"] == 60
+            and (abs(measured["x"] - 0.5) > 1 or abs(measured["y"] - 4.5) > 1),
+            json.dumps({"line": line, "measured": measured}),
+        )
+        m36_fixture(
+            "assert(c.teleport({0.5,16.5},s));"
+            "assert(s.create_entity{name='wooden-chest',position={24.5,12.5},force=c.force});"
+            "rcon.print('m36:{}')"
+        )
+        blocked = asyncio.run(m36_line(12.5))
+        record(
+            "M36 CJ walking line stops at an entity midway and preserves progress",
+            blocked.get("stopped") == "blocked"
+            and blocked.get("next_position") == {"x": 24.5, "y": 12.5}
+            and blocked.get("placed") == 23
+            and not blocked["complete"],
+            json.dumps(blocked),
+        )
+        m36_fixture(
+            "assert(c.teleport({0.5,28.5},s));inv.clear();"
+            "assert(inv.insert{name='transport-belt',count=15}==15);rcon.print('m36:{}')"
+        )
+        short = asyncio.run(m36_line(24.5))
+        measured = m36_fixture(
+            "rcon.print('m36:'..helpers.table_to_json({belts=inv.get_item_count('transport-belt'),"
+            "next_empty=s.find_entity('transport-belt',{16.5,24.5})==nil}))"
+        )
+        record(
+            "M36 CJ walking line exhausts materials without placing free belts",
+            short.get("stopped") == "missing_materials"
+            and short.get("placed") == 15
+            and short.get("next_position") == {"x": 16.5, "y": 24.5}
+            and not short["complete"]
+            and measured["belts"] == 0
+            and measured["next_empty"],
+            json.dumps(short),
+        )
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = m36_fixture(
+                f"rcon.print('m36:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m36_fixture(
+            "if b then assert(c.crafting_queue_size==0);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();state.last_observation=b.last_observation;"
+            "state.recent_observations=b.recent_observations;"
+            "for ref,entry in pairs(state.targets) do if entry.entity and entry.entity.valid "
+            "and entry.entity.surface==s then if entry.unit_number then "
+            "state.owned_refs[entry.unit_number]=nil end;state.targets[ref]=nil end end;"
+            "if s then assert(game.delete_surface(s)) end;state.explored_map[name]=nil;"
+            "storage.m36_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m36:'..helpers.table_to_json({restored=true}))"
+        )
+        observed_map_cells.pop(m36_surface, None)
+        record(
+            "M36 removes fixtures and restores inventory, queue, position and observation",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m36_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m36_position,
+        )
+
     failed = [label for label, passed, _ in results if not passed]
     if failed:
         raise RuntimeError("Failed checks: " + ", ".join(failed))

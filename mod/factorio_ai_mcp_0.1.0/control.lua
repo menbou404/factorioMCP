@@ -4,7 +4,7 @@ local MAX_OBSERVATIONS = 100
 local MAX_RECENT_OBSERVATIONS = 8
 local OBSERVATION_RADIUS = 16
 local COMPACT_ENTITY_FIELDS = {
-  "target_ref", "name", "x", "y", "direction", "status", "recipe", "belt_items",
+  "target_ref", "name", "x", "y", "direction", "status", "missing_ingredients", "recipe", "belt_items",
   "underground_type", "neighbour", "pickup_position", "drop_position", "electric_network_id",
   "input_priority", "output_priority", "filter", "inventory_limit"
 }
@@ -17,6 +17,30 @@ local MOVE_BLOCKED_ARRIVAL_RADIUS = 1.5
 local ENTITY_STATUS_NAMES = {}
 for name, value in pairs(defines.entity_status) do
   ENTITY_STATUS_NAMES[value] = name
+end
+local function reported_entity_status(entity)
+  local status = ENTITY_STATUS_NAMES[entity.status]
+  if status ~= "full_output" or entity.type ~= "assembling-machine" then return status end
+  local recipe = entity.get_recipe()
+  local input = entity.get_inventory(defines.inventory.crafter_input)
+  if not recipe or not input or not input.valid then return status end
+  -- get_contents includes every quality; count one craft's item ingredients only.
+  local held, needed, missing = {}, {}, {}
+  for _, stack in pairs(input.get_contents()) do
+    held[stack.name] = (held[stack.name] or 0) + stack.count
+  end
+  for _, ingredient in pairs(recipe.ingredients) do
+    if ingredient.type == "item" then
+      needed[ingredient.name] = (needed[ingredient.name] or 0) + ingredient.amount
+    end
+  end
+  for name, count in pairs(needed) do
+    local short = count - (held[name] or 0)
+    if short > 0 then missing[#missing + 1] = {name = name, count = short} end
+  end
+  if #missing == 0 then return status end
+  table.sort(missing, function(a, b) return a.name < b.name end)
+  return "item_ingredient_shortage", missing
 end
 local PLACEABLE_ITEMS = {
   ["wooden-chest"] = true, ["iron-chest"] = true,
@@ -154,8 +178,13 @@ local function remaining_walk_distance(action, character)
 end
 
 local function conflict_detail(action, character)
-  return {running_action = action and {id = action.id, type = action.type,
+  return {running_action = action and {id = action.id, type = action.line_result and "place_line" or action.type,
           remaining_distance = remaining_walk_distance(action, character)} or nil}
+end
+
+local function line_action_result(action, result)
+  for key, value in pairs(action.line_result or {}) do result[key] = value end
+  return result
 end
 
 local function sorted_keys(values)
@@ -366,9 +395,20 @@ local function adjusted_goal_detail(action, detail)
   return detail
 end
 
+local advance_place_line -- Continues a line after the shared move machinery arrives.
 local function finish_action(state, slot, status, error_code, detail)
   local action = state[slot]
   if not action then return end
+  if action.line_result and not action.line_finished then
+    stop_character(state.character)
+    state.path_request_id = nil
+    if status == "succeeded" then
+      advance_place_line(state, action)
+      return
+    end
+    action.line_result.complete = false
+    action.line_result.stopped = status == "cancelled" and "cancelled" or "out_of_range"
+  end
   if action.type == "move" or action.type == "mine" then
     stop_character(state.character)
   end
@@ -389,18 +429,22 @@ local function finish_action(state, slot, status, error_code, detail)
     end
   end
   if action.type == "move" then detail = adjusted_goal_detail(action, detail) end
+  if action.line_result and not action.line_finished then
+    action.line_result.detail = {reason = error_code, walk_detail = detail}
+  end
   action.status = status
   action.error = error_code
   action.detail = detail
   action.finished_tick = game.tick
   local completed = {
-    id = action.id, type = action.type, status = status,
+    id = action.id, type = action.line_result and "place_line" or action.type, status = status,
     error = error_code, detail = detail,
     goal_adjusted = action.goal_adjusted, original_goal = action.original_goal,
     position = valid_character(state) and position_data(state.character) or nil,
     started_tick = action.started_tick, finished_tick = game.tick
   }
-  if action.type == "move" and status == "succeeded" and valid_character(state) then
+  if action.type == "move" and not action.line_result and status == "succeeded" and
+     valid_character(state) then
     -- A point query tests the final position against belt collision boxes, any force.
     local belts = state.character.surface.find_entities_filtered{
       position = state.character.position, type = {"transport-belt", "underground-belt", "splitter"}
@@ -410,6 +454,7 @@ local function finish_action(state, slot, status, error_code, detail)
       completed.hint = "Stand off belts before the next action; belts can carry the character."
     end
   end
+  completed.line_result = action.line_result
   state.last_action = completed
   state.completed_actions[action.id] = completed
   state.completed_order[#state.completed_order + 1] = action.id
@@ -468,7 +513,7 @@ local function status(state)
     inventory = inventory_contents(character),
     crafting_queue_size = character.crafting_queue_size,
     action = state.action and {id = state.action.id, action_id = state.action.id,
-      type = state.action.type, status = state.action.status} or nil,
+      type = state.action.line_result and "place_line" or state.action.type, status = state.action.status} or nil,
     craft_action = state.craft_action and {id = state.craft_action.id,
       action_id = state.craft_action.id,
       type = state.craft_action.type, status = state.craft_action.status} or nil
@@ -1263,7 +1308,7 @@ local function do_research_labs(state)
       end
       labs[#labs + 1] = {
         target_ref = register_target(state, entity), x = entity.position.x, y = entity.position.y,
-        status = ENTITY_STATUS_NAMES[entity.status], science_units = units, missing = missing,
+        status = reported_entity_status(entity), science_units = units, missing = missing,
         blocking = holds_required and #missing > 0
       }
     end
@@ -1424,8 +1469,7 @@ local function do_observe(state, params)
       end
     end
     if entity.supports_direction then observed.direction = entity.direction end
-    local entity_status = entity.status
-    if entity_status ~= nil then observed.status = ENTITY_STATUS_NAMES[entity_status] end
+    observed.status, observed.missing_ingredients = reported_entity_status(entity)
     if entity.type ~= "resource" then
       local box = entity.bounding_box
       observed.bounding_box = {
@@ -2408,10 +2452,12 @@ local function electric_network_detail(target)
           producers = producers, consumers = consumers}
 end
 
-local function do_place(state, params, line_placement)
+local function do_place(state, params, line_placement, own_action)
   local character, err = require_character(state)
   if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state.action, state.character) end
+  if state.action and state.action ~= own_action then
+    return nil, "action_conflict", conflict_detail(state.action, state.character)
+  end
   local placement, reason, detail = validate_placement(state, character, params, true, line_placement)
   if not placement then return nil, reason, detail end
   local inventory = placement.inventory
@@ -2571,18 +2617,13 @@ local function do_check_line(state, params)
   return result
 end
 
-local function do_place_line(state, params)
-  local character, err = require_character(state)
-  if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state.action, state.character) end
-  local line, reason, detail = validate_line(character, params)
-  if not line then return nil, reason, detail end
+-- Both modes share exactly the same per-tile placement loop. A walking line is
+-- a move action with line progress attached; each arrival resumes this function.
+advance_place_line = function(state, action)
+  local params, line, result = action.line_params, action.line, action.line_result
+  local character = state.character
   local first, requested, prototype = line.first, line.requested, line.prototype
   local direction, step_x, step_y = line.direction, line.step_x, line.step_y
-  local result = {item = params.item, name = prototype.name, direction = direction,
-                  end_direction = line.end_direction,
-                  requested = requested, placed = 0, already_present = 0,
-                  complete = false, first_position = first}
   local collected = {}
   local function merge_collected(items)
     for _, item in ipairs(items or {}) do
@@ -2591,7 +2632,10 @@ local function do_place_line(state, params)
       qualities[item.quality] = (qualities[item.quality] or 0) + item.count
     end
   end
-  for index = 0, requested - 1 do
+  merge_collected(result.collected_items)
+  result.collected_items = nil
+  result.stopped, result.detail, result.stand_position = nil, nil, nil
+  for index = action.line_index or 0, requested - 1 do
     local tile_direction = index == requested - 1 and line.end_direction or direction
     local position = {x = first.x + index * step_x, y = first.y + index * step_y}
     local existing
@@ -2615,7 +2659,7 @@ local function do_place_line(state, params)
       local ok, placed, reason, detail = pcall(do_place, state, {
         item = params.item, surface = params.surface, x = position.x, y = position.y,
         direction = tile_direction
-      }, true)
+      }, true, action.id and action or nil)
       if not ok then
         log("AI MCP line handler error: " .. tostring(placed))
         reason = "internal_error"
@@ -2633,11 +2677,14 @@ local function do_place_line(state, params)
       if result.stopped == "out_of_range" then
         result.stand_position = line_stand_position(state, character, line, index)
       end
+      action.line_index = index
       break
     end
+    action.line_index = index + 1
     result.last_position = position
   end
   result.complete = result.stopped == nil
+  if result.complete then result.next_position = nil end
   for _, name in ipairs(sorted_keys(collected)) do
     for _, quality in ipairs(sorted_keys(collected[name])) do
       result.collected_items = result.collected_items or {}
@@ -2646,7 +2693,49 @@ local function do_place_line(state, params)
       }
     end
   end
-  return result
+  if not action.id then return result end
+  if result.stopped == "out_of_range" then
+    local stand = result.stand_position
+    if action.line_walk_index == action.line_index then
+      -- An arrival must advance the line before another walk can start.
+      result.detail = {reason = "no_progress_after_walk"}
+    elseif stand then
+      result.stopped, result.detail, result.stand_position = nil, nil, nil
+      action.line_walk_index = action.line_index
+      action.goal = stand
+      action.retries, action.escape_tried = 0, nil
+      action.original_goal, action.goal_adjusted = nil, nil
+      local ok = pcall(request_path, state, character, stand)
+      if ok then return end
+      finish_action(state, "action", "failed", "path_not_found")
+      return
+    else
+      result.detail = {reason = "stand_position_not_found"}
+    end
+  end
+  action.line_finished = true
+  finish_action(state, "action", "succeeded")
+end
+
+local function do_place_line(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action, state.character) end
+  if params.walk ~= nil and type(params.walk) ~= "boolean" then return nil, "invalid_input" end
+  local line, reason, detail = validate_line(character, params)
+  if not line then return nil, reason, detail end
+  local result = {item = params.item, name = line.prototype.name, direction = line.direction,
+                  end_direction = line.end_direction,
+                  requested = line.requested, placed = 0, already_present = 0,
+                  complete = false, first_position = line.first}
+  local action = {type = "move", line = line, line_params = params, line_result = result,
+                  line_index = 0, surface_index = character.surface.index,
+                  goal = {x = character.position.x, y = character.position.y}}
+  if params.walk then begin_action(state, "action", action) end
+  advance_place_line(state, action)
+  if not params.walk then return result end
+  return line_action_result(action, {action_id = action.id, type = "place_line",
+    status = action.status, error = action.error})
 end
 
 local function do_rotate(state, params)
@@ -2926,7 +3015,7 @@ local function get_entity_inventory(character, params, allow_status_only)
 end
 
 local function inventory_entity_state(target)
-  local status = target.status
+  local status, missing = reported_entity_status(target)
   local recipe_name
   if target.type == "assembling-machine" or target.type == "furnace" then
     local recipe = target.get_recipe()
@@ -2941,7 +3030,7 @@ local function inventory_entity_state(target)
   -- Guard: previous_recipe.name may be a LuaRecipePrototype, not a string.
   -- Normalize before callers index recipes or serialize the value to JSON.
   if recipe_name and type(recipe_name) ~= "string" then recipe_name = recipe_name.name end
-  return status ~= nil and ENTITY_STATUS_NAMES[status] or nil, recipe_name
+  return status, recipe_name, missing
 end
 
 local function do_entity_feeders(state, params)
@@ -2963,7 +3052,7 @@ local function do_entity_feeders(state, params)
         local pickup = entity.pickup_target
         feeders[#feeders + 1] = {
           name = entity.name, x = entity.position.x, y = entity.position.y,
-          status = ENTITY_STATUS_NAMES[entity.status],
+          status = reported_entity_status(entity),
           pickup_target = pickup and pickup.valid and pickup.name or nil
         }
       end
@@ -2987,7 +3076,7 @@ local function do_entity_inventory(state, params)
     local inventory = target.get_inventory(inventory_id)
     if inventory and inventory.valid then inventories[role] = inventory.get_contents() end
   end
-  local status, recipe = inventory_entity_state(target)
+  local status, recipe, missing = inventory_entity_state(target)
   local belt_items, belt_lanes = belt_contents(target, true)
   local products_finished, products_since_recipe, recipe_products, recipe_product_amounts
   if target.type == "assembling-machine" or target.type == "furnace" then
@@ -3027,7 +3116,7 @@ local function do_entity_inventory(state, params)
     if resource and resource.valid then mining_target = resource.name end
   end
   return {name = target.name, type = target.type,
-          inventories = inventories, status = status, recipe = recipe,
+          inventories = inventories, status = status, recipe = recipe, missing_ingredients = missing,
           products_finished = products_finished, recipe_products = recipe_products,
           products_since_recipe = products_since_recipe,
           recipe_product_amounts = recipe_product_amounts,
@@ -3056,13 +3145,13 @@ end
 
 local function transfer_shortage_detail(source, params, role, target)
   local preview = transfer_inventory_contents(source)
-  local status, recipe
+  local status, recipe, missing
   if params.direction == "from_entity" then
-    status, recipe = inventory_entity_state(target)
+    status, recipe, missing = inventory_entity_state(target)
   end
   return {item = params.item, requested = params.count, available = 0,
           inventory_role = params.direction == "from_entity" and role or nil,
-          status = status, recipe = recipe,
+          status = status, recipe = recipe, missing_ingredients = missing,
           contents = #preview > 0 and preview or nil}
 end
 
@@ -3251,8 +3340,8 @@ local function do_action_status(state, params)
       detail = adjusted_goal_detail(action, detail)
     end
   end
-  return adjusted_goal_detail(action, {
-    action_id = action.id, type = action.type, status = action.status,
+  return line_action_result(action, adjusted_goal_detail(action, {
+    action_id = action.id, type = action.line_result and "place_line" or action.type, status = action.status,
     remaining_distance = action.status == "running" and
                          remaining_walk_distance(action, state.character) or nil,
     error = action.error, detail = detail,
@@ -3260,7 +3349,7 @@ local function do_action_status(state, params)
     position = action.status == "running" and
                (valid_character(state) and position_data(state.character) or nil) or
                action.position
-  })
+  }))
 end
 
 local function do_cancel(state, params)
@@ -3434,6 +3523,10 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
     finish_action(state, "action", "failed", "character_dead")
     return
   end
+  if state.action.surface_index and state.character.surface.index ~= state.action.surface_index then
+    finish_action(state, "action", "failed", "surface_changed")
+    return
+  end
   if finish_move_within(state) then return end
   if event.try_again_later then
     state.action.retries = state.action.retries + 1
@@ -3484,6 +3577,10 @@ local function tick_action(state, slot)
     return
   end
   if action.type == "move" then
+    if action.surface_index and character.surface.index ~= action.surface_index then
+      finish_action(state, slot, "failed", "surface_changed")
+      return
+    end
     if finish_move_within(state) then return end
     if not action.path then return end
     local d = math.sqrt(distance_squared(character.position, action.goal))
