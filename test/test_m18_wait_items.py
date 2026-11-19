@@ -124,7 +124,7 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("hint", value)
         sleep.assert_awaited_with(0.25)
 
-    async def test_full_output_stalls_after_ten_unchanged_seconds(self):
+    async def test_full_output_stalls_after_three_seconds(self):
         result, elapsed, sleep = await self.wait_with_clock(lambda _: inventory(4, "full_output"))
         self.assertFalse(result.is_error)
         value = payload(result)
@@ -133,12 +133,60 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(value["timed_out"])
         self.assertEqual(value["current"], 4)
         self.assertEqual(value["status"], "full_output")
-        self.assertEqual(value["stalled_seconds"], 10)
-        self.assertEqual(value["waited_seconds"], 10)
-        self.assertEqual(elapsed, 10)
-        self.assertEqual(sleep.await_count, 20)
+        self.assertEqual(value["stalled_seconds"], 3)
+        self.assertTrue(value["output_full"])
+        self.assertEqual(value["waited_seconds"], 3)
+        self.assertEqual(elapsed, 3)
+        self.assertEqual(sleep.await_count, 6)
         self.assertIn("Take products out", value["hint"])
         self.assertIn("output inserter", value["hint"])
+
+    async def test_transient_full_output_does_not_stall(self):
+        for inventory_at in (
+            lambda t: inventory(4, "full_output" if int(t / 2) % 2 == 0 else "working"),
+            lambda t: inventory(4 + int(t / 2) % 2, "full_output"),
+        ):
+            with self.subTest(inventory_at=inventory_at):
+                result, elapsed, _ = await self.wait_with_clock(inventory_at)
+                value = payload(result)
+                self.assertFalse(result.is_error)
+                self.assertFalse(value["stalled"])
+                self.assertTrue(value["timed_out"])
+                self.assertNotIn("output_full", value)
+                self.assertNotIn("stalled_seconds", value)
+                self.assertEqual(elapsed, 20)
+
+    async def test_full_output_timer_resets_on_any_other_status(self):
+        for status in ("working", "no_ingredients", None):
+            with self.subTest(status=status):
+                result, elapsed, _ = await self.wait_with_clock(
+                    lambda t, status=status: inventory(4, status if 2 <= t < 2.5 else "full_output")
+                )
+                value = payload(result)
+                self.assertTrue(value["stalled"])
+                self.assertTrue(value["output_full"])
+                self.assertEqual(elapsed, 5.5)
+                self.assertEqual(value["stalled_seconds"], 5.5 if status == "no_ingredients" else 3)
+
+    async def test_full_output_count_change_restarts_three_second_timer(self):
+        result, elapsed, _ = await self.wait_with_clock(
+            lambda t: inventory(4 if t < 2 else 3, "full_output")
+        )
+        value = payload(result)
+        self.assertTrue(value["stalled"])
+        self.assertTrue(value["output_full"])
+        self.assertEqual(value["stalled_seconds"], 3)
+        self.assertEqual(elapsed, 5)
+
+    async def test_full_output_requires_three_seconds_after_another_stopped_status(self):
+        result, elapsed, _ = await self.wait_with_clock(
+            lambda t: inventory(4, "no_ingredients" if t < 9 else "full_output")
+        )
+        value = payload(result)
+        self.assertTrue(value["stalled"])
+        self.assertTrue(value["output_full"])
+        self.assertEqual(value["stalled_seconds"], 12)
+        self.assertEqual(elapsed, 12)
 
     async def test_shortages_have_status_specific_hints(self):
         for status, hint_text in (
@@ -161,7 +209,7 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
     async def test_changing_count_does_not_stall(self):
         # Changes in either direction count, including items removed by inserters.
         result, elapsed, _ = await self.wait_with_clock(
-            lambda t: inventory(4 if int(t / 8) % 2 else 5, "full_output")
+            lambda t: inventory(4 if int(t / 8) % 2 else 5, "no_ingredients")
         )
         self.assertFalse(result.is_error)
         self.assertFalse(payload(result)["stalled"])
@@ -170,7 +218,7 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_count_change_resets_stall_timer(self):
         result, elapsed, _ = await self.wait_with_clock(
-            lambda t: inventory(4 if t < 8 else 5, "full_output")
+            lambda t: inventory(4 if t < 8 else 5, "no_ingredients")
         )
         self.assertTrue(payload(result)["stalled"])
         self.assertEqual(payload(result)["stalled_seconds"], 10)
@@ -178,7 +226,7 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_working_time_does_not_count_towards_stall(self):
         result, elapsed, _ = await self.wait_with_clock(
-            lambda t: inventory(4, "working" if 4 <= t < 8 else "full_output")
+            lambda t: inventory(4, "working" if 4 <= t < 8 else "no_ingredients")
         )
         self.assertTrue(payload(result)["stalled"])
         self.assertEqual(payload(result)["stalled_seconds"], 10)
@@ -302,6 +350,7 @@ class WaitForItemsTests(unittest.IsolatedAsyncioTestCase):
             "0.5 seconds",
             "qualities",
             "10 consecutive seconds",
+            "3 consecutive seconds of full_output",
             "valid_roles",
             "containers without status",
             *ITEMS_STALLED_HINTS,

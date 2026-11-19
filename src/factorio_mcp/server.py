@@ -118,6 +118,10 @@ PLACE_DESCRIPTION = (
     " fluid_connections with port position,"
     " target_position, direction, flow, fluidbox_index, and connected when present."
     " Inserters include actual pickup_position and drop_position as absolute map coordinates."
+    " When dropping onto a belt, drop_lane is left or right looking in the belt's direction"
+    " of travel: the lane farther from the inserter. Omitted for inserters directly ahead"
+    " of or behind the belt, where the side is ambiguous. Inserters on opposite sides of"
+    " one belt drop to opposite lanes, allowing two item types on separate lanes."
     " Mining drills include actual drop_position as absolute map coordinates: the tile where"
     " the drill outputs; put a chest, furnace or belt there."
     " Successful mining-drill placements include mining_area_resources as {name, tiles}"
@@ -197,11 +201,21 @@ MACHINE_STATUS_DESCRIPTION = (
 INVENTORY_MACHINE_DESCRIPTION = (
     " Chests with a slot limit include inventory_limit (usable slots); use set_inventory_limit"
     " to change or clear it."
+    " Owned belts (transport-belt, underground-belt, splitter) succeed with empty inventories."
+    " belt_items lists {name, quality, count} merged across all transport lines;"
+    " belt_lanes = {left: [...], right: [...]} separates lanes looking in the belt's direction"
+    " of travel, with the same item shape and name-then-quality order; empty lists are allowed."
+    " Underground surface and underground lines are merged per side; splitters merge both"
+    " channels and their split lines per side. observe_nearby includes only merged belt_items."
     " Owned inserter and mining-drill types without inventory roles also succeed within"
     " interact reach, with empty inventories; other unsupported entities return invalid_target."
     " Inserters include pickup_position, drop_position, and held_stack = {name, quality, count}"
     " only when holding an item. Inserters using filters also include filters (item names in"
     " slot order) and filter_mode; these fields are absent when use_filters is false."
+    " Inserters dropping onto belts include drop_lane (left or right looking in the belt's"
+    " direction of travel), the lane farther from the inserter. Omitted when directly ahead"
+    " of or behind the belt. Put inserters on opposite sides of one belt to put two item types"
+    " on opposite lanes; read belt_lanes to check the result."
     " Mining drills include drop_position and mining_target (resource name) when present."
     " Both retain direction and include status when available."
     " Owned electric-pole types also succeed within interact reach with empty inventories."
@@ -277,7 +291,11 @@ ROLE_ALIASES = {
 # Stopped states from Factorio 2.0.77 defines.entity_status. In particular,
 # low_power is not stopped: a machine may still make progress at reduced speed.
 ITEMS_STALLED_HINTS = {
-    "full_output": "Take products out or add an output inserter.",
+    "full_output": (
+        "The machine has stopped making products at the current count. "
+        "Take products out or add an output inserter; more are made only after products "
+        "are taken out or an output inserter removes them."
+    ),
     "full_burnt_result_output": "Take spent fuel out of the burnt result inventory.",
     "no_ingredients": "Supply materials to the machine's input inventory.",
     "item_ingredient_shortage": "Supply missing materials to the machine's input inventory.",
@@ -527,6 +545,12 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
             + "Walk near next_position and call place_line again from it to the original end; "
             "already placed tiles are skipped. Use place_entity if only one tile remains."
         )
+        if result.get("stopped") == "out_of_range" and result.get("stand_position"):
+            result["hint"] = (
+                "Use move_to with stand_position, then call place_line again from next_position "
+                "to the same end with the same end_direction. Use place_entity if only one "
+                "tile remains."
+            )
     batch_operations = {
         "transfer_items": "transfer_item",
         "place_entities": "place_entity",
@@ -548,6 +572,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     if "role_aliases" in result and not isinstance(result["role_aliases"], dict):
         result["role_aliases"] = {}
     for field in (
+        "belt_items",
         "collected_items",
         "ground_items",
         "returned_items",
@@ -558,6 +583,11 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     ):
         if field in result and not isinstance(result[field], list):
             result[field] = []
+    lanes = result.get("belt_lanes")
+    if isinstance(lanes, dict):
+        for side in ("left", "right"):
+            if not isinstance(lanes.get(side), list):
+                lanes[side] = []
     # Observation uses a filters object; inserter results/reads use an array.
     if operation in ("set_inserter_filter", "get_entity_inventory", "") and (
         "use_filters" in result or result.get("type") == "inserter"
@@ -957,6 +987,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and connection_type (normal or underground). "
             "Transport belts, underground-belt, and splitter include belt_items as "
             "{name, quality, count} entries merged across all transport lines. "
+            "Read get_entity_inventory(ies) for belt_lanes separated into left and right "
+            "looking in the belt's direction of travel; observe_nearby keeps only belt_items. "
             "Underground belts include underground_type and, when paired, neighbour = {x, y}. "
             "Splitters include input_priority, output_priority and filter only when different "
             "from defaults (none, none, no filter); these fields survive compact=true. "
@@ -1345,6 +1377,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "reports whether the whole line finished. Summary includes requested, placed, "
             "already_present, direction, first_position, last_position (if any), next_position "
             "and stopped/detail/hint on stop, and merged collected_items when picked up."
+            " On out_of_range, stand_position suggests a visible, clear character standing"
+            " position reaching the most remaining tiles among bounded candidates along both"
+            " sides and around the ends, with ties nearest the character. Candidates must reach"
+            " next_position and allow move_to arrival clearance; omitted when none fits."
+            " Use move_to with stand_position, then call place_line again from next_position"
+            " to the same end with the same end_direction."
             + LINE_END_DIRECTION_DESCRIPTION
             + WALK_WAIT_DESCRIPTION
         )
@@ -1662,10 +1700,17 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "hint warn when the character moved more than 0.5 tiles, possibly carried by a "
             "belt. Stand off belts before the next action. "
             "Returns early with stalled=true, stalled_seconds, and a status hint when the "
-            "count stays unchanged for 10 consecutive seconds in stopped states: "
-            + ", ".join(ITEMS_STALLED_HINTS)
+            "count stays unchanged for 10 consecutive seconds in stopped states other than "
+            "full_output: "
+            + ", ".join(status for status in ITEMS_STALLED_HINTS if status != "full_output")
             + ". Working states and containers without status never stall. "
-            "For full_output, take products out or add an output inserter; "
+            "For full_output with the count not reached, returns with stalled=true "
+            "and output_full=true after 3 consecutive seconds of full_output with the count "
+            "unchanged, including when this status first appears during the wait. "
+            "Any count change or other status resets this 3-second timer. "
+            "The machine has stopped making products at the current count; more are made only "
+            "after products are taken out or an output inserter removes them. "
+            "Take products out or add an output inserter; "
             "for ingredient shortages, supply materials; for no_fuel/no_power, supply fuel/power."
             " For low_power or no_power, read a nearby electric pole with get_entity_inventory"
             " to see production and consumption."
@@ -1690,6 +1735,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         unchanged_since = None
         last_count = None
         initial_products_finished = None
+        full_output_since = None
         try:
             while True:
                 response = await call("get_entity_inventory", {"target_ref": target_ref})
@@ -1751,9 +1797,15 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                         unchanged_since = now
                 else:
                     unchanged_since = None
+                if status == "full_output" and not reached:
+                    if full_output_since is None or current != last_count:
+                        full_output_since = now
+                else:
+                    full_output_since = None
                 last_count = current
                 stalled_seconds = now - unchanged_since if unchanged_since is not None else 0
-                stalled = stalled_seconds >= 10
+                output_full = full_output_since is not None and now - full_output_since >= 3
+                stalled = output_full if status == "full_output" else stalled_seconds >= 10
                 if reached or stalled or waited >= timeout_seconds:
                     result = {
                         "target_ref": target_ref,
@@ -1774,6 +1826,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                     if stalled:
                         result["stalled_seconds"] = stalled_seconds
                         result["hint"] = ITEMS_STALLED_HINTS[status]
+                    if output_full:
+                        result["output_full"] = True
                     if not reached:
                         try:
                             diagnostics = _success_value(
