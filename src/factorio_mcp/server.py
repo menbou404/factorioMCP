@@ -14,7 +14,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
 from mcp.types import CallToolResult, InputRequiredResult, TextContent
-from pydantic import BaseModel, BeforeValidator, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, BeforeValidator, Field, ValidationError
 
 from .bridge import BridgeError, FactorioBridge
 
@@ -31,6 +31,19 @@ FilterNames = Annotated[
 ]
 InserterFilters = Annotated[
     list[Annotated[str, Field(min_length=1, strict=True)]], Field(max_length=5, strict=True)
+]
+
+
+def _unique_target_refs(value: list[str]) -> list[str]:
+    if len(set(value)) != len(value):
+        raise ValueError("target_refs must not contain duplicates.")
+    return value
+
+
+MiningTargetRefs = Annotated[
+    list[Annotated[str, Field(min_length=1, strict=True)]],
+    Field(min_length=1, max_length=32, strict=True, json_schema_extra={"uniqueItems": True}),
+    AfterValidator(_unique_target_refs),
 ]
 
 
@@ -82,6 +95,7 @@ WALK_WAIT_OPERATIONS = {
     "transfer_item",
     "transfer_items",
     "mine_entity",
+    "mine_entities",
     "move_to",
 }
 WALK_WAIT_DESCRIPTION = (
@@ -202,6 +216,13 @@ MACHINE_STATUS_DESCRIPTION = (
 )
 
 INVENTORY_MACHINE_DESCRIPTION = (
+    " Owned steam-engine generators, offshore-pump, pipe, pipe-to-ground, storage-tank"
+    " and pump also support status-only reads with empty inventories. Boilers retain fuel."
+    " Fluidboxes include fluids = [{index, name, amount, capacity, temperature}], including"
+    " empty boxes (amount=0, name and temperature omitted). Generators include power_output_kw:"
+    " energy_generated_last_tick * 60 / 1000, the last tick's output in kW; idle/no-steam is 0."
+    " When power stops, inspect the boiler for water, steam and fuel, then the steam engine"
+    " for steam and power_output_kw."
     " Chests with a slot limit include inventory_limit (usable slots); use set_inventory_limit"
     " to change or clear it."
     " Owned belts (transport-belt, underground-belt, splitter) succeed with empty inventories."
@@ -231,7 +252,8 @@ INVENTORY_MACHINE_DESCRIPTION = (
 
 RUNNING_WALK_HINT = (
     "The next placement (place_entity, place_entities, place_line), transfer_item(s), "
-    "mine_entity or move_to automatically waits up to 15 seconds for this walk to finish, "
+    "mine_entity, mine_entities or move_to automatically waits up to 15 seconds "
+    "for this walk to finish, "
     "returning waited_for_walk; a still-running walk returns action_conflict. "
     "For longer walks, call wait_for_action with this action_id: {action_id}."
 )
@@ -362,7 +384,8 @@ HINTS = {
     "action_conflict": (
         "Wait for detail.running_action with wait_for_action, or stop it with cancel_action. "
         "Only one craft at a time and one walk/mine at a time; crafting can run alongside either. "
-        "place_entity, place_entities, place_line, transfer_item(s), mine_entity and move_to "
+        "place_entity, place_entities, place_line, transfer_item(s), mine_entity, mine_entities "
+        "and move_to "
         "automatically wait up to 15 seconds for a running walk and retry once, returning "
         "waited_for_walk = {action_id, status, seconds}. Longer walks need wait_for_action. "
         "A running mine conflicts immediately; placement and transfers are allowed while crafting. "
@@ -531,6 +554,16 @@ def _normalize_batch_result(result: dict[str, Any], operation: str | None = None
 
 
 def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
+    if operation == "mine_entities" or result.get("type") == "mine_entities":
+        if "gained" in result and not isinstance(result["gained"], list):
+            result["gained"] = []
+        detail = result.get("detail")
+        if (
+            isinstance(detail, dict)
+            and "gained" in detail
+            and not isinstance(detail["gained"], list)
+        ):
+            detail["gained"] = []
     if operation == "set_inventory_limit" or (
         operation == "" and {"slots", "name", "position", "target_ref"} <= result.keys()
     ):
@@ -591,6 +624,7 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         "recipe_products",
         "mining_area_resources",
         "stand_positions",
+        "fluids",
     ):
         if field in result and not isinstance(result[field], list):
             result[field] = []
@@ -1263,7 +1297,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Without within, if terrain or an entity prevents standing at the goal, walk to "
             "a standable spot within 10 tiles instead. The start result, running detail and "
             "final result include goal_adjusted (the actual goal) and original_goal "
-            "(the requested goal). With within set, the original goal is used unchanged. "
+            "(the requested goal). If the character box at the adjusted goal overlaps a "
+            "transport-belt, underground-belt or splitter, prefer a non-belt standable spot "
+            "within 3 tiles, reported through the same goal_adjusted and original_goal fields. "
+            "With within set, the original goal is used unchanged; on arrival on a belt, "
+            "continue a short walk to a non-belt standable point within the radius when one "
+            "is found within 3 tiles. Searches are bounded on a quarter-tile grid. "
             "Set within (0.5-10 tiles) to stop when the character centre is within that "
             "Euclidean distance of the goal; the pathfinder uses the same radius. "
             "Use within = the needed reach (e.g. reach.interact from observe_nearby) to walk "
@@ -1334,6 +1373,30 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         return await start_action(
             "mine_entity", {"target_ref": target_ref, "count": count}, wait_seconds
         )
+
+    @server.tool(
+        description=(
+            "Mine 1-32 unique observed target_refs in the given order over normal game time, "
+            "without walking. Uses the same reach, ownership, minable and inventory checks "
+            "as mine_entity. Resources are rejected up front as invalid_input with "
+            "detail.errors naming each index (1-based); mine ore with mine_entity. Trees "
+            "and rocks are allowed. To rebuild a belt line, mine_entities the old tiles in "
+            "one call, then place_line. Shares the walk/mine slot; crafting can run alongside. "
+            "The first failure stops the batch with status=failed, following mine_entity, "
+            "including targets already gone before their turn (no skips). Returns mined, "
+            "requested, gained (merged {name, quality, count} item products), current_index "
+            "and stopped={index, target_ref, reason, detail} when stopped. Progress is also "
+            "in running get_action_status/wait_for_action; cancel_action preserves progress. "
+            "Prefer wait_seconds (1-50) to start and wait; timeouts leave the action running "
+            "with timed_out=true and action_id. Continue with wait_for_action. Automatic "
+            "walk wait plus wait_seconds is capped at 50 seconds." + WALK_WAIT_DESCRIPTION
+        )
+    )
+    async def mine_entities(
+        target_refs: MiningTargetRefs,
+        wait_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] | None = None,
+    ) -> CallToolResult:
+        return await start_action("mine_entities", {"target_refs": target_refs}, wait_seconds)
 
     @server.tool(
         description=(
@@ -1986,6 +2049,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Walking lines include progress and all final line fields. "
             "Running mining reports detail.gained and detail.count; "
             "detail.estimated_seconds estimates the remaining mining time when computable; "
+            "mine_entities instead reports mined, requested, current_index, merged gained "
+            "items and stopped when present, both at top level and in detail; "
             "running crafting reports detail.count and detail.remaining."
         )
     )
@@ -2001,6 +2066,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "to save a call; use wait_for_action to continue waiting after a timeout. "
             "A timeout returns the last running status "
             "and leaves the action running. Running mining reports detail.gained and detail.count; "
+            "mine_entities reports mined, requested, current_index, merged gained items "
+            "and stopped when present, both at top level and in detail; "
             "running walks include remaining_distance (straight-line tiles, rounded to 2 decimals) "
             "and a hint about the automatic walk wait before placing or transferring. "
             "The next placement, transfer, mine or move waits up to 15 seconds for this walk "
