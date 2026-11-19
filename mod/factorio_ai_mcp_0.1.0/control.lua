@@ -66,6 +66,14 @@ local INVENTORY_ROLES = {
   ["assembling-machine-1"] = {source = defines.inventory.crafter_input,
                               result = defines.inventory.crafter_output}
 }
+local STATUS_ONLY_ENTITIES = {
+  ["steam-engine"] = true, ["steam-turbine"] = true, ["offshore-pump"] = true,
+  ["pipe"] = true, ["pipe-to-ground"] = true, ["storage-tank"] = true, ["pump"] = true,
+  ["inserter"] = true, ["long-handed-inserter"] = true, ["electric-mining-drill"] = true,
+  ["small-electric-pole"] = true, ["medium-electric-pole"] = true,
+  ["big-electric-pole"] = true, ["substation"] = true,
+  ["transport-belt"] = true, ["underground-belt"] = true, ["splitter"] = true
+}
 local ROLE_ALIASES = {
   ["stone-furnace"] = {input = "source", output = "result"},
   ["assembling-machine-1"] = {input = "source", output = "result"},
@@ -222,6 +230,24 @@ local function is_belt(entity)
          entity.type == "splitter"
 end
 
+local function overlaps_belt(character, position)
+  local box = character.prototype.collision_box
+  local area = {left_top = {x = position.x + box.left_top.x, y = position.y + box.left_top.y},
+                right_bottom = {x = position.x + box.right_bottom.x, y = position.y + box.right_bottom.y}}
+  for _, belt in pairs(character.surface.find_entities_filtered{
+    area = area, type = {"transport-belt", "underground-belt", "splitter"}
+  }) do
+    if belt.valid then
+      local bounds = belt.bounding_box
+      if bounds.left_top.x < area.right_bottom.x and bounds.right_bottom.x > area.left_top.x and
+         bounds.left_top.y < area.right_bottom.y and bounds.right_bottom.y > area.left_top.y then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 local function belt_contents(entity, include_lanes)
   if not is_belt(entity) then return nil, nil end
   -- 2.0.77 defines.transport_line names the side relative to travel. Merge
@@ -329,10 +355,61 @@ local function mining_inventory_count(character, product_names)
   return count
 end
 
+local function mining_item_counts(character, product_names)
+  local counts = {}
+  local function add(name, quality, count)
+    if not product_names or product_names[name] then
+      local key = name .. "\t" .. quality
+      counts[key] = counts[key] or {name = name, quality = quality, count = 0}
+      counts[key].count = counts[key].count + count
+    end
+  end
+  for _, item in pairs(character.get_main_inventory().get_contents()) do
+    add(item.name, item.quality, item.count)
+  end
+  for _, item in ipairs(character.crafting_queue or {}) do
+    local recipe = character.force.recipes[item.recipe]
+    if recipe and not item.prerequisite then
+      for _, product in pairs(recipe.products) do
+        if product.type == "item" then
+          add(product.name, item.quality or "normal", item.count * (product.amount or 0))
+        end
+      end
+    end
+  end
+  return counts
+end
+
+local function update_batch_gained(character, action)
+  if not action.batch or not action.batch_inventory or not character or not character.valid or
+     not character.get_main_inventory() then return end
+  local current = mining_item_counts(character, action.product_names)
+  for key, item in pairs(current) do
+    local previous = action.batch_inventory and action.batch_inventory[key]
+    local gained = math.max(0, item.count - (previous and previous.count or 0))
+    if gained > 0 then
+      local total = action.batch.gained[key] or {name = item.name, quality = item.quality, count = 0}
+      total.count = total.count + gained
+      action.batch.gained[key] = total
+    end
+  end
+  action.batch_inventory = current
+end
+
+local function batch_mine_result(action)
+  local batch, gained = action.batch, {}
+  for _, key in ipairs(sorted_keys(batch.gained)) do gained[#gained + 1] = batch.gained[key] end
+  return {mined = batch.mined, requested = #batch.refs, current_index = batch.index,
+          gained = gained, stopped = batch.stopped}
+end
+
 local function adjust_mining_inventory(state, before)
   if before and state.action and state.action.type == "mine" then
     state.action.last_inventory_count = state.action.last_inventory_count +
       mining_inventory_count(state.character, state.action.product_names) - before
+    if state.action.batch then
+      state.action.batch_inventory = mining_item_counts(state.character, state.action.product_names)
+    end
   end
 end
 
@@ -396,9 +473,20 @@ local function adjusted_goal_detail(action, detail)
 end
 
 local advance_place_line -- Continues a line after the shared move machinery arrives.
+local advance_batch_mine
+local belt_free_position
 local function finish_action(state, slot, status, error_code, detail)
   local action = state[slot]
   if not action then return end
+  if action.batch then
+    update_batch_gained(state.character, action)
+    if status == "succeeded" and advance_batch_mine(state, action) then return end
+    if status ~= "succeeded" then
+      action.batch.stopped = {index = action.batch.index,
+        target_ref = action.batch.refs[action.batch.index], reason = error_code, detail = detail}
+    end
+    detail = batch_mine_result(action)
+  end
   if action.line_result and not action.line_finished then
     stop_character(state.character)
     state.path_request_id = nil
@@ -412,7 +500,7 @@ local function finish_action(state, slot, status, error_code, detail)
   if action.type == "move" or action.type == "mine" then
     stop_character(state.character)
   end
-  if action.type == "mine" and status ~= "succeeded" then
+  if action.type == "mine" and not action.batch and status ~= "succeeded" then
     detail = mine_partial_detail(state.character, action, detail)
   end
   if action.type == "move" and (error_code == "blocked" or error_code == "timeout") and
@@ -445,14 +533,14 @@ local function finish_action(state, slot, status, error_code, detail)
   }
   if action.type == "move" and not action.line_result and status == "succeeded" and
      valid_character(state) then
-    -- A point query tests the final position against belt collision boxes, any force.
-    local belts = state.character.surface.find_entities_filtered{
-      position = state.character.position, type = {"transport-belt", "underground-belt", "splitter"}
-    }
-    if #belts > 0 then
+    if overlaps_belt(state.character, state.character.position) then
       completed.standing_on_belt = true
       completed.hint = "Stand off belts before the next action; belts can carry the character."
     end
+  end
+  if action.batch then
+    for key, value in pairs(batch_mine_result(action)) do completed[key] = value end
+    completed.type = "mine_entities"
   end
   completed.line_result = action.line_result
   state.last_action = completed
@@ -472,6 +560,18 @@ local function finish_move_within(state)
      not valid_character(state) then return false end
   if distance_squared(state.character.position, action.goal) > action.within * action.within then
     return false
+  end
+  if not action.line_result and overlaps_belt(state.character, state.character.position) then
+    if not action.belt_step_searched then
+      action.belt_step_searched = true
+      action.belt_step = belt_free_position(state.character, state.character.position,
+                                            action.goal, action.within)
+      if action.belt_step then
+        action.belt_step_pending = true
+        action.path = nil
+      end
+    end
+    if action.belt_step then return false end
   end
   finish_action(state, "action", "succeeded", nil, {position = position_data(state.character)})
   return true
@@ -513,7 +613,8 @@ local function status(state)
     inventory = inventory_contents(character),
     crafting_queue_size = character.crafting_queue_size,
     action = state.action and {id = state.action.id, action_id = state.action.id,
-      type = state.action.line_result and "place_line" or state.action.type, status = state.action.status} or nil,
+      type = state.action.batch and "mine_entities" or
+        (state.action.line_result and "place_line" or state.action.type), status = state.action.status} or nil,
     craft_action = state.craft_action and {id = state.craft_action.id,
       action_id = state.craft_action.id,
       type = state.craft_action.type, status = state.craft_action.status} or nil
@@ -689,6 +790,36 @@ local function path_not_found_detail(character, goal, action)
   return detail
 end
 
+-- Bounded quarter-tile lattice, nearest first (at most 441 candidates).
+-- Check the real character box and collision mask, without requiring buildability.
+belt_free_position = function(character, center, within_goal, within)
+  local candidates = {}
+  for x = -12, 12 do
+    for y = -12, 12 do
+      local d = (x * x + y * y) / 16
+      if d > 0 and d <= 9 then
+        local position = {x = center.x + x / 4, y = center.y + y / 4}
+        -- Leave a walking-step margin inside the requested arrival disk.
+        if not within or distance_squared(position, within_goal) <= (within - 0.15) ^ 2 then
+          candidates[#candidates + 1] = {position = position, distance = d}
+        end
+      end
+    end
+  end
+  table.sort(candidates, function(a, b)
+    if a.distance ~= b.distance then return a.distance < b.distance end
+    if a.position.x ~= b.position.x then return a.position.x < b.position.x end
+    return a.position.y < b.position.y
+  end)
+  for _, candidate in ipairs(candidates) do
+    local position = candidate.position
+    if not overlaps_belt(character, position) then
+      local tiles, entities = goal_obstacles(character, position)
+      if #tiles == 0 and #entities == 0 then return position end
+    end
+  end
+end
+
 local function path_start_blocked(character)
   -- Include touching edges and fixed-point rounding, not just strict overlaps.
   local box = character.bounding_box
@@ -722,6 +853,8 @@ end
 
 local function request_path(state, character, goal, explicit_start)
   local action = state.action
+  goal = action.belt_step or goal
+  action.belt_step_pending = nil
   action.path = nil
   action.path_index = 1
   action.stuck_ticks = 0
@@ -746,7 +879,9 @@ local function request_path(state, character, goal, explicit_start)
     start = start,
     goal = goal,
     force = character.force,
-    radius = action.within, -- double; nil preserves the API's default radius of 1.
+    -- A belt step uses ordinary point-walk pathfinding (default radius 1),
+    -- then steering reaches the safe point. Tiny radii can miss the path grid.
+    radius = not action.belt_step and action.within or nil,
     entity_to_ignore = character,
     -- Cached paths can still cross structures built since the previous request.
     pathfind_flags = {cache = false},
@@ -791,7 +926,7 @@ local function do_move(state, params)
   if distance_squared(character.position, goal) > 128 * 128 then
     return nil, "out_of_range", range_detail(character, goal, 128)
   end
-  local original_goal, goal_adjusted
+  local original_goal, goal_adjusted, belt_goal_adjusted
   if params.within == nil then
     -- Use the path diagnostic's character collision mask, ignoring this character
     -- itself so moving to the current position does not spuriously adjust the goal.
@@ -803,10 +938,19 @@ local function do_move(state, params)
       goal = {x = free.x, y = free.y}
       goal_adjusted = goal
     end
+    if overlaps_belt(character, goal) then
+      local free = belt_free_position(character, goal)
+      if free then
+        original_goal = original_goal or goal
+        goal, goal_adjusted = free, free
+        belt_goal_adjusted = true
+      end
+    end
   end
   local result = begin_action(state, "action", {
     type = "move", goal = goal, within = params.within, path = nil, path_index = 1,
     original_goal = original_goal, goal_adjusted = goal_adjusted,
+    belt_goal_adjusted = belt_goal_adjusted,
     last_x = character.position.x, last_y = character.position.y,
     stuck_ticks = 0, retries = 0
   })
@@ -830,10 +974,7 @@ local function do_move(state, params)
   return result
 end
 
-local function do_mine(state, params)
-  local character, err = require_character(state)
-  if not character then return nil, err end
-  if state.action then return nil, "action_conflict", conflict_detail(state.action, state.character) end
+local function prepare_mine(character, params)
   local count = params.count or 1
   if type(count) ~= "number" or count < 1 or count > 100 or count % 1 ~= 0 then
     return nil, "invalid_input"
@@ -871,14 +1012,82 @@ local function do_mine(state, params)
     character.selected = nil
     return nil, "invalid_target", {entity = target.name, reason = "not_selectable"}
   end
-  local result = begin_action(state, "action", {
+  return {
     type = "mine", target = target, reach = reach, goal_count = count, gained = 0,
     last_inventory_count = before, product_names = product_names,
     target_is_resource = target.type == "resource",
     last_progress_tick = game.tick
-  })
-  character.mining_state = {mining = true, position = target.position}
+  }
+end
+
+local function do_mine(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action, character) end
+  local action, mine_error, detail = prepare_mine(character, params)
+  if not action then return nil, mine_error, detail end
+  local result = begin_action(state, "action", action)
+  character.mining_state = {mining = true, position = action.target.position}
   result.estimated_seconds = mining_estimated_seconds(character, state.action)
+  return result
+end
+
+advance_batch_mine = function(state, action)
+  local batch = action.batch
+  batch.mined = batch.mined + 1
+  stop_character(state.character)
+  if batch.index == #batch.refs then return false end
+  batch.index = batch.index + 1
+  local next_action, err, detail = prepare_mine(state.character, {target_ref = batch.refs[batch.index]})
+  if not next_action then
+    finish_action(state, "action", "failed", err, detail)
+    return true
+  end
+  for key, value in pairs(next_action) do action[key] = value end
+  action.batch_inventory = mining_item_counts(state.character, action.product_names)
+  state.character.mining_state = {mining = true, position = action.target.position}
+  return true
+end
+
+local function do_mine_entities(state, params)
+  local character, err = require_character(state)
+  if not character then return nil, err end
+  if state.action then return nil, "action_conflict", conflict_detail(state.action, character) end
+  local refs, seen, errors = params.target_refs, {}, {}
+  if type(refs) ~= "table" or #refs < 1 or #refs > 32 then return nil, "invalid_input" end
+  local count = 0
+  for index, ref in pairs(refs) do
+    count = count + 1
+    if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or index > #refs or
+       type(ref) ~= "string" or #ref == 0 or seen[ref] then
+      errors[#errors + 1] = {index = index, field = "target_refs", reason = "invalid_or_duplicate_ref"}
+    else
+      seen[ref] = true
+      local entry = state.targets[ref]
+      local entity = entry and entry.entity
+      -- Validation does not expose any unseen world data: inspect registered refs only.
+      if entity and entity.valid and entity.type == "resource" then
+        errors[#errors + 1] = {index = index, field = "target_refs", reason = "resource_not_allowed"}
+      end
+    end
+  end
+  if count ~= #refs or #errors > 0 then return nil, "invalid_input", {errors = errors} end
+  local result = begin_action(state, "action", {type = "mine",
+    batch = {refs = refs, index = 1, mined = 0, gained = {}}})
+  local action = state.action
+  local first, mine_error, detail = prepare_mine(character, {target_ref = refs[1]})
+  if not first then
+    finish_action(state, "action", "failed", mine_error, detail)
+    result.status = "failed"
+    result.error = mine_error
+    result.detail = state.last_action.detail
+  else
+    for key, value in pairs(first) do action[key] = value end
+    action.batch_inventory = mining_item_counts(character, action.product_names)
+    character.mining_state = {mining = true, position = action.target.position}
+  end
+  for key, value in pairs(batch_mine_result(action)) do result[key] = value end
+  result.type = "mine_entities"
   return result
 end
 
@@ -3003,10 +3212,16 @@ local function get_entity_inventory(character, params, allow_status_only)
   -- the existing unsupported_entity error, including its supported-entity list.
   if not roles and allow_status_only and
      (target.type == "inserter" or target.type == "mining-drill" or
-      target.type == "electric-pole" or is_belt(target)) then roles = {} end
+      target.type == "electric-pole" or target.type == "generator" or
+      STATUS_ONLY_ENTITIES[target.name] or is_belt(target)) then roles = {} end
   if not roles then
+    local supported = {}
+    for name in pairs(INVENTORY_ROLES) do supported[name] = true end
+    if allow_status_only then
+      for name in pairs(STATUS_ONLY_ENTITIES) do supported[name] = true end
+    end
     return nil, nil, "invalid_target", {entity = target.name, reason = "unsupported_entity",
-                                       supported_entities = sorted_keys(INVENTORY_ROLES)}
+                                       supported_entities = sorted_keys(supported)}
   end
   if not character.can_reach_entity(target) then
     return nil, nil, "out_of_range", range_detail(character, target.position, character.reach_distance)
@@ -3077,6 +3292,17 @@ local function do_entity_inventory(state, params)
     if inventory and inventory.valid then inventories[role] = inventory.get_contents() end
   end
   local status, recipe, missing = inventory_entity_state(target)
+  local fluids = {}
+  local fluidbox = target.fluidbox
+  for index = 1, #fluidbox do
+    local fluid = fluidbox[index]
+    fluids[#fluids + 1] = {index = index, name = fluid and fluid.name,
+      amount = fluid and fluid.amount or 0, capacity = fluidbox.get_capacity(index),
+      temperature = fluid and fluid.temperature}
+  end
+  -- 2.0.77 LuaEntity.energy_generated_last_tick is joules generated last tick.
+  -- Convert at 60 ticks/s to kW. Idle/no-steam generators explicitly report zero.
+  local power_output_kw = target.type == "generator" and target.energy_generated_last_tick * 60 / 1000 or nil
   local belt_items, belt_lanes = belt_contents(target, true)
   local products_finished, products_since_recipe, recipe_products, recipe_product_amounts
   if target.type == "assembling-machine" or target.type == "furnace" then
@@ -3116,6 +3342,7 @@ local function do_entity_inventory(state, params)
     if resource and resource.valid then mining_target = resource.name end
   end
   return {name = target.name, type = target.type,
+          fluids = #fluids > 0 and fluids or nil, power_output_kw = power_output_kw,
           inventories = inventories, status = status, recipe = recipe, missing_ingredients = missing,
           products_finished = products_finished, recipe_products = recipe_products,
           products_since_recipe = products_since_recipe,
@@ -3322,7 +3549,10 @@ local function do_action_status(state, params)
   if not action or action.id ~= params.action_id then return nil, "action_not_found" end
   local detail = action.detail
   if action.status == "running" then
-    if action.type == "mine" then
+    if action.batch then
+      update_batch_gained(state.character, action)
+      detail = batch_mine_result(action)
+    elseif action.type == "mine" then
       detail = {gained = mine_partial_detail(state.character, action).gained,
                 count = action.goal_count,
                 estimated_seconds = mining_estimated_seconds(state.character, action)}
@@ -3340,8 +3570,9 @@ local function do_action_status(state, params)
       detail = adjusted_goal_detail(action, detail)
     end
   end
-  return line_action_result(action, adjusted_goal_detail(action, {
-    action_id = action.id, type = action.line_result and "place_line" or action.type, status = action.status,
+  local result = line_action_result(action, adjusted_goal_detail(action, {
+    action_id = action.id, type = action.batch and "mine_entities" or
+      (action.line_result and "place_line" or action.type), status = action.status,
     remaining_distance = action.status == "running" and
                          remaining_walk_distance(action, state.character) or nil,
     error = action.error, detail = detail,
@@ -3350,6 +3581,12 @@ local function do_action_status(state, params)
                (valid_character(state) and position_data(state.character) or nil) or
                action.position
   }))
+  if action.batch or action.type == "mine_entities" then
+    for key, value in pairs(action.batch and batch_mine_result(action) or action.detail or {}) do
+      result[key] = value
+    end
+  end
+  return result
 end
 
 local function do_cancel(state, params)
@@ -3406,6 +3643,7 @@ local handlers = {
   end,
   move_to = do_move,
   mine_entity = do_mine,
+  mine_entities = do_mine_entities,
   craft = do_craft,
   place_entity = do_place,
   place_line = do_place_line,
@@ -3463,7 +3701,7 @@ commands.add_command("ai_mcp", "AI MCP bridge (RCON only)", function(command)
     error = (not ok) and "internal_error" or err,
     detail = ok and err ~= nil and detail or nil
   })
-  if request.operation == "move_to" or request.operation == "mine_entity" or
+  if request.operation == "move_to" or request.operation == "mine_entity" or request.operation == "mine_entities" or
      request.operation == "cancel_action" or request.operation == "craft" or
      request.operation == "place_entity" or request.operation == "transfer_item" or
      request.operation == "place_entities" or request.operation == "place_line" or
@@ -3528,6 +3766,7 @@ script.on_event(defines.events.on_script_path_request_finished, function(event)
     return
   end
   if finish_move_within(state) then return end
+  if state.action.belt_step_pending then return end
   if event.try_again_later then
     state.action.retries = state.action.retries + 1
     if state.action.retries > 3 then
@@ -3582,9 +3821,12 @@ local function tick_action(state, slot)
       return
     end
     if finish_move_within(state) then return end
+    if action.belt_step_pending then request_path(state, character, action.goal); return end
     if not action.path then return end
-    local d = math.sqrt(distance_squared(character.position, action.goal))
-    if d <= MOVE_ARRIVAL_RADIUS then
+    local walk_goal = action.belt_step or action.goal
+    local d = math.sqrt(distance_squared(character.position, walk_goal))
+    if action.within == nil and d <= MOVE_ARRIVAL_RADIUS and
+       (not action.belt_goal_adjusted or not overlaps_belt(character, character.position)) then
       finish_action(state, slot, "succeeded", nil, {position = position_data(character)})
       return
     end
@@ -3605,7 +3847,8 @@ local function tick_action(state, slot)
         action.final_progress_tick = game.tick
       end
       if game.tick - action.final_progress_tick >= 60 then
-        if d <= MOVE_BLOCKED_ARRIVAL_RADIUS then
+        if not action.belt_step and d <= MOVE_BLOCKED_ARRIVAL_RADIUS and
+           (not action.belt_goal_adjusted or not overlaps_belt(character, character.position)) then
           finish_action(state, slot, "succeeded", nil,
             {position = position_data(character), distance = d, goal_blocked = true})
         else
@@ -3616,7 +3859,7 @@ local function tick_action(state, slot)
     end
     -- An adjusted path start can be up to 2 tiles away: walk to its first
     -- waypoint as usual. The progress timers and shared retry cap still apply.
-    local destination = waypoint and waypoint.position or action.goal
+    local destination = waypoint and waypoint.position or walk_goal
     local dx = destination.x - character.position.x
     local dy = destination.y - character.position.y
     local previous = action.path[action.path_index - 1]
@@ -3643,6 +3886,7 @@ local function tick_action(state, slot)
       end
     end
   elseif action.type == "mine" then
+    update_batch_gained(character, action)
     local inventory = character.get_main_inventory()
     if not inventory then
       finish_action(state, slot, "failed", "inventory_full")

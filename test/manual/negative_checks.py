@@ -2847,8 +2847,9 @@ def main():
             "direction=0,force=c.force};assert(b.inserter);b.inserter.active=false;"
             'assert(s.create_entity{name="burner-inserter",position={5.5,3.5},force=c.force});'
             'assert(s.create_entity{name="burner-mining-drill",position={-2,-4},force=c.force});'
-            'local pipe=s.create_entity{name="pipe",position={0.5,0.5},force=c.force};'
-            "assert(pipe and c.can_reach_entity(pipe));"
+            # Walls remain unsupported by inventory reads after M37's fluid diagnostics.
+            'local wall=s.create_entity{name="stone-wall",position={0.5,0.5},force=c.force};'
+            "assert(wall and c.can_reach_entity(wall));"
             'assert(s.create_entity{name="electric-mining-drill",position={13.5,3.5},'
             "force=c.force});"
             'assert(s.create_entity{name="inserter",position={6.5,3.5},force="enemy"});'
@@ -2880,13 +2881,13 @@ def main():
 
         near = bridge.call(
             "observe_nearby",
-            {"names": ["electric-mining-drill", "inserter", "pipe"]},
+            {"names": ["electric-mining-drill", "inserter", "stone-wall"]},
         )["result"]["entities"]
         drill = next(e for e in near if e["name"] == "electric-mining-drill" and e["x"] < 0)
         far_drill = next(e for e in near if e["name"] == "electric-mining-drill" and e["x"] > 10)
         inserter = next(e for e in near if e["name"] == "inserter" and e["owned"])
         enemy = next(e for e in near if e["name"] == "inserter" and not e["owned"])
-        pipe = next(e for e in near if e["name"] == "pipe" and e["owned"])
+        wall = next(e for e in near if e["name"] == "stone-wall" and e["owned"])
         refs = [drill["target_ref"], inserter["target_ref"]]
         reads = [bridge.call("get_entity_inventory", {"target_ref": ref})["result"] for ref in refs]
         for entity, result in zip((drill, inserter), reads, strict=True):
@@ -2964,7 +2965,7 @@ def main():
                 errors[label].detail["reason"] == "unsupported_entity",
             )
         for label, entity, code in (
-            ("M26 reachable pipe remains unsupported", pipe, "invalid_target"),
+            ("M26 reachable stone-wall remains unsupported", wall, "invalid_target"),
             ("M26 distant drill remains out of range", far_drill, "out_of_range"),
             ("M26 enemy inserter remains forbidden", enemy, "invalid_target"),
         ):
@@ -2972,8 +2973,8 @@ def main():
                 label, "get_entity_inventory", {"target_ref": entity["target_ref"]}, {code}
             )
         record(
-            "M26 pipe rejection retains unsupported_entity reason",
-            errors["M26 reachable pipe remains unsupported"].detail.get("reason")
+            "M26 stone-wall rejection retains unsupported_entity reason",
+            errors["M26 reachable stone-wall remains unsupported"].detail.get("reason")
             == "unsupported_entity",
         )
         record(
@@ -3429,11 +3430,11 @@ def main():
             m28_tool("move_to", {"surface": m28_surface, "x": 8.5, "y": 0.3, "wait_seconds": 20})
         )
         record(
-            "M28 move_to ending on a neutral belt warns to stand off belts",
+            "M28/M37 move_to adjusts a neutral belt goal and finishes off belts",
             not is_error
             and belt_move.get("status") == "succeeded"
-            and belt_move.get("standing_on_belt") is True
-            and "belt" in belt_move.get("hint", ""),
+            and belt_move.get("goal_adjusted")
+            and not belt_move.get("standing_on_belt"),
             json.dumps(belt_move),
         )
         started = bridge.call("move_to", {"surface": m28_surface, "x": 0.5, "y": 4.5})["result"]
@@ -5747,6 +5748,283 @@ def main():
             restored.get("restored") is True
             and bridge.call("get_inventory")["result"]["items"] == m36_inventory
             and bridge.call("get_agent_status")["result"]["position"] == m36_position,
+        )
+
+    # M37 CK/CL/CM: all creation, item supply and teleports are fixture-only RCON.
+    m37_surface = "m37-belt-batch-fluid-fixture"
+    m37_server = create_server(bridge)
+    m37_inventory = bridge.call("get_inventory")["result"]["items"]
+    m37_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m37_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m37_surface}";local s=game.surfaces[name];'
+            "local b=storage.m37_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m37:" not in raw:
+            raise RuntimeError("M37 fixture failed: " + raw)
+        return json.loads(raw.split("m37:", 1)[1].strip())
+
+    async def m37_tool(name, args):
+        response = await m37_server.call_tool(name, args)
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    def m37_action(name, args):
+        value = asyncio.run(m37_tool(name, {**args, "wait_seconds": 20}))
+        if value.get("status") == "running":
+            value = asyncio.run(
+                m37_tool(
+                    "wait_for_action", {"action_id": value["action_id"], "timeout_seconds": 50}
+                )
+            )
+        assert value.get("status") != "running", value
+        return value
+
+    def m37_refs(names):
+        entities = bridge.call("observe_nearby", {"names": names})["result"]["entities"]
+        return {(e["name"], e["x"], e["y"]): e["target_ref"] for e in entities}
+
+    try:
+        m37_fixture(
+            "assert(not s and not b,'M37 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,selected=c.selected,"
+            "inventory=game.create_inventory(#inv),saved={},fields={'targets','owned_refs',"
+            "'recipe_baselines','last_observation','recent_observations','explored_map',"
+            "'last_action','completed_actions','completed_order','processed','processed_order',"
+            "'next_target_id','next_action_id'}};storage.m37_backup=b;"
+            "for _,key in ipairs(b.fields) do b.saved[key]=state[key] end;"
+            "for _,key in ipairs({'targets','owned_refs','recipe_baselines','recent_observations',"
+            "'explored_map','completed_actions','completed_order','processed','processed_order'}) "
+            "do state[key]={} end;state.last_observation=nil;state.last_action=nil;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=96,height=64});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},2);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-48,47 do for y=-32,31 do "
+            "tiles[#tiles+1]={name='grass-1',position={x,y}} end end;s.set_tiles(tiles);"
+            "assert(c.teleport({8.5,4.5},s));"
+            "local belt=s.create_entity{name='transport-belt',position={8.5,0.5},force='neutral'};"
+            "assert(belt);belt.active=false;rcon.print('m37:{}')"
+        )
+        moved = m37_action("move_to", {"surface": m37_surface, "x": 8.5, "y": 0.5})
+        record(
+            "M37 CK belt-centre goal adjusts and finishes off belts",
+            moved["status"] == "succeeded"
+            and moved.get("original_goal") == {"x": 8.5, "y": 0.5}
+            and moved.get("goal_adjusted")
+            and not moved.get("standing_on_belt"),
+            json.dumps(moved),
+        )
+        m37_fixture("assert(c.teleport({8.5,0.5},s));rcon.print('m37:{}')")
+        within = m37_action("move_to", {"surface": m37_surface, "x": 8.5, "y": 0.5, "within": 2})
+        record(
+            "M37 CK within arrival walks off the belt while staying inside the radius",
+            within["status"] == "succeeded"
+            and within["detail"]["distance"] <= 2
+            and within["detail"]["within"] == 2
+            and not within.get("standing_on_belt"),
+            json.dumps(within),
+        )
+        m37_fixture(
+            "for x=16,26 do for y=-5,5 do local e=s.create_entity{name='transport-belt',"
+            "position={x+0.5,y+0.5},force=c.force};assert(e);e.active=false end end;"
+            "assert(c.teleport({21.5,4.5},s));rcon.print('m37:{}')"
+        )
+        fallback = m37_action("move_to", {"surface": m37_surface, "x": 21.5, "y": 0.5})
+        record(
+            "M37 CK wide belt field retains the belt warning when no safe goal exists",
+            fallback["status"] == "succeeded"
+            and not fallback.get("goal_adjusted")
+            and fallback.get("standing_on_belt") is True
+            and "belt" in fallback.get("hint", ""),
+            json.dumps(fallback),
+        )
+        m37_fixture(
+            "for _,e in pairs(s.find_entities()) do if e~=c then e.destroy() end end;"
+            "assert(c.teleport({0.5,4.5},s));inv.clear();"
+            "for x=-2,2 do for y=0,1 do assert(s.create_entity{name='transport-belt',"
+            "position={x+0.5,y+0.5},force=c.force}) end end;rcon.print('m37:{}')"
+        )
+        refs = m37_refs(["transport-belt"])
+        ordered = [refs[("transport-belt", x + 0.5, y + 0.5)] for x in range(-2, 3) for y in (0, 1)]
+        mined = m37_action("mine_entities", {"target_refs": ordered})
+        measured = m37_fixture(
+            "rcon.print('m37:'..helpers.table_to_json({belts=inv.get_item_count('transport-belt'),"
+            "remaining=s.count_entities_filtered{name='transport-belt'}}))"
+        )
+        record(
+            "M37 CL ten belts mined in one action return to inventory",
+            mined["status"] == "succeeded"
+            and mined["mined"] == mined["requested"] == 10
+            and sum(i["count"] for i in mined["gained"] if i["name"] == "transport-belt") == 10
+            and measured == {"belts": 10, "remaining": 0},
+            json.dumps({"action": mined, "measured": measured}),
+        )
+        m37_fixture(
+            "for _,p in ipairs({{0.5,0.5},{14.5,0.5},{2.5,0.5}}) do "
+            "assert(s.create_entity{name='transport-belt',position=p,force=c.force}) end;"
+            "assert(s.create_entity{name='iron-ore',position={-2.5,2.5},amount=100});"
+            "rcon.print('m37:{}')"
+        )
+        refs = m37_refs(["transport-belt", "iron-ore"])
+        ordered = [refs[("transport-belt", x, 0.5)] for x in (0.5, 14.5, 2.5)]
+        partial = m37_action("mine_entities", {"target_refs": ordered})
+        measured = m37_fixture(
+            "rcon.print('m37:'..helpers.table_to_json({first_gone="
+            "s.find_entity('transport-belt',{0.5,0.5})==nil,middle_present="
+            "s.find_entity('transport-belt',{14.5,0.5})~=nil,last_present="
+            "s.find_entity('transport-belt',{2.5,0.5})~=nil,"
+            "belts=inv.get_item_count('transport-belt')}))"
+        )
+        record(
+            "M37 CL first unreachable target fails the batch and leaves later targets untouched",
+            partial["status"] == "failed"
+            and partial["mined"] == 1
+            and partial["requested"] == 3
+            and partial["stopped"]["index"] == 2
+            and partial["stopped"]["target_ref"] == ordered[1]
+            and partial["stopped"]["reason"] == "out_of_range"
+            and measured
+            == {"first_gone": True, "middle_present": True, "last_present": True, "belts": 11},
+            json.dumps({"action": partial, "measured": measured}),
+        )
+        response = asyncio.run(
+            m37_server.call_tool(
+                "mine_entities", {"target_refs": [ordered[2], refs[("iron-ore", -2.5, 2.5)]]}
+            )
+        )
+        rejected = json.loads(response.content[0].text)
+        record(
+            "M37 CL resource validation rejects the entire batch up front with its index",
+            response.is_error
+            and rejected.get("error") == "invalid_input"
+            and rejected["detail"]["errors"][0]["index"] == 2
+            and m37_fixture(
+                "rcon.print('m37:'..helpers.table_to_json({present="
+                "s.find_entity('transport-belt',{2.5,0.5})~=nil}))"
+            )["present"],
+            json.dumps(rejected),
+        )
+        # Geometry comes from the 2.0.77 base prototypes: boiler's west water port,
+        # north steam port, and engine's south port. No fluids are inserted by script.
+        m37_fixture(
+            "for _,e in pairs(s.find_entities()) do if e~=c then e.destroy() end end;"
+            "local tiles={};for x=-6,-4 do for y=-1,1 do "
+            "tiles[#tiles+1]={name='water',position={x,y}} end end;s.set_tiles(tiles);"
+            "assert(c.teleport({3.5,-0.5},s));"
+            "b.boiler=s.create_entity{name='boiler',position={0.5,0},direction=0,force=c.force};"
+            "assert(b.boiler);assert(b.boiler.get_fuel_inventory().insert{name='coal',count=20}==20);"
+            "b.engine=s.create_entity{name='steam-engine',position={0.5,-4.5},force=c.force};"
+            "assert(b.engine);"
+            "assert(s.create_entity{name='pipe',position={0.5,-1.5},force=c.force});"
+            "assert(s.create_entity{name='pipe',position={-1.5,0.5},force=c.force});"
+            "assert(s.create_entity{name='offshore-pump',position={-2.5,0.5},"
+            "direction=12,force=c.force});"
+            "assert(s.create_entity{name='small-electric-pole',position={2.5,-3.5},force=c.force});"
+            "local load=s.create_entity{name='electric-energy-interface',position={4.5,-4.5},"
+            "force=c.force};assert(load);load.power_production=0;load.power_usage=300000/60;"
+            "load.electric_buffer_size=1000000;load.energy=0;"
+            "b.dry=s.create_entity{name='steam-engine',position={7.5,0.5},force=c.force};"
+            "assert(b.dry);rcon.print('m37:{}')"
+        )
+        refs = m37_refs(["boiler", "steam-engine", "pipe", "offshore-pump"])
+        diagnostic_refs = [
+            refs[(name, x, y)]
+            for name, x, y in (
+                ("boiler", 0.5, 0),
+                ("steam-engine", 0.5, -4.5),
+                ("pipe", -1.5, 0.5),
+                ("offshore-pump", -2.5, 0.5),
+                ("steam-engine", 7.5, 0.5),
+            )
+        ]
+        deadline = time.monotonic() + 20
+        while True:
+            diagnostic = asyncio.run(
+                m37_tool("get_entity_inventories", {"target_refs": diagnostic_refs})
+            )
+            entries = diagnostic["results"]
+            if all(entry["ok"] for entry in entries):
+                boiler, engine, pipe, pump, dry = [entry["result"] for entry in entries]
+                if engine.get("power_output_kw", 0) > 0:
+                    break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+
+        def has_fluid(entity, name):
+            return any(
+                f.get("name") == name
+                and f["amount"] > 0
+                and f["capacity"] > 0
+                and "temperature" in f
+                for f in entity.get("fluids", [])
+            )
+
+        record(
+            "M37 CM real water/steam/fuel and last-tick generator output are readable in batch",
+            all(entry["ok"] for entry in entries)
+            and has_fluid(boiler, "water")
+            and has_fluid(boiler, "steam")
+            and boiler["inventories"]["fuel"]
+            and has_fluid(engine, "steam")
+            and engine.get("power_output_kw", 0) > 0
+            and has_fluid(pipe, "water")
+            and has_fluid(pump, "water"),
+            json.dumps(diagnostic),
+        )
+        dry_single = asyncio.run(
+            m37_tool("get_entity_inventory", {"target_ref": diagnostic_refs[-1]})
+        )
+        record(
+            "M37 CM no-steam generator reports zero output and empty fluidbox",
+            dry_single.get("power_output_kw") == 0
+            and dry_single.get("inventories") == {}
+            and dry_single.get("fluids")
+            and all(
+                f["amount"] == 0 and "name" not in f and f["capacity"] > 0
+                for f in dry_single["fluids"]
+            ),
+            json.dumps(dry_single),
+        )
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = m37_fixture(
+                f"rcon.print('m37:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m37_fixture(
+            "if b then assert(c.crafting_queue_size==0);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();if s then assert(game.delete_surface(s)) end;"
+            "for _,key in ipairs(b.fields) do state[key]=b.saved[key] end;"
+            "storage.m37_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m37:'..helpers.table_to_json({restored=true}))"
+        )
+        observed_map_cells.pop(m37_surface, None)
+        record(
+            "M37 removes fixtures and restores inventory, queue, position and observation state",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m37_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m37_position,
         )
 
     failed = [label for label, passed, _ in results if not passed]

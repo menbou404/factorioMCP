@@ -863,7 +863,8 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
             "one craft at a time",
             "one walk/mine at a time",
             "crafting can run alongside either",
-            "place_entity, place_entities, place_line, transfer_item(s), mine_entity and move_to",
+            "place_entity, place_entities, place_line, transfer_item(s), mine_entity, "
+            "mine_entities and move_to",
             "automatically wait up to 15 seconds for a running walk and retry once",
             "waited_for_walk",
             "A running mine conflicts immediately",
