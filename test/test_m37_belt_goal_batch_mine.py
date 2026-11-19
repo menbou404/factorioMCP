@@ -71,7 +71,10 @@ class BeltGoalBatchMineTests(unittest.IsolatedAsyncioTestCase):
                 ("get_action_status", {"action_id": "m"}),
                 ("cancel_action", {"action_id": "m"}),
                 ("wait_for_action", {"action_id": "m", "timeout_seconds": 1}),
-                ("mine_entities", {"target_refs": ["a", "b", "c"], "wait_seconds": 1}),
+                (
+                    "mine_entities",
+                    {"target_refs": ["a", "b", "c"], "wait_seconds": 1},
+                ),
             ):
                 bridge.call.return_value = {"result": copy.deepcopy(value)}
                 with self.subTest(status=status, tool=tool):
