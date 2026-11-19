@@ -88,6 +88,7 @@ INSERTER_DIRECTION_DESCRIPTION = (
 )
 
 WALK_WAIT_SECONDS = 15.0
+WALK_ACTION_TYPES = {"move", "place_line", "place_entities", "transfer_items"}
 WALK_WAIT_OPERATIONS = {
     "place_entity",
     "place_entities",
@@ -112,6 +113,25 @@ STAND_DESCRIPTION = (
     " placement waits for the walk automatically."
 )
 
+BATCH_WALK_DESCRIPTION = (
+    " With walk=true, one call can walk to and place/transfer/mine at a distant spot,"
+    " processing items in order in the walk/mine slot; crafting is allowed."
+    " Returns walks (number of walks), current_index and progress through get_action_status"
+    " or wait_for_action; cancel_action keeps completed work."
+    " Conflicts follow place_line walk=true."
+    " wait_seconds (1-50) waits up to that many seconds; omit it for an immediate action_id."
+    " Automatic walk wait plus wait_seconds is capped at 50 seconds."
+    " move_to followed by the action remains valid."
+)
+
+ITEM_TARGET_DESCRIPTION = (
+    " Inserters include pickup_target and drop_target = {target_ref, name}; mining drills"
+    " include drop_target. Fields are omitted when no target exists. Check drop_target in"
+    " placement results: warning no_drop_target means items will be dropped on the ground;"
+    " if the target is placed next, ignore this. Inventory reads instead include"
+    " no_drop_target=true. Targets do not guarantee item acceptance."
+)
+
 
 PLACE_DESCRIPTION = (
     "Place a supported entity within build reach, consuming one real inventory item."
@@ -120,6 +140,7 @@ PLACE_DESCRIPTION = (
     " (default input). direction is belt travel direction for both ends;"
     " for output it is the direction items leave."
     + INSERTER_DIRECTION_DESCRIPTION
+    + ITEM_TARGET_DESCRIPTION
     + PLACEMENT_VISIBILITY_DESCRIPTION
     + " Items on the ground inside the footprint are picked up into the main inventory"
     " in the same tick before building when they are the only blockers and all fit."
@@ -247,7 +268,7 @@ INVENTORY_MACHINE_DESCRIPTION = (
     " producers, consumers}: average kW over the last 5 seconds, rounded to one decimal."
     " producers and consumers list {name, kw} per prototype, sorted by kw descending,"
     " at most 10 each, omitting zero entries. Absent when the pole has no network."
-    " These reads do not extend transfer_item support."
+    " These reads do not extend transfer_item support." + ITEM_TARGET_DESCRIPTION
 )
 
 RUNNING_WALK_HINT = (
@@ -271,7 +292,7 @@ def _append_hint(result: dict[str, Any], hint: str) -> None:
 
 
 def _running_walk_guidance(result: dict[str, Any]) -> dict[str, Any]:
-    if result.get("status") == "running" and result.get("type") in {"move", "place_line"}:
+    if result.get("status") == "running" and result.get("type") in WALK_ACTION_TYPES:
         _append_hint(result, RUNNING_WALK_HINT.format(action_id=result["action_id"]))
     return result
 
@@ -602,6 +623,8 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
     }
     if operation in batch_operations:
         return _normalize_batch_result(result, batch_operations[operation])
+    if result.get("type") in ("place_entities", "transfer_items"):
+        return _normalize_batch_result(result, batch_operations[result["type"]])
     if operation == "get_request_result":
         original = result.get("original_response")
         if isinstance(original, dict):
@@ -847,7 +870,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
         if (
             entry.get("error") == "action_conflict"
             and isinstance(running, dict)
-            and running.get("type") in {"move", "place_line"}
+            and running.get("type") in WALK_ACTION_TYPES
             and running.get("id")
         ):
             return running
@@ -997,6 +1020,17 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             return _response(_running_walk_guidance(value))
         return await wait_action(value["action_id"], wait_seconds, value)
 
+    async def invoke_walk_batch(
+        operation: str, items: list[dict[str, Any]], walk: bool, wait_seconds: float | None
+    ) -> CallToolResult:
+        if wait_seconds is not None and not walk:
+            return _error_response(
+                BridgeError("invalid_input", "wait_seconds requires walk=true."), operation
+            )
+        if walk:
+            return await start_action(operation, {"items": items, "walk": True}, wait_seconds)
+        return await invoke(operation, {"items": items})
+
     @server.tool(description="Check the connection to the Factorio AI Mod.")
     async def factorio_ping() -> CallToolResult:
         return await invoke("ping")
@@ -1054,6 +1088,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " neighbour, pickup_position, drop_position, electric_network_id, input_priority,"
             " output_priority, filter, and inventory_limit when present."
             " Counts, paging, resources and blocked_tiles are unchanged; compact defaults to false."
+            " Owned inserters and mining drills without a drop target include no_drop_target=true"
+            " in compact and full views. Read pickup/drop target refs via get_entity_inventory."
             " Each call also records fully observed 8x8 cells for get_explored_map, "
             "and seen resources in partially observed cells, independent of filters and paging."
             + MACHINE_STATUS_DESCRIPTION
@@ -1099,7 +1135,10 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Partial cells do not count in explored.cells or explored bounds and may appear "
             "in frontier; they never overwrite fully observed cells. "
             "Values are as of observed_tick and update when the area is observed again. "
-            "Lists resource patches, water (with a shore tile for offshore pumps), forests "
+            "Water includes pump_position={x,y,direction} verified placeable during observation;"
+            " use pump_position directly for offshore-pump placement after moving within reach."
+            " It is historical and may become blocked later."
+            " Lists resource patches, water (with a shore tile for offshore pumps), forests "
             "and rocks nearest first. Each list contains at most limit components; "
             "resources_total, water_total, trees_total and rocks_total count components "
             "before truncation. Use resource_names to filter resource kinds. "
@@ -1377,7 +1416,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Mine 1-32 unique observed target_refs in the given order over normal game time, "
-            "without walking. Uses the same reach, ownership, minable and inventory checks "
+            "without walking by default. Uses the same reach, ownership, minable and inventory "
+            "checks "
             "as mine_entity. Resources are rejected up front as invalid_input with "
             "detail.errors naming each index (1-based); mine ore with mine_entity. Trees "
             "and rocks are allowed. To rebuild a belt line, mine_entities the old tiles in "
@@ -1389,13 +1429,20 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "in running get_action_status/wait_for_action; cancel_action preserves progress. "
             "Prefer wait_seconds (1-50) to start and wait; timeouts leave the action running "
             "with timed_out=true and action_id. Continue with wait_for_action. Automatic "
-            "walk wait plus wait_seconds is capped at 50 seconds." + WALK_WAIT_DESCRIPTION
+            "walk wait plus wait_seconds is capped at 50 seconds."
+            + WALK_WAIT_DESCRIPTION
+            + BATCH_WALK_DESCRIPTION
         )
     )
     async def mine_entities(
         target_refs: MiningTargetRefs,
+        walk: Annotated[bool, Field(strict=True)] = False,
         wait_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] | None = None,
     ) -> CallToolResult:
+        if walk:
+            return await start_action(
+                "mine_entities", {"target_refs": target_refs, "walk": True}, wait_seconds
+            )
         return await start_action("mine_entities", {"target_refs": target_refs}, wait_seconds)
 
     @server.tool(
@@ -1601,7 +1648,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
 
     @server.tool(
         description=(
-            "Place 1-10 entities in order in one tick without walking. "
+            "Place 1-10 entities in order in one tick without walking by default. "
             "Each entry follows place_entity rules: "
             + PLACE_DESCRIPTION
             + " Mining causes action_conflict for each entry; crafting is allowed. "
@@ -1609,14 +1656,19 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and result or error/detail/hint using the same error codes as place_entity, "
             "plus succeeded and failed counts. The batch retries only when every entry failed "
             "with a conflict from the same walk. The batch itself is ok: true when it ran, "
-            "even if all entries failed."
+            "even if all entries failed. wait_seconds requires walk=true." + BATCH_WALK_DESCRIPTION
         )
     )
     async def place_entities(
         items: Annotated[list[PlaceEntry], Field(min_length=1, max_length=10, strict=True)],
+        walk: Annotated[bool, Field(strict=True)] = False,
+        wait_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] | None = None,
     ) -> CallToolResult:
-        return await invoke(
-            "place_entities", {"items": [entry.model_dump(exclude_none=True) for entry in items]}
+        return await invoke_walk_batch(
+            "place_entities",
+            [entry.model_dump(exclude_none=True) for entry in items],
+            walk,
+            wait_seconds,
         )
 
     @server.tool(
@@ -2024,7 +2076,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
 
     @server.tool(
         description=(
-            "Transfer 1-10 items in order in one tick without walking. "
+            "Transfer 1-10 items in order in one tick without walking by default. "
             "Each entry follows transfer_item rules: "
             + TRANSFER_DESCRIPTION
             + " "
@@ -2035,17 +2087,23 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and result or error/detail/hint using the same error codes as transfer_item, "
             "plus succeeded and failed counts. The batch retries only when every entry failed "
             "with a conflict from the same walk. The batch itself is ok: true when it ran, "
-            "even if all entries failed."
+            "even if all entries failed. wait_seconds requires walk=true." + BATCH_WALK_DESCRIPTION
         )
     )
     async def transfer_items(
         items: Annotated[list[TransferEntry], Field(min_length=1, max_length=10, strict=True)],
+        walk: Annotated[bool, Field(strict=True)] = False,
+        wait_seconds: Annotated[float, Field(ge=1, le=50, allow_inf_nan=False)] | None = None,
     ) -> CallToolResult:
-        return await invoke("transfer_items", {"items": [entry.model_dump() for entry in items]})
+        return await invoke_walk_batch(
+            "transfer_items", [entry.model_dump() for entry in items], walk, wait_seconds
+        )
 
     @server.tool(
         description=(
             "Get the status of a walking, place_line, mining, or crafting action. "
+            "Walking place_entities/transfer_items report results so far, succeeded, failed,"
+            " current_index and walks. "
             "Walking lines include progress and all final line fields. "
             "Running mining reports detail.gained and detail.count; "
             "detail.estimated_seconds estimates the remaining mining time when computable; "
@@ -2060,6 +2118,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Wait for a walking, place_line, mining, or crafting action to finish. "
+            "Walking batches keep results so far, current_index and walks. "
             "Walking lines retain all final line fields. Prefer this over polling "
             "get_action_status. For move_to, place_line with walk=true, and craft, prefer their "
             "wait_seconds argument "

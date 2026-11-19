@@ -2996,6 +2996,7 @@ def main():
             "pickup_position",
             "drop_position",
             "electric_network_id",
+            "no_drop_target",
         }
         page = 0
         total = 0
@@ -5948,19 +5949,6 @@ def main():
                 ("steam-engine", 7.5, 0.5),
             )
         ]
-        deadline = time.monotonic() + 20
-        while True:
-            diagnostic = asyncio.run(
-                m37_tool("get_entity_inventories", {"target_refs": diagnostic_refs})
-            )
-            entries = diagnostic["results"]
-            if all(entry["ok"] for entry in entries):
-                boiler, engine, pipe, pump, dry = [entry["result"] for entry in entries]
-                if engine.get("power_output_kw", 0) > 0:
-                    break
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.1)
 
         def has_fluid(entity, name):
             return any(
@@ -5971,16 +5959,31 @@ def main():
                 for f in entity.get("fluids", [])
             )
 
+        deadline = time.monotonic() + 20
+        while True:
+            diagnostic = asyncio.run(
+                m37_tool("get_entity_inventories", {"target_refs": diagnostic_refs})
+            )
+            entries = diagnostic["results"]
+            diagnostic_ready = False
+            if all(entry["ok"] for entry in entries):
+                boiler, engine, pipe, pump, dry = [entry["result"] for entry in entries]
+                diagnostic_ready = bool(
+                    has_fluid(boiler, "water")
+                    and has_fluid(boiler, "steam")
+                    and boiler["inventories"]["fuel"]
+                    and has_fluid(engine, "steam")
+                    and engine.get("power_output_kw", 0) > 0
+                    and has_fluid(pipe, "water")
+                    and has_fluid(pump, "water")
+                )
+            if diagnostic_ready or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+
         record(
             "M37 CM real water/steam/fuel and last-tick generator output are readable in batch",
-            all(entry["ok"] for entry in entries)
-            and has_fluid(boiler, "water")
-            and has_fluid(boiler, "steam")
-            and boiler["inventories"]["fuel"]
-            and has_fluid(engine, "steam")
-            and engine.get("power_output_kw", 0) > 0
-            and has_fluid(pipe, "water")
-            and has_fluid(pump, "water"),
+            diagnostic_ready,
             json.dumps(diagnostic),
         )
         dry_single = asyncio.run(
@@ -6025,6 +6028,314 @@ def main():
             restored.get("restored") is True
             and bridge.call("get_inventory")["result"]["items"] == m37_inventory
             and bridge.call("get_agent_status")["result"]["position"] == m37_position,
+        )
+
+    # M38 CN/CO/CP: all creation, item supply and teleports are fixture-only RCON.
+    m38_surface = "m38-targets-pump-walk-fixture"
+    m38_server = create_server(bridge)
+    m38_inventory = bridge.call("get_inventory")["result"]["items"]
+    m38_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m38_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m38_surface}";local s=game.surfaces[name];'
+            "local b=storage.m38_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m38:" not in raw:
+            raise RuntimeError("M38 fixture failed: " + raw)
+        return json.loads(raw.split("m38:", 1)[1].strip())
+
+    async def m38_tool(name, args):
+        response = await m38_server.call_tool(name, args)
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    def m38_action(name, args):
+        value = asyncio.run(m38_tool(name, {**args, "wait_seconds": 20}))
+        if value.get("status") == "running":
+            value = asyncio.run(
+                m38_tool(
+                    "wait_for_action", {"action_id": value["action_id"], "timeout_seconds": 50}
+                )
+            )
+        assert value.get("status") != "running", value
+        return value
+
+    def m38_refs(names):
+        entities = bridge.call("observe_nearby", {"names": names})["result"]["entities"]
+        return {(e["name"], e["x"], e["y"]): e["target_ref"] for e in entities}
+
+    try:
+        m38_fixture(
+            "assert(not s and not b,'M38 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,selected=c.selected,"
+            "inventory=game.create_inventory(#inv),saved={},fields={'targets','owned_refs',"
+            "'recipe_baselines','last_observation','recent_observations','explored_map',"
+            "'last_action','completed_actions','completed_order','processed','processed_order',"
+            "'next_target_id','next_action_id','path_request_id','last_heartbeat_tick'}};storage.m38_backup=b;"
+            "for _,key in ipairs(b.fields) do b.saved[key]=state[key] end;"
+            "for _,key in ipairs({'targets','owned_refs','recipe_baselines','recent_observations',"
+            "'explored_map','completed_actions','completed_order','processed','processed_order'}) "
+            "do state[key]={} end;state.last_observation=nil;state.last_action=nil;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=96,height=64});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},2);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-48,47 do for y=-32,31 do "
+            "tiles[#tiles+1]={name='grass-1',position={x,y}} end end;s.set_tiles(tiles);"
+            "assert(c.teleport({8.5,4.5},s));rcon.print('m38:{}')"
+        )
+        # CN: real placements, including the fallback in the placement tick.
+        m38_fixture(
+            "for _,e in pairs(s.find_entities()) do if e~=c then e.destroy() end end;"
+            "assert(c.teleport({3.5,3.5},s));"
+            "for _,v in ipairs({{'inserter',2},{'stone-furnace',2},{'electric-mining-drill',1},"
+            "{'wooden-chest',5},{'offshore-pump',1},{'coal',10}}) do "
+            "assert(inv.insert{name=v[1],count=v[2]}==v[2]) end;"
+            "assert(s.create_entity{name='wooden-chest',position={0.5,-1.5},force=c.force});"
+            "assert(s.create_entity{name='stone-furnace',position={0,1},force=c.force});"
+            "rcon.print('m38:{}')"
+        )
+        refs = m38_refs(["wooden-chest", "stone-furnace"])
+        pickup_ref = refs[("wooden-chest", 0.5, -1.5)]
+        drop_ref = refs[("stone-furnace", 0, 1)]
+        insertion = asyncio.run(
+            m38_tool(
+                "place_entity",
+                {"item": "inserter", "surface": m38_surface, "x": 0.5, "y": -0.5, "direction": 0},
+            )
+        )
+        record(
+            "M38 CN placement returns the chest pickup and furnace drop refs",
+            insertion.get("pickup_target") == {"target_ref": pickup_ref, "name": "wooden-chest"}
+            and insertion.get("drop_target") == {"target_ref": drop_ref, "name": "stone-furnace"},
+            json.dumps(insertion),
+        )
+        empty = asyncio.run(
+            m38_tool(
+                "place_entities",
+                {
+                    "items": [
+                        {
+                            "item": "inserter",
+                            "surface": m38_surface,
+                            "x": 3.5,
+                            "y": 0.5,
+                            "direction": 0,
+                        }
+                    ]
+                },
+            )
+        )["results"][0]["result"]
+        read = asyncio.run(
+            m38_tool("get_entity_inventory", {"target_ref": insertion["target_ref"]})
+        )
+        empty_read = asyncio.run(
+            m38_tool("get_entity_inventory", {"target_ref": empty["target_ref"]})
+        )
+        record(
+            "M38 CN empty drop warns, target reads preserve refs and flag the empty drop",
+            "drop_target" not in empty
+            and "no_drop_target" in empty.get("warnings", [])
+            and "ground" in empty.get("hint", "")
+            and "placed next" in empty.get("hint", "")
+            and read.get("pickup_target") == insertion.get("pickup_target")
+            and read.get("drop_target") == insertion.get("drop_target")
+            and empty_read.get("no_drop_target") is True
+            and "drop_target" not in empty_read,
+            json.dumps({"empty": empty, "read": read, "empty_read": empty_read}),
+        )
+        for compact in (False, True):
+            observed = bridge.call("observe_nearby", {"names": ["inserter"], "compact": compact})[
+                "result"
+            ]
+            entries = {e["target_ref"]: e for e in observed["entities"]}
+            record(
+                f"M38 CN observe compact={compact} flags empty drop without target refs",
+                entries[empty["target_ref"]].get("no_drop_target") is True
+                and not entries[insertion["target_ref"]].get("no_drop_target")
+                and all(
+                    "pickup_target" not in e and "drop_target" not in e for e in entries.values()
+                ),
+                json.dumps(observed),
+            )
+        m38_fixture(
+            "assert(c.teleport({-1.5,2.5},s));"
+            "assert(s.create_entity{name='iron-ore',position={-5.5,0.5},amount=1000});"
+            "rcon.print('m38:{}')"
+        )
+        drill_args = {
+            "item": "electric-mining-drill",
+            "surface": m38_surface,
+            "x": -5.5,
+            "y": 0.5,
+            "direction": 0,
+        }
+        preview = asyncio.run(m38_tool("check_placement", drill_args))
+        drop = preview["drop_position"]
+        m38_fixture(
+            "assert(s.create_entity{name='stone-furnace',position={"
+            f"{drop['x']},{drop['y'] - 0.5}"
+            "},force=c.force});rcon.print('m38:{}')"
+        )
+        refs = m38_refs(["stone-furnace"])
+        drill_furnace = next(ref for (name, x, y), ref in refs.items() if x < -3)
+        drill = asyncio.run(m38_tool("place_entity", drill_args))
+        batch_read = asyncio.run(
+            m38_tool(
+                "get_entity_inventories",
+                {"target_refs": [insertion["target_ref"], drill["target_ref"]]},
+            )
+        )
+        record(
+            "M38 CN drill drops into furnace and batch inventory reads expose targets",
+            drill.get("drop_target") == {"target_ref": drill_furnace, "name": "stone-furnace"}
+            and all(e["ok"] for e in batch_read["results"])
+            and batch_read["results"][0]["result"].get("pickup_target", {}).get("target_ref")
+            == pickup_ref
+            and batch_read["results"][1]["result"].get("drop_target") == drill.get("drop_target"),
+            json.dumps({"drill": drill, "reads": batch_read}),
+        )
+        # CO: artificial water exists only on this disposable fixture surface.
+        m38_fixture(
+            "for _,e in pairs(s.find_entities()) do if e~=c then e.destroy() end end;"
+            "local tiles={};for x=8,15 do for y=-4,3 do "
+            "tiles[#tiles+1]={name='water',position={x,y}} end end;s.set_tiles(tiles);"
+            "assert(c.teleport({8.5,5.5},s));rcon.print('m38:{}')"
+        )
+        bridge.call("observe_nearby")
+        water = asyncio.run(m38_tool("get_explored_map", {}))["water"]
+        pump = next((group["pump_position"] for group in water if "pump_position" in group), None)
+        record(
+            "M38 CO explored water has a verified pump_position",
+            pump is not None,
+            json.dumps(water),
+        )
+        if pump:
+            args = {"item": "offshore-pump", "surface": m38_surface, **pump}
+            check = asyncio.run(m38_tool("check_placement", args))
+            placed_pump = asyncio.run(m38_tool("place_entity", args))
+            record(
+                "M38 CO recorded position and direction check placeable and build successfully",
+                check.get("placeable") is True
+                and placed_pump.get("name") == "offshore-pump"
+                and placed_pump.get("direction") == pump["direction"],
+                json.dumps({"check": check, "placed": placed_pump}),
+            )
+        # CP: item order spans thirty tiles, with normal inventory consumption.
+        m38_fixture("assert(c.teleport({-12.5,16.5},s));rcon.print('m38:{}')")
+        placement_items = [
+            {"item": "wooden-chest", "surface": m38_surface, "x": x, "y": 12.5}
+            for x in (-12.5, 17.5)
+        ]
+        placed = m38_action("place_entities", {"items": placement_items, "walk": True})
+        record(
+            "M38 CP ordered placement walks between distant items",
+            placed.get("status") == "succeeded"
+            and placed.get("succeeded") == 2
+            and placed.get("walks", 0) >= 1
+            and [r["result"]["position"]["x"] for r in placed["results"]] == [-12.5, 17.5],
+            json.dumps(placed),
+        )
+        chest_ref = placed["results"][1]["result"]["target_ref"]
+        m38_fixture("assert(c.teleport({-12.5,16.5},s));rcon.print('m38:{}')")
+        transfer = {
+            "target_ref": chest_ref,
+            "inventory_role": "main",
+            "direction": "to_entity",
+            "item": "coal",
+            "count": 3,
+        }
+        no_walk = asyncio.run(m38_tool("transfer_items", {"items": [transfer]}))
+        record(
+            "M38 CP transfer walk=false keeps out_of_range",
+            no_walk["results"][0].get("error") == "out_of_range",
+            json.dumps(no_walk),
+        )
+        moved = m38_action("transfer_items", {"items": [transfer], "walk": True})
+        chest_read = asyncio.run(m38_tool("get_entity_inventory", {"target_ref": chest_ref}))
+        record(
+            "M38 CP walking transfer reaches the chest and transfers real coal",
+            moved.get("walks", 0) >= 1
+            and moved.get("succeeded") == 1
+            and moved["results"][0]["result"].get("moved") == 3
+            and any(
+                i["name"] == "coal" and i["count"] == 3 for i in chest_read["inventories"]["main"]
+            ),
+            json.dumps(moved),
+        )
+        mine_refs = [r["result"]["target_ref"] for r in placed["results"]]
+        no_walk_mine = asyncio.run(
+            m38_tool("mine_entities", {"target_refs": mine_refs, "wait_seconds": 1})
+        )
+        record(
+            "M38 CP mine with wait_seconds and no walk stops at its first out_of_range target",
+            no_walk_mine.get("status") == "failed"
+            and no_walk_mine.get("mined") == 0
+            and no_walk_mine.get("error") == "out_of_range",
+            json.dumps(no_walk_mine),
+        )
+        mined = m38_action("mine_entities", {"target_refs": mine_refs, "walk": True})
+        record(
+            "M38 CP walking mining reaches and removes distant targets in order",
+            mined.get("status") == "succeeded"
+            and mined.get("mined") == 2
+            and mined.get("walks", 0) >= 2,
+            json.dumps(mined),
+        )
+        no_walk_place = asyncio.run(m38_tool("place_entities", {"items": [placement_items[0]]}))
+        record(
+            "M38 CP placement walk=false keeps out_of_range",
+            no_walk_place["results"][0].get("error") == "out_of_range",
+            json.dumps(no_walk_place),
+        )
+        for tool, args in (
+            ("place_entities", {"items": placement_items}),
+            ("transfer_items", {"items": [transfer]}),
+        ):
+            response = asyncio.run(m38_server.call_tool(tool, {**args, "wait_seconds": 1}))
+            record(
+                f"M38 CP {tool} wait_seconds requires walk=true",
+                response.is_error
+                and json.loads(response.content[0].text).get("error") == "invalid_input",
+            )
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = m38_fixture(
+                f"rcon.print('m38:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m38_fixture(
+            "if b then assert(c.crafting_queue_size==0);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();if s then assert(game.delete_surface(s)) end;"
+            "for _,key in ipairs(b.fields) do state[key]=b.saved[key] end;"
+            "storage.m38_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m38:'..helpers.table_to_json({restored=true}))"
+        )
+        observed_map_cells.pop(m38_surface, None)
+        record(
+            "M38 removes fixtures and restores inventory, queue, position and observation state",
+            restored.get("restored") is True
+            and bridge.call("get_inventory")["result"]["items"] == m38_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m38_position,
         )
 
     failed = [label for label, passed, _ in results if not passed]
