@@ -585,7 +585,7 @@ local function finish_move_within(state)
   if distance_squared(state.character.position, action.goal) > action.within * action.within then
     return false
   end
-  if not action.line_result and overlaps_belt(state.character, state.character.position) then
+  if overlaps_belt(state.character, state.character.position) then
     if not action.belt_step_searched then
       action.belt_step_searched = true
       action.belt_step = belt_free_position(state.character, state.character.position,
@@ -698,7 +698,18 @@ local function add_item_targets(state, entity, result, placement)
     if target then return {target_ref = register_target(state, target), name = target.name} end
   end
   if entity.type == "inserter" then result.pickup_target = reference(item_target(entity, true)) end
-  result.drop_target = reference(item_target(entity, false))
+  local drop = item_target(entity, false)
+  result.drop_target = reference(drop)
+  if not placement and entity.type == "inserter" then
+    if result.drop_target then
+      result.drop_target.status, result.drop_target.missing_ingredients = reported_entity_status(drop)
+    end
+    if result.status == "waiting_for_space_in_destination" then
+      result.hint = "Check drop_target.status: no_recipe means set a recipe; full_output means " ..
+        "take products out. The machine may already hold enough of the held item and be " ..
+        "waiting for another ingredient listed in drop_target.missing_ingredients."
+    end
+  end
   if not result.drop_target then
     if placement then
       result.warnings = result.warnings or {}
@@ -2446,10 +2457,13 @@ local function line_stand_position(state, character, line, next_index)
   local next_position = {x = line.first.x + next_index * line.step_x,
                          y = line.first.y + next_index * line.step_y}
   local best, best_count, best_distance = nil, 0, math.huge
+  local candidate_visible = false
   local function consider(candidate)
     -- A continuation must reach its first tile as well as maximizing coverage.
     if distance_squared(candidate, next_position) > reach ^ 2 or
-       not placement_stand_clear(state, character, candidate) then return end
+       not placement_visible(state, character, candidate) then return end
+    candidate_visible = true
+    if not placement_stand_clear(state, character, candidate) then return end
     -- Belts do not collide with characters. Explicitly reject entity footprints
     -- as well, so the suggestion cannot stand on a belt and be carried away.
     for _, entity in pairs(character.surface.find_entities_filtered{
@@ -2488,7 +2502,7 @@ local function line_stand_position(state, character, line, next_index)
     consider({x = line.first.x, y = top})
     consider({x = line.first.x, y = bottom})
   end
-  return best -- nil deliberately omits stand_position when no candidate fits.
+  return best, candidate_visible and "blocked" or "not_visible"
 end
 
 local function placement_blocking(state, character, prototype, position, direction, observed_only)
@@ -3001,6 +3015,9 @@ advance_place_line = function(state, action)
   local character = state.character
   local first, requested, prototype = line.first, line.requested, line.prototype
   local direction, step_x, step_y = line.direction, line.step_x, line.step_y
+  local stand_reason
+  local approached = action.line_approaching
+  action.line_approaching = nil
   local collected = {}
   local function merge_collected(items)
     for _, item in ipairs(items or {}) do
@@ -3024,7 +3041,10 @@ advance_place_line = function(state, action)
         break
       end
     end
-    if existing then
+    if approached then
+      -- The approach reveals candidates; choose a stand before placing again.
+      result.stopped = "out_of_range"
+    elseif existing then
       if prototype.type == "pipe" or existing.direction == tile_direction then
         result.already_present = result.already_present + 1
       else
@@ -3052,7 +3072,7 @@ advance_place_line = function(state, action)
     if result.stopped then
       result.next_position = position
       if result.stopped == "out_of_range" then
-        result.stand_position = line_stand_position(state, character, line, index)
+        result.stand_position, stand_reason = line_stand_position(state, character, line, index)
       end
       action.line_index = index
       break
@@ -3080,12 +3100,27 @@ advance_place_line = function(state, action)
       result.stopped, result.detail, result.stand_position = nil, nil, nil
       action.line_walk_index = action.line_index
       action.goal = stand
+      -- An approach uses within-reach arrival; the stand walk uses an exact goal.
+      action.within = nil
+      action.belt_step, action.belt_step_pending, action.belt_step_searched = nil, nil, nil
+      action.belt_goal_adjusted = nil
       action.walk_started_tick = game.tick
       action.retries, action.escape_tried = 0, nil
       action.original_goal, action.goal_adjusted = nil, nil
       local ok = pcall(request_path, state, character, stand)
       if ok then return end
       finish_action(state, "action", "failed", "path_not_found")
+      return
+    elseif stand_reason == "not_visible" and action.line_approach_index ~= action.line_index then
+      action.line_approach_index = action.line_index
+      local started, reason, detail = batch_walk_to(state, action, result.next_position,
+                                                   character.build_distance)
+      if started then
+        action.line_approaching = true
+        result.stopped, result.detail = nil, nil
+        return
+      end
+      finish_action(state, "action", "failed", reason, detail)
       return
     else
       result.detail = {reason = "stand_position_not_found"}

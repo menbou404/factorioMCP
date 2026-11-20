@@ -231,7 +231,10 @@ MACHINE_STATUS_DESCRIPTION = (
     " With enough ingredients an assembler keeps crafting until then."
     " item_ingredient_shortage with missing_ingredients = [{name, count}] means add those"
     " items for one more craft; fluid ingredients are excluded and qualities are combined."
-    " waiting_for_space_in_destination for inserters means their target is full."
+    " When an inserter stops, check drop_target.status: no_recipe means set a recipe,"
+    " full_output means take products out; the machine may already hold enough of the held"
+    " item and wait for another ingredient listed in drop_target.missing_ingredients."
+    " waiting_for_space_in_destination inserters include a hint explaining these checks."
     " For low_power or no_power, read a nearby electric pole with get_entity_inventory"
     " to see production and consumption."
 )
@@ -268,6 +271,8 @@ INVENTORY_MACHINE_DESCRIPTION = (
     " producers, consumers}: average kW over the last 5 seconds, rounded to one decimal."
     " producers and consumers list {name, kw} per prototype, sorted by kw descending,"
     " at most 10 each, omitting zero entries. Absent when the pole has no network."
+    " Inserter inventory reads add status and, for ingredient shortages, missing_ingredients"
+    " to drop_target, using the same corrected machine status as observe_nearby."
     " These reads do not extend transfer_item support." + ITEM_TARGET_DESCRIPTION
 )
 
@@ -1507,6 +1512,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and stopped/detail/hint on stop, and merged collected_items when picked up."
             " With walk=true, place a long line in one call by walking along it: place reachable"
             " tiles, walk to stand_position using the same pathfinding as move_to, and repeat."
+            " If no stand candidate is visible, approach the next tile within build reach"
+            " (up to 128 tiles away), then find a stand_position; approach each index only once."
             " Shares the walk/mine slot; never places outside build reach."
             " wait_seconds requires walk=true (1-50, omitted for an immediate return) and"
             " starts and waits like move_to;"
@@ -1859,6 +1866,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "inventory read errors are returned with the same hints. "
             "count is 1-10000; timeout_seconds is 1-50 (default 20). "
             "Counts all qualities across all inventory roles, or only inventory_role if given. "
+            "For transport-belt, underground-belt and splitter targets, counts items currently "
+            "on all of the entity's transport lines and returns belt=true; the number changes "
+            "as items move. inventory_role and produced=true on belts return invalid_input. "
             "Use produced=true when an output inserter removes products so inventory counts "
             "would not grow. Only assemblers and furnaces support produced (default false). "
             "item must be a product of the current recipe (or an idle furnace's previous recipe); "
@@ -1894,7 +1904,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "inserters whose drop_target is the target, sorted by x then y, with name, x, y, "
             "status and pickup_target (source entity name, omitted when none). "
             "No feeders returns an empty list. Feeders are omitted when reached=true or "
-            "diagnostics fail; diagnostic failures preserve the wait result."
+            "diagnostics fail, or for belt targets; diagnostic failures preserve the wait result."
             + MACHINE_BUFFER_DESCRIPTION
         )
     )
@@ -1917,7 +1927,14 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                 response = await call("get_entity_inventory", {"target_ref": target_ref})
                 value = _success_value("get_entity_inventory", response)
                 inventories = value["inventories"]
+                belt = value.get("type") in {"transport-belt", "underground-belt", "splitter"}
                 role = ROLE_ALIASES.get(value["name"], {}).get(inventory_role, inventory_role)
+                if belt and role is not None:
+                    raise BridgeError(
+                        "invalid_input",
+                        "inventory_role is not applicable to belt targets.",
+                        {"entity": value["name"], "inventory_role": inventory_role},
+                    )
                 if role is not None and role not in inventories:
                     return _error_response(
                         BridgeError(
@@ -1956,6 +1973,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                     current = (finished - initial_products_finished) * value[
                         "recipe_product_amounts"
                     ][item]
+                elif belt:
+                    # The Mod merges get_contents() for transport lines 1..max,
+                    # including underground segments and all splitter channels.
+                    current = sum(
+                        stack["count"] for stack in value["belt_items"] if stack["name"] == item
+                    )
                 else:
                     contents = [inventories[role]] if role is not None else inventories.values()
                     current = sum(
@@ -1997,6 +2020,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                         result["status"] = status
                     if produced:
                         result["produced"] = True
+                    if belt:
+                        result["belt"] = True
                     if role is not None:
                         result["inventory_role"] = role
                     if value.get("missing_ingredients") is not None:
@@ -2006,7 +2031,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
                         result["hint"] = ITEMS_STALLED_HINTS[status]
                     if output_full:
                         result["output_full"] = True
-                    if not reached:
+                    if not reached and not belt:
                         try:
                             diagnostics = _success_value(
                                 "entity_feeders",
