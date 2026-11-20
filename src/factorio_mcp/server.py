@@ -155,6 +155,11 @@ PLACE_DESCRIPTION = (
     " Returns target_ref for the placed entity, the snapped position and actual"
     " fluid_connections with port position,"
     " target_position, direction, flow, fluidbox_index, and connected when present."
+    " Ports include fluid (filter, recipe lock, or contents), production_type when known,"
+    " and connected_to={target_ref, name} for the connected entity, including other forces."
+    " Conflicting adjacent fluids return blocked with detail.reason=fluid_mixing,"
+    " fluids and a hint."
+    " The Mod checks this before building: 2.0.77 surface checks allow destructive merging."
     " Actual fluid_connections reflect the live API: assembling-machine-2 hides its"
     " fluid boxes until a fluid recipe is set; prototype previews may still show ports."
     " Pumpjacks must be placed on crude oil: off oil returns detail.reason=no_resource"
@@ -245,7 +250,8 @@ MACHINE_STATUS_DESCRIPTION = (
     " items for one more craft; fluid ingredients are excluded and qualities are combined."
     " When an inserter stops, check drop_target.status: no_recipe means set a recipe,"
     " full_output means take products out; the machine may already hold enough of the held"
-    " item and wait for another ingredient listed in drop_target.missing_ingredients."
+    " item and wait for another ingredient listed in drop_target.missing_ingredients or"
+    " drop_target.missing_fluids."
     " waiting_for_space_in_destination inserters include a hint explaining these checks."
     " For low_power or no_power, read a nearby electric pole with get_entity_inventory"
     " to see production and consumption."
@@ -257,6 +263,10 @@ INVENTORY_MACHINE_DESCRIPTION = (
     " Owned pumpjack also supports status-only reads with fluids and mining_target (crude-oil)."
     " assembling-machine-2, oil-refinery and chemical-plant have source/result inventories"
     " and recipe/status/production fields like assembling-machine-1; steel-chest has main."
+    " Fluid entities include live fluid_connections with fluid per port, production_type,"
+    " and connected_to={target_ref, name} when connected (including other forces)."
+    " For pipe, pipe-to-ground, pump and storage-tank, each fluids entry also includes"
+    " connected_to=[{target_ref, name}] (deduplicated) and unconnected_ports."
     " Fluidboxes include fluids = [{index, name, amount, capacity, temperature}], including"
     " empty boxes (amount=0, name and temperature omitted). Generators include power_output_kw:"
     " energy_generated_last_tick * 60 / 1000, the last tick's output in kW; idle/no-steam is 0."
@@ -319,6 +329,11 @@ def _running_walk_guidance(result: dict[str, Any]) -> dict[str, Any]:
 
 MACHINE_BUFFER_DESCRIPTION = (
     " For item outputs, full_output means the result is full (about one stack per product)."
+    " Assemblers, oil-refinery and chemical-plant with a recipe include missing_fluids"
+    " = [{name, amount}] for positive deficits for one craft in matching input fluidboxes,"
+    " including fluid_ingredient_shortage; full_fluids lists full output fluid names"
+    " when stopped with full_output. These diagnostics also appear in observe_nearby;"
+    " missing_fluids survives compact=true."
     " With enough"
     " ingredients an assembler keeps crafting until then. Add items listed in"
     " missing_ingredients when status is item_ingredient_shortage."
@@ -683,9 +698,19 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         "mining_area_resources",
         "stand_positions",
         "fluids",
+        "fluid_connections",
+        "missing_fluids",
+        "full_fluids",
     ):
         if field in result and not isinstance(result[field], list):
             result[field] = []
+    for fluid in result.get("fluids", []):
+        if (
+            isinstance(fluid, dict)
+            and "connected_to" in fluid
+            and not isinstance(fluid["connected_to"], list)
+        ):
+            fluid["connected_to"] = []
     lanes = result.get("belt_lanes")
     if isinstance(lanes, dict):
         for side in ("left", "right"):
@@ -728,6 +753,9 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
             for field in (
                 "belt_items",
                 "fluids",
+                "fluid_connections",
+                "missing_fluids",
+                "full_fluids",
                 "inventory_roles",
                 "missing_science",
                 "science_units",
@@ -1107,8 +1135,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "remaining science per pack type, including partly used packs, rounded to 3 decimals "
             "(a full pack is 1 unit); omitted when the lab input is empty. "
             "Owned fluid structures include fluid_connections with port position, target_position, "
-            "direction, flow, fluidbox_index, connected, "
+            "direction, flow, fluidbox_index, connected, fluid, production_type, "
+            "connected_to={target_ref, name} (including other forces), "
             "and connection_type (normal or underground). "
+            "Recipe machines include missing_fluids=[{name, amount}] for one craft input deficits "
+            "and full_fluids=[name] for full fluid outputs when stopped. "
             "Transport belts, underground-belt, and splitter include belt_items as "
             "{name, quality, count} entries merged across all transport lines. "
             "Read get_entity_inventory(ies) for belt_lanes separated into left and right "
@@ -1124,7 +1155,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " Use compact=true when inspecting many belts or machines: it omits bounding boxes"
             " and fluids and other per-entity details, and target_ref stays usable."
             " Entity entries keep only target_ref, name, x, y, direction, status,"
-            " missing_ingredients, recipe, belt_items, underground_type, neighbour,"
+            " missing_ingredients, missing_fluids, recipe, belt_items, underground_type, neighbour,"
             " pickup_position, drop_position,"
             " electric_network_id, input_priority, output_priority, filter,"
             " inventory_limit, no_drop_target and mining_target when present."
@@ -1366,6 +1397,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Items are not spilled normally; spilled_items reports an unexpected insert shortfall. "
             "Modules still cause not_empty with detail.reason=modules. "
             "Setting the same recipe is a no-op success."
+            " Returns live fluid_connections with fluid per port, production_type and"
+            " connected_to={target_ref, name} when connected, including no-op results."
         )
     )
     async def set_recipe(target_ref: RequiredText, recipe: RequiredText) -> CallToolResult:
@@ -1747,7 +1780,14 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and ground_items lists the stacks; free inventory space. "
             "Item-entity blocking entries include stack={name, quality, count}. "
             "Returns the snapped position and preview fluid_connections with port position, "
-            "target_position, direction, flow, and fluidbox_index when present. "
+            "target_position, direction, flow, fluidbox_index and production_type when present. "
+            "fluid is included only for a known prototype filter; "
+            "recipe-dependent fluid is omitted. "
+            "No recipe argument is accepted; set_recipe returns recipe-specific ports "
+            "after building. "
+            "Conflicting adjacent fluids return blocked_reason=fluid_mixing, fluids and a hint. "
+            "The Mod prevents merging before placement when surface collision checks alone "
+            "would allow it. "
             "Supports pumpjack, oil-refinery, chemical-plant, storage-tank, pump, "
             "assembling-machine-2 and steel-chest. "
             "Prototype previews can show assembling-machine-2 "
