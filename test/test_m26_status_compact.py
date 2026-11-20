@@ -1,6 +1,9 @@
+import ast
 import copy
 import json
+import re
 import unittest
+from pathlib import Path
 from unittest.mock import Mock
 
 from mcp import Client
@@ -41,8 +44,28 @@ class StatusCompactTests(unittest.IsolatedAsyncioTestCase):
             "target_ref stays usable",
             "Counts, paging, resources and blocked_tiles are unchanged",
             "compact defaults to false",
+            "inventory_limit, no_drop_target and mining_target",
+            "Fluids remain available with compact=false and in get_entity_inventory reads",
         ):
             self.assertIn(text, description)
+
+    def test_manual_whitelist_matches_mod_compact_fields(self):
+        root = Path(__file__).resolve().parents[1]
+        control = (root / "mod/factorio_ai_mcp_0.1.0/control.lua").read_text(encoding="utf-8")
+        fields = re.search(r"local COMPACT_ENTITY_FIELDS = \{(.*?)\}", control, re.S)
+        self.assertIsNotNone(fields)
+        compact_fields = re.findall(r'"([a-z_]+)"', fields[1])
+        manual = ast.parse((root / "test/manual/negative_checks.py").read_text(encoding="utf-8"))
+        whitelists = [
+            ast.literal_eval(node.value)
+            for node in ast.walk(manual)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "whitelist" for t in node.targets)
+        ]
+        self.assertEqual(whitelists, [set(compact_fields)])
+        self.assertEqual(len(compact_fields), len(set(compact_fields)))
+        self.assertIn("mining_target", compact_fields)
+        self.assertNotIn("fluids", compact_fields)
 
     async def test_compact_schema_and_only_true_is_forwarded(self):
         bridge = Mock()
