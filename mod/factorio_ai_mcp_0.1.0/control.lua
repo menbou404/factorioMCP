@@ -6,7 +6,8 @@ local OBSERVATION_RADIUS = 16
 local COMPACT_ENTITY_FIELDS = {
   "target_ref", "name", "x", "y", "direction", "status", "missing_ingredients", "recipe", "belt_items",
   "underground_type", "neighbour", "pickup_position", "drop_position", "electric_network_id",
-  "input_priority", "output_priority", "filter", "inventory_limit", "no_drop_target"
+  "input_priority", "output_priority", "filter", "inventory_limit", "no_drop_target",
+  "mining_target"
 }
 local MAP_CELL_SIZE = 8
 local MAX_EXPLORED_CELLS = 16384
@@ -18,6 +19,29 @@ local ENTITY_STATUS_NAMES = {}
 for name, value in pairs(defines.entity_status) do
   ENTITY_STATUS_NAMES[value] = name
 end
+local function is_fluid_resource(prototype)
+  if not prototype or prototype.type ~= "resource" then return false end
+  if prototype.resource_category == "basic-fluid" then return true end
+  local properties = prototype.mineable_properties
+  for _, product in pairs(properties and properties.products or {}) do
+    if product.type == "fluid" then return true end
+  end
+  return false
+end
+
+local function add_resource_amount(summary, prototype, count, amount)
+  if is_fluid_resource(prototype) then
+    summary.count = (summary.count or 0) + count
+    local normal = prototype.normal_resource_amount
+    -- Combined well yield, in percent; amount is not a finite item quantity.
+    if normal and normal > 0 then
+      summary.yield_percent = (summary.yield_percent or 0) + amount / normal * 100
+    end
+  else
+    summary.total_amount = (summary.total_amount or 0) + amount
+  end
+end
+
 local function reported_entity_status(entity)
   local status = ENTITY_STATUS_NAMES[entity.status]
   if status ~= "full_output" or entity.type ~= "assembling-machine" then return status end
@@ -43,19 +67,22 @@ local function reported_entity_status(entity)
   return "item_ingredient_shortage", missing
 end
 local PLACEABLE_ITEMS = {
-  ["wooden-chest"] = true, ["iron-chest"] = true,
+  ["wooden-chest"] = true, ["iron-chest"] = true, ["steel-chest"] = true,
   ["stone-furnace"] = true,
   ["burner-mining-drill"] = true, ["transport-belt"] = true,
   ["underground-belt"] = true, ["splitter"] = true,
   ["long-handed-inserter"] = true, ["pipe-to-ground"] = true,
   ["inserter"] = true, ["burner-inserter"] = true, ["small-electric-pole"] = true,
   ["assembling-machine-1"] = true, ["electric-mining-drill"] = true,
+  ["assembling-machine-2"] = true, ["oil-refinery"] = true, ["chemical-plant"] = true,
+  ["pumpjack"] = true, ["storage-tank"] = true, ["pump"] = true,
   ["pipe"] = true, ["offshore-pump"] = true, ["boiler"] = true,
   ["steam-engine"] = true, ["lab"] = true
 }
 local INVENTORY_ROLES = {
   ["wooden-chest"] = {main = defines.inventory.chest},
   ["iron-chest"] = {main = defines.inventory.chest},
+  ["steel-chest"] = {main = defines.inventory.chest},
   ["stone-furnace"] = {source = defines.inventory.crafter_input,
                        result = defines.inventory.crafter_output,
                        fuel = defines.inventory.fuel},
@@ -64,10 +91,17 @@ local INVENTORY_ROLES = {
   ["boiler"] = {fuel = defines.inventory.fuel},
   ["lab"] = {input = defines.inventory.lab_input},
   ["assembling-machine-1"] = {source = defines.inventory.crafter_input,
-                              result = defines.inventory.crafter_output}
+                              result = defines.inventory.crafter_output},
+  ["assembling-machine-2"] = {source = defines.inventory.crafter_input,
+                              result = defines.inventory.crafter_output},
+  ["oil-refinery"] = {source = defines.inventory.crafter_input,
+                      result = defines.inventory.crafter_output},
+  ["chemical-plant"] = {source = defines.inventory.crafter_input,
+                        result = defines.inventory.crafter_output}
 }
 local STATUS_ONLY_ENTITIES = {
   ["steam-engine"] = true, ["steam-turbine"] = true, ["offshore-pump"] = true,
+  ["pumpjack"] = true,
   ["pipe"] = true, ["pipe-to-ground"] = true, ["storage-tank"] = true, ["pump"] = true,
   ["inserter"] = true, ["long-handed-inserter"] = true, ["electric-mining-drill"] = true,
   ["small-electric-pole"] = true, ["medium-electric-pole"] = true,
@@ -77,6 +111,9 @@ local STATUS_ONLY_ENTITIES = {
 local ROLE_ALIASES = {
   ["stone-furnace"] = {input = "source", output = "result"},
   ["assembling-machine-1"] = {input = "source", output = "result"},
+  ["assembling-machine-2"] = {input = "source", output = "result"},
+  ["oil-refinery"] = {input = "source", output = "result"},
+  ["chemical-plant"] = {input = "source", output = "result"},
   ["lab"] = {source = "input"}
 }
 
@@ -693,6 +730,7 @@ local function item_target(entity, pickup)
 end
 
 local function add_item_targets(state, entity, result, placement)
+  if entity.name == "pumpjack" then return result end -- Fluid output has no item drop target.
   if entity.type ~= "inserter" and entity.type ~= "mining-drill" then return result end
   local function reference(target)
     if target then return {target_ref = register_target(state, target), name = target.name} end
@@ -1070,6 +1108,10 @@ local function prepare_mine(character, params)
   if target.force ~= character.force and target.force.name ~= "neutral" then
     return nil, "invalid_target", {entity = target.name, reason = "other_force"}
   end
+  if is_fluid_resource(target.prototype) then
+    return nil, "invalid_target", {entity = target.name, reason = "fluid_resource",
+      hint = "Use a pumpjack to extract crude oil; fluid resources cannot be mined by hand."}
+  end
   if not target.minable then return nil, "invalid_target" end
   if not character.can_reach_entity(target) then
     return nil, "out_of_range", range_detail(character, target.position, reach)
@@ -1081,8 +1123,7 @@ local function prepare_mine(character, params)
   for _, product in pairs(properties and properties.products or {}) do
     if product.type == "item" then product_names[product.name] = true end
   end
-  -- Fluid-only resources retain the total-count fallback. Empty non-resource sets
-  -- are saved as empty tables and complete solely when the target disappears.
+  -- Empty non-resource sets complete solely when the target disappears.
   if target.type == "resource" and next(product_names) == nil then product_names = nil end
   local before = mining_inventory_count(character, product_names)
   character.selected = target
@@ -1528,7 +1569,7 @@ local function map_components(cells, kind, name, position)
           local resource = cell.resources[name]
           if cell.partial then group.partial = true end
           group.tiles = (group.tiles or 0) + resource.tiles
-          group.total_amount = (group.total_amount or 0) + resource.amount
+          add_resource_amount(group, prototypes.entity[name], resource.tiles, resource.amount)
           group.nearest = nearest_sample(group.nearest, resource.sample, position)
         elseif kind == "water" then
           group.tiles = (group.tiles or 0) + cell.water
@@ -1790,13 +1831,13 @@ local function do_observe(state, params)
       local resource = resources_by_name[entity.name]
       local position = entity.position
       if not resource then
-        resource = {name = entity.name, tiles = 0, total_amount = 0,
+        resource = {name = entity.name, tiles = 0,
                     left_top = {x = position.x, y = position.y},
                     right_bottom = {x = position.x, y = position.y}}
         resources_by_name[entity.name] = resource
       end
       resource.tiles = resource.tiles + 1
-      resource.total_amount = resource.total_amount + entity.amount
+      add_resource_amount(resource, entity.prototype, 1, entity.amount)
       resource.left_top.x = math.min(resource.left_top.x, position.x)
       resource.left_top.y = math.min(resource.left_top.y, position.y)
       resource.right_bottom.x = math.max(resource.right_bottom.x, position.x)
@@ -1878,13 +1919,17 @@ local function do_observe(state, params)
       end
       observed.filter = item_filter_name(entity.splitter_filter)
     end
-    if entity.type == "inserter" or entity.type == "mining-drill" then
+    if entity.type == "mining-drill" and observed.owned then
+      local resource = entity.mining_target
+      if resource and resource.valid then observed.mining_target = resource.name end
+    end
+    if entity.type == "inserter" or (entity.type == "mining-drill" and entity.name ~= "pumpjack") then
       observed.drop_position = entity.drop_position
       if observed.owned and not item_target(entity, false) then observed.no_drop_target = true end
     end
     local fluids = {}
     local fluidbox = entity.fluidbox
-    for fluid_index = 1, #fluidbox do
+    for fluid_index = 1, fluidbox and #fluidbox or 0 do
       local fluid = fluidbox[fluid_index]
       if fluid then fluids[#fluids + 1] = {name = fluid.name, amount = fluid.amount} end
     end
@@ -2086,7 +2131,10 @@ local function research_trigger_data(technology)
     item = item.name
     if item and type(item) ~= "string" then item = item.name end
   end
-  return {type = trigger.type, item = item,
+  local entity = trigger.entity
+  if entity and type(entity) ~= "string" then entity = entity.name end
+  return {type = trigger.type, item = item, entity = entity,
+          fluid = trigger.fluid, amount = trigger.amount,
           count = trigger.count or (trigger.type == "craft-item" and 1 or nil)}
 end
 
@@ -2300,7 +2348,7 @@ local function preview_inserter_positions(prototype, position, direction)
 end
 
 local function preview_drill_drop_position(prototype, position, direction)
-  if prototype.type ~= "mining-drill" then return nil end
+  if prototype.type ~= "mining-drill" or prototype.name == "pumpjack" then return nil end
   return absolute_placement_position(prototype.vector_to_place_result, position, direction)
 end
 
@@ -2582,7 +2630,13 @@ local function placement_blocking(state, character, prototype, position, directi
     if prototype.type == "mining-drill" then
       local resources = placement_mining_area_resources(character, prototype, position, direction)
       detail.mining_area_resources = resources
-      if #resources == 0 then detail.reason_detail = "no_resources_in_mining_area" end
+      if #resources == 0 then
+        detail.reason_detail = "no_resources_in_mining_area"
+        if prototype.name == "pumpjack" then
+          detail.reason = "no_resource"
+          detail.hint = "Pumpjacks must be placed on crude oil."
+        end
+      end
     end
     local nearby, seen = {}, {}
     for dx = -8, 8 do
@@ -2802,7 +2856,7 @@ local function do_check_placement(state, params)
           stand_positions = blocked.stand_positions,
           ground_items = placement and placement.ground_items or blocked.ground_items,
           mining_area_resources = mining_area_resources,
-          reason_detail = blocked.reason_detail}
+          reason_detail = blocked.reason_detail, hint = blocked.hint}
 end
 
 local function electric_network_detail(target)
@@ -2891,7 +2945,8 @@ local function do_place(state, params, line_placement, own_action)
           direction = created.direction, consumed_item = params.item,
           pickup_position = created.type == "inserter" and created.pickup_position or nil,
           drop_lane = inserter_drop_lane(created),
-          drop_position = (created.type == "inserter" or created.type == "mining-drill") and
+          drop_position = (created.type == "inserter" or
+                          (created.type == "mining-drill" and created.name ~= "pumpjack")) and
                           created.drop_position or nil,
           fluid_connections = placed_fluid_connections(created), collected_items = collected_items,
           mining_area_resources = placement_mining_area_resources(character, created.prototype,
@@ -3185,6 +3240,8 @@ local function do_rotate(state, params)
       if not target.rotate{reverse = false} then break end
       rotations = rotations + 1
       local current = target.direction
+      -- Native rotate can have a shorter cycle despite supports_direction=true:
+      -- a placed 1x2 pump reverses 180 degrees, retaining its footprint/axis.
       if seen[current] then break end
       seen[current] = true
     end
@@ -3195,7 +3252,7 @@ local function do_rotate(state, params)
       for value in pairs(seen) do reachable[#reachable + 1] = value end
       table.sort(reachable)
       return nil, "invalid_target", {reason = "direction_unreachable",
-        direction = target.direction, reachable_directions = reachable}
+        direction = target.direction, requested_direction = direction, reachable_directions = reachable}
     end
   end
   return {name = target.name, direction = target.direction, position = position_data(target),
@@ -3331,8 +3388,15 @@ local function do_set_recipe(state, params)
   end
   local recipe = character.force.recipes[params.recipe]
   local categories = target.prototype.crafting_categories
-  if not recipe or not recipe.enabled or not categories or not categories[recipe.category] then
-    return nil, "recipe_unavailable"
+  if not recipe or not recipe.enabled then
+    return nil, "recipe_unavailable", {recipe = params.recipe,
+      reason = recipe and "disabled" or "unknown"}
+  end
+  if not categories or not categories[recipe.category] then
+    return nil, "invalid_input", {entity = target.name, recipe = params.recipe,
+      reason = "unsupported_recipe_category", category = recipe.category,
+      supported_categories = sorted_keys(categories or {}),
+      hint = "Choose a machine that supports this recipe category."}
   end
   local modules = target.get_module_inventory()
   if modules and not modules.is_empty() then return nil, "not_empty", {reason = "modules"} end
@@ -3498,7 +3562,7 @@ local function do_entity_inventory(state, params)
   local status, recipe, missing = inventory_entity_state(target)
   local fluids = {}
   local fluidbox = target.fluidbox
-  for index = 1, #fluidbox do
+  for index = 1, fluidbox and #fluidbox or 0 do
     local fluid = fluidbox[index]
     fluids[#fluids + 1] = {index = index, name = fluid and fluid.name,
       amount = fluid and fluid.amount or 0, capacity = fluidbox.get_capacity(index),
@@ -3541,7 +3605,7 @@ local function do_entity_inventory(state, params)
       held_stack = {name = stack.name, quality = stack.quality.name, count = stack.count}
     end
   elseif target.type == "mining-drill" then
-    drop_position = target.drop_position
+    if target.name ~= "pumpjack" then drop_position = target.drop_position end
     local resource = target.mining_target
     if resource and resource.valid then mining_target = resource.name end
   end

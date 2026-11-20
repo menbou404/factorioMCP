@@ -2997,6 +2997,12 @@ def main():
             "drop_position",
             "electric_network_id",
             "no_drop_target",
+            "missing_ingredients",
+            "input_priority",
+            "output_priority",
+            "filter",
+            "inventory_limit",
+            "mining_target",
         }
         page = 0
         total = 0
@@ -4864,6 +4870,7 @@ def main():
             == {
                 "reason": "direction_unreachable",
                 "direction": cycle["original"],
+                "requested_direction": unreachable,
                 "reachable_directions": cycle["reachable"],
             }
             and actual["direction"] == cycle["original"],
@@ -4877,7 +4884,12 @@ def main():
             is_error
             and value["error"] == "invalid_target"
             and value["detail"]
-            == {"reason": "direction_unreachable", "direction": 0, "reachable_directions": [0]},
+            == {
+                "reason": "direction_unreachable",
+                "direction": 0,
+                "requested_direction": 4,
+                "reachable_directions": [0],
+            },
             json.dumps(value),
         )
         with patch.object(bridge, "call", wraps=bridge.call) as calls:
@@ -6631,6 +6643,456 @@ def main():
             restored.get("restored") is True
             and bridge.call("get_inventory")["result"]["items"] == m39_inventory
             and bridge.call("get_agent_status")["result"]["position"] == m39_position,
+        )
+
+    # M40 CT/CU: only fixture RCON creates resources, supplies items or teleports.
+    m40_surface = "m40-oil-entities-fixture"
+    m40_server = create_server(bridge)
+    m40_inventory = bridge.call("get_inventory")["result"]["items"]
+    m40_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m40_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m40_surface}";local s=game.surfaces[name];'
+            "local b=storage.m40_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m40:" not in raw:
+            raise RuntimeError("M40 fixture failed: " + raw)
+        return json.loads(raw.split("m40:", 1)[1].strip())
+
+    def m40_tool(name, args):
+        response = asyncio.run(m40_server.call_tool(name, args))
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    def m40_error(name, args, code, reason):
+        response = asyncio.run(m40_server.call_tool(name, args))
+        value = json.loads(response.content[0].text)
+        record(
+            f"M40 {name} rejects {reason}",
+            response.is_error
+            and value.get("error") == code
+            and value.get("detail", {}).get("reason") == reason,
+            json.dumps(value),
+        )
+        return value
+
+    def m40_read_until(target_ref, predicate):
+        deadline = time.monotonic() + 12
+        while True:
+            value = m40_tool("get_entity_inventory", {"target_ref": target_ref})
+            if predicate(value) or time.monotonic() >= deadline:
+                return value
+            time.sleep(0.1)
+
+    def m40_place(item, x, direction=0, fluid=False):
+        m40_fixture(f"assert(c.teleport({{{x},5.5}},s));rcon.print('m40:{{}}')")
+        args = {"item": item, "surface": m40_surface, "x": x, "y": 0.5, "direction": direction}
+        preview = m40_tool("check_placement", args)
+        placed = m40_tool("place_entity", args)
+        record(
+            f"M40 CT {item} checks and places a real inventory item",
+            preview.get("placeable") is True and placed.get("consumed_item") == item,
+            json.dumps({"preview": preview, "placed": placed}),
+        )
+        if fluid:
+            # Compare prototype ports against live API ports, including the unusual
+            # direction-dependent pumpjack output. Do not synthesize hidden boxes.
+            def ports(value, relative=False):
+                centre = value.get("position", value)
+                x, y = (centre["x"], centre["y"]) if relative else (0, 0)
+                return {
+                    (
+                        p["position"]["x"] - x,
+                        p["position"]["y"] - y,
+                        p["target_position"]["x"] - x,
+                        p["target_position"]["y"] - y,
+                    )
+                    for p in value.get("fluid_connections", [])
+                }
+
+            record(
+                f"M40 CT {item} preview matches actual direction-dependent fluid ports",
+                bool(ports(placed)) and ports(placed) == ports(preview),
+            )
+            # Measure the native API cycle instead of assuming a 90-degree step.
+            # supports_direction does not guarantee four reachable orientations:
+            # tanks use two_direction_only and placed 1x2 pumps retain their axis.
+            native = m40_fixture(
+                f"local e=s.find_entities_filtered{{name='{item}'}}[1];assert(e);"
+                "local original=e.direction;local seen={[original]=true};local next_direction;"
+                "for i=1,4 do if not e.rotate{reverse=false} then break end;"
+                "next_direction=next_direction or e.direction;"
+                "if seen[e.direction] then break end;seen[e.direction]=true end;"
+                "e.direction=original;local reachable={};"
+                "for d in pairs(seen) do reachable[#reachable+1]=d end;table.sort(reachable);"
+                "rcon.print('m40:'..helpers.table_to_json({direction=original,"
+                "next_direction=next_direction,reachable=reachable}))"
+            )
+            rotated_direction = native.get("next_direction", native["direction"])
+            # A rotation regression must be recorded without skipping the remaining
+            # inventory/category checks; the outer finally always restores the fixture.
+            response = asyncio.run(
+                m40_server.call_tool(
+                    "rotate_entity",
+                    {"target_ref": placed["target_ref"], "direction": rotated_direction},
+                )
+            )
+            rotated = json.loads(response.content[0].text)
+            rotated_preview = m40_tool("check_placement", {**args, "direction": rotated_direction})
+            entities = m40_tool("observe_nearby", {"names": [item]})["entities"]
+            observed = next(e for e in entities if e["target_ref"] == placed["target_ref"])
+            record(
+                f"M40 CT {item} rotates and live fluid ports follow the new direction",
+                not response.is_error
+                and rotated.get("direction") == rotated_direction
+                and ports(observed, relative=True) == ports(rotated_preview, relative=True),
+                json.dumps({"native": native, "rotated": rotated, "observed": observed}),
+            )
+            if item == "pump":
+                unreachable = next(d for d in (0, 4, 8, 12) if d not in native["reachable"])
+                rejected = m40_error(
+                    "rotate_entity",
+                    {"target_ref": placed["target_ref"], "direction": unreachable},
+                    "invalid_target",
+                    "direction_unreachable",
+                )
+                actual = next(
+                    e
+                    for e in m40_tool("observe_nearby", {"names": [item]})["entities"]
+                    if e["target_ref"] == placed["target_ref"]
+                )
+                detail = rejected.get("detail", {})
+                record(
+                    "M40 CT pump rejects the other axis and restores its original direction",
+                    native["reachable"] == [4, 12]
+                    and detail.get("requested_direction") == unreachable
+                    and detail.get("direction") == actual.get("direction") == observed["direction"]
+                    and detail.get("reachable_directions") == native["reachable"],
+                    json.dumps(rejected),
+                )
+                for reachable in detail.get("reachable_directions", []):
+                    response = asyncio.run(
+                        m40_server.call_tool(
+                            "rotate_entity",
+                            {"target_ref": placed["target_ref"], "direction": reachable},
+                        )
+                    )
+                    result = json.loads(response.content[0].text)
+                    record(
+                        f"M40 CT pump reaches reported direction {reachable}",
+                        not response.is_error and result.get("direction") == reachable,
+                        json.dumps(result),
+                    )
+        return placed
+
+    def m40_power(placed):
+        p = placed["position"]
+        m40_fixture(
+            f"local x,y={p['x']},{p['y']};"
+            "local g=s.create_entity{name='electric-energy-interface',"
+            "position={x+4,y-2},force=c.force};assert(g);"
+            "g.power_production=1000000/60;g.power_usage=0;"
+            "g.electric_buffer_size=1000000;g.energy=1000000;"
+            "assert(s.create_entity{name='small-electric-pole',"
+            "position={x+2,y-2},force=c.force});rcon.print('m40:{}')"
+        )
+
+    try:
+        m40_fixture(
+            "assert(not s and not b,'M40 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,selected=c.selected,"
+            "inventory=game.create_inventory(#inv),saved={},recipes={},technologies={},queue={},"
+            "research_enabled=c.force.research_enabled,progress=c.force.research_progress,"
+            "fields={'targets','owned_refs','recipe_baselines','last_observation',"
+            "'recent_observations','explored_map','last_action','completed_actions',"
+            "'completed_order','processed','processed_order','next_target_id','next_action_id',"
+            "'path_request_id','last_heartbeat_tick'}};storage.m40_backup=b;"
+            "for _,t in ipairs(c.force.research_queue or {}) do b.queue[#b.queue+1]=t.name end;"
+            "for n,r in pairs(c.force.recipes) do b.recipes[n]=r.enabled end;"
+            "for n,t in pairs(c.force.technologies) do b.technologies[n]={researched=t.researched,"
+            "enabled=t.enabled,level=t.level,progress=t.saved_progress} end;"
+            "c.force.disable_research();"
+            "for _,key in ipairs(b.fields) do b.saved[key]=state[key] end;"
+            "for _,key in ipairs({'targets','owned_refs','recipe_baselines','recent_observations',"
+            "'explored_map','completed_actions','completed_order','processed','processed_order'}) "
+            "do state[key]={} end;state.last_observation=nil;state.last_action=nil;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=128,height=64});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},3);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-64,63 do for y=-32,31 do "
+            "tiles[#tiles+1]={name=(x>=20 and x<=23 and y>=20 and y<=23) and 'water' or 'grass-1',"
+            "position={x,y}} end end;s.set_tiles(tiles);"
+            "assert(s.create_entity{name='crude-oil',position={-32.5,0.5},amount=300000});"
+            "for _,n in ipairs({'basic-oil-processing','plastic-bar','sulfur','sulfuric-acid',"
+            "'lubricant','iron-gear-wheel','engine-unit','electric-engine-unit'}) do "
+            "assert(c.force.recipes[n]);c.force.recipes[n].enabled=true end;"
+            "for n,count in pairs({['pumpjack']=2,['oil-refinery']=1,['chemical-plant']=1,"
+            "['assembling-machine-2']=1,['steel-chest']=1,['storage-tank']=1,['pump']=1,"
+            "['assembling-machine-1']=1,['coal']=20,['iron-plate']=20}) do "
+            "assert(inv.insert{name=n,count=count}==count) end;"
+            "assert(c.teleport({-32.5,5.5},s));rcon.print('m40:{}')"
+        )
+        oil_observation = m40_tool("observe_nearby", {"include_resources": True})
+        oil = next(e for e in oil_observation["entities"] if e["name"] == "crude-oil")
+        summary = next(r for r in oil_observation["resources"] if r["name"] == "crude-oil")
+        explored = m40_tool("get_explored_map", {"resource_names": ["crude-oil"]})
+        record(
+            "M40 CU crude oil is observed and remembered as a deposit count and yield",
+            summary.get("count") == 1
+            and "total_amount" not in summary
+            and math.isclose(summary.get("yield_percent", -1), 100)
+            and len(explored["resources"]) == 1
+            and explored["resources"][0].get("count") == 1
+            and "total_amount" not in explored["resources"][0],
+            json.dumps({"summary": summary, "map": explored}),
+        )
+        m40_fixture("assert(c.teleport({-32.5,2.5},s));rcon.print('m40:{}')")
+        rejected = m40_error(
+            "mine_entity", {"target_ref": oil["target_ref"]}, "invalid_target", "fluid_resource"
+        )
+        record(
+            "M40 CU hand mining hint directs the AI to a pumpjack",
+            "pumpjack" in rejected.get("hint", ""),
+        )
+        tech = m40_tool("get_technology_info", {"technology": "oil-processing"})
+        record(
+            "M40 CU oil-processing exposes its mining trigger even before research",
+            tech.get("trigger") == {"type": "mine-entity", "entity": "crude-oil"},
+            json.dumps(tech),
+        )
+
+        pumpjack = m40_place("pumpjack", -32.5, direction=4, fluid=True)
+        record(
+            "M40 CU pumpjack placement reports crude oil in its mining area",
+            pumpjack.get("mining_area_resources") == [{"name": "crude-oil", "tiles": 1}],
+        )
+        m40_power(pumpjack)
+        pumped = m40_read_until(
+            pumpjack["target_ref"],
+            lambda v: any(
+                f.get("name") == "crude-oil" and f.get("amount", 0) > 0 for f in v.get("fluids", [])
+            ),
+        )
+        record(
+            "M40 CU a powered pumpjack actually extracts crude oil",
+            pumped.get("mining_target") == "crude-oil"
+            and any(
+                f.get("name") == "crude-oil" and f.get("amount", 0) > 0
+                for f in pumped.get("fluids", [])
+            ),
+            json.dumps(pumped),
+        )
+        compact = m40_tool("observe_nearby", {"names": ["pumpjack"], "compact": True})["entities"][
+            0
+        ]
+        record(
+            "M40 CU compact pumpjack observation keeps mining_target and omits fluids",
+            compact.get("mining_target") == "crude-oil" and "fluids" not in compact,
+        )
+        full = m40_tool("observe_nearby", {"names": ["pumpjack"], "compact": False})["entities"][0]
+        record(
+            "M40 CU full pumpjack observation retains fluids and mining_target",
+            full.get("mining_target") == "crude-oil" and bool(full.get("fluids")),
+        )
+        off_oil = {"item": "pumpjack", "surface": m40_surface, "x": -32.5, "y": 10.5}
+        preview = m40_tool("check_placement", off_oil)
+        record(
+            "M40 CU pumpjack preview rejects placement off crude oil clearly",
+            preview.get("placeable") is False
+            and preview.get("blocked_reason") == "no_resource"
+            and preview.get("mining_area_resources") == []
+            and "crude oil" in preview.get("hint", ""),
+            json.dumps(preview),
+        )
+        m40_error("place_entity", off_oil, "blocked", "no_resource")
+
+        refinery = m40_place("oil-refinery", -20.5, direction=8, fluid=True)
+        configured = m40_tool(
+            "set_recipe", {"target_ref": refinery["target_ref"], "recipe": "basic-oil-processing"}
+        )
+        read = m40_tool("get_entity_inventory", {"target_ref": refinery["target_ref"]})
+        record(
+            "M40 CT refinery accepts basic-oil-processing and reports recipe and fluids",
+            configured.get("recipe") == read.get("recipe") == "basic-oil-processing"
+            and bool(read.get("fluids"))
+            and "source" in read["inventories"]
+            and "result" in read["inventories"],
+            json.dumps(read),
+        )
+
+        plant = m40_place("chemical-plant", -8.5, direction=12, fluid=True)
+        m40_power(plant)
+        m40_tool("set_recipe", {"target_ref": plant["target_ref"], "recipe": "plastic-bar"})
+        transfer = m40_tool(
+            "transfer_item",
+            {
+                "target_ref": plant["target_ref"],
+                "direction": "to_entity",
+                "inventory_role": "input",
+                "item": "coal",
+                "count": 5,
+            },
+        )
+        read = m40_tool("get_entity_inventory", {"target_ref": plant["target_ref"]})
+        record(
+            "M40 CT chemical plant accepts coal in source for plastic-bar",
+            transfer.get("moved") == 5
+            and read.get("recipe") == "plastic-bar"
+            and bool(read.get("status"))
+            and sum(i["count"] for i in read["inventories"]["source"] if i["name"] == "coal") == 5,
+            json.dumps(read),
+        )
+        m40_fixture(
+            "local e=assert(s.find_entity('chemical-plant',{-8.5,0.5}));"
+            "e.get_inventory(defines.inventory.crafter_input).clear();"
+            "assert(e.get_output_inventory().insert{name='plastic-bar',count=10000}>0);"
+            "rcon.print('m40:{}')"
+        )
+        shortage = m40_read_until(
+            plant["target_ref"], lambda v: v.get("status") == "item_ingredient_shortage"
+        )
+        record(
+            "M40 CT chemical plant shortage correction counts coal and excludes fluids",
+            shortage.get("status") == "item_ingredient_shortage"
+            and shortage.get("missing_ingredients") == [{"name": "coal", "count": 1}],
+            json.dumps(shortage),
+        )
+
+        assembler = m40_place("assembling-machine-2", 3.5)
+        m40_tool(
+            "set_recipe", {"target_ref": assembler["target_ref"], "recipe": "electric-engine-unit"}
+        )
+        fluid_read = m40_tool("get_entity_inventory", {"target_ref": assembler["target_ref"]})
+        fluid_observed = m40_tool("observe_nearby", {"names": ["assembling-machine-2"]})[
+            "entities"
+        ][0]
+        record(
+            "M40 CT assembling-machine-2 exposes live fluid boxes for a fluid recipe",
+            fluid_read.get("recipe") == "electric-engine-unit"
+            and bool(fluid_read.get("fluids"))
+            and bool(fluid_observed.get("fluid_connections")),
+            json.dumps(fluid_read),
+        )
+        m40_tool("set_recipe", {"target_ref": assembler["target_ref"], "recipe": "iron-gear-wheel"})
+        transfer = m40_tool(
+            "transfer_item",
+            {
+                "target_ref": assembler["target_ref"],
+                "direction": "to_entity",
+                "inventory_role": "source",
+                "item": "iron-plate",
+                "count": 5,
+            },
+        )
+        read = m40_tool("get_entity_inventory", {"target_ref": assembler["target_ref"]})
+        record(
+            "M40 CT assembling-machine-2 supports recipe, inventory read and transfer",
+            transfer.get("moved") == 5
+            and read.get("recipe") == "iron-gear-wheel"
+            and sum(i["count"] for i in read["inventories"]["source"] if i["name"] == "iron-plate")
+            == 5,
+        )
+        chest = m40_place("steel-chest", 15.5)
+        transfer = m40_tool(
+            "transfer_item",
+            {
+                "target_ref": chest["target_ref"],
+                "direction": "to_entity",
+                "inventory_role": "main",
+                "item": "coal",
+                "count": 2,
+            },
+        )
+        read = m40_tool("get_entity_inventory", {"target_ref": chest["target_ref"]})
+        record(
+            "M40 CT steel-chest supports main inventory and real item transfer",
+            transfer.get("moved") == 2
+            and sum(i["count"] for i in read["inventories"]["main"] if i["name"] == "coal") == 2,
+        )
+        for item, x, direction in (("storage-tank", 27.5, 0), ("pump", 39.5, 12)):
+            placed = m40_place(item, x, direction=direction, fluid=True)
+            read = m40_tool("get_entity_inventory", {"target_ref": placed["target_ref"]})
+            batch = m40_tool("get_entity_inventories", {"target_refs": [placed["target_ref"]]})
+            record(
+                f"M40 CT {item} single and batch reads report status and fluid boxes",
+                read.get("inventories") == {}
+                and bool(read.get("fluids"))
+                and bool(read.get("status"))
+                and batch["results"][0].get("result", {}).get("fluids") == read.get("fluids"),
+                json.dumps(read),
+            )
+        old_assembler = m40_place("assembling-machine-1", 51.5)
+        m40_error(
+            "set_recipe",
+            {"target_ref": old_assembler["target_ref"], "recipe": "plastic-bar"},
+            "invalid_input",
+            "unsupported_recipe_category",
+        )
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = m40_fixture(
+                f"rcon.print('m40:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m40_fixture(
+            "if b then assert(c.crafting_queue_size==0);c.force.research_queue={};"
+            "for n,v in pairs(b.technologies) do local t=c.force.technologies[n];"
+            "if t.level~=v.level then t.level=v.level end;"
+            "if t.researched~=v.researched then t.researched=v.researched end;"
+            "t.enabled=v.enabled end;"
+            "for n,enabled in pairs(b.recipes) do c.force.recipes[n].enabled=enabled end;"
+            "c.force.research_queue=b.queue;"
+            "for n,v in pairs(b.technologies) do "
+            "c.force.technologies[n].saved_progress=v.progress end;"
+            "if c.force.current_research then c.force.research_progress=b.progress end;"
+            "if b.research_enabled then c.force.enable_research() "
+            "else c.force.disable_research() end;"
+            "for n,v in pairs(b.technologies) do local t=c.force.technologies[n];"
+            "assert(t.level==v.level and t.researched==v.researched and t.enabled==v.enabled "
+            "and t.saved_progress==v.progress) end;"
+            "for n,enabled in pairs(b.recipes) do assert(c.force.recipes[n].enabled==enabled) end;"
+            "local queue=c.force.research_queue or {};assert(#queue==#b.queue);"
+            "for i,t in ipairs(queue) do assert(t.name==b.queue[i]) end;"
+            "assert(c.force.research_progress==b.progress "
+            "and c.force.research_enabled==b.research_enabled);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();if s then assert(game.delete_surface(s)) end;"
+            "for _,key in ipairs(b.fields) do state[key]=b.saved[key] end;"
+            "for _,key in ipairs(b.fields) do assert(state[key]==b.saved[key]) end;"
+            "storage.m40_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m40:'..helpers.table_to_json({restored=true}))"
+        )
+        # Surface deletion completes at the end of the tick, so verify removal
+        # in a separate RCON request after the restoration command has completed.
+        removed = m40_fixture(
+            "rcon.print('m40:'..helpers.table_to_json({backup=b~=nil,surface=s~=nil}))"
+        )
+        observed_map_cells.pop(m40_surface, None)
+        record(
+            "M40 restores inventory, queue, position, observations and force recipes/technologies",
+            restored.get("restored") is True
+            and removed == {"backup": False, "surface": False}
+            and bridge.call("get_inventory")["result"]["items"] == m40_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m40_position,
         )
 
     failed = [label for label, passed, _ in results if not passed]

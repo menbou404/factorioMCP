@@ -143,6 +143,12 @@ class StrictArgsRotateTests(unittest.IsolatedAsyncioTestCase):
         bridge = Mock()
         server = create_server(bridge)
         details = [
+            {
+                "reason": "direction_unreachable",
+                "direction": 12,
+                "requested_direction": 0,
+                "reachable_directions": [4, 12],
+            },
             {"reason": "direction_unreachable", "direction": 0, "reachable_directions": [0, 4]},
             {"reason": "direction_unreachable", "direction": 0, "reachable_directions": [0]},
             {"entity": "wooden-chest", "reason": "not_rotatable"},
@@ -174,6 +180,8 @@ class StrictArgsRotateTests(unittest.IsolatedAsyncioTestCase):
             "direction_unreachable",
             "restored original direction",
             "reachable_directions",
+            "requested_direction",
+            "pump reverses 180 degrees on its existing axis",
             INSERTER_DIRECTION_DESCRIPTION,
         ):
             self.assertIn(text, tool.description)

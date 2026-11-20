@@ -126,7 +126,8 @@ BATCH_WALK_DESCRIPTION = (
 
 ITEM_TARGET_DESCRIPTION = (
     " Inserters include pickup_target and drop_target = {target_ref, name}; mining drills"
-    " include drop_target. Fields are omitted when no target exists. Check drop_target in"
+    " include drop_target for item output. Pumpjack omits item-drop fields and outputs fluids."
+    " Fields are omitted when no target exists. Check drop_target in"
     " placement results: warning no_drop_target means items will be dropped on the ground;"
     " if the target is placed next, ignore this. Inventory reads instead include"
     " no_drop_target=true. Targets do not guarantee item acceptance."
@@ -136,6 +137,8 @@ ITEM_TARGET_DESCRIPTION = (
 PLACE_DESCRIPTION = (
     "Place a supported entity within build reach, consuming one real inventory item."
     " Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground."
+    " Also supports pumpjack, oil-refinery, chemical-plant, storage-tank, pump,"
+    " assembling-machine-2 and steel-chest. Oil equipment accepts directions 0/4/8/12."
     " underground_type is only valid for underground-belt: input or output"
     " (default input). direction is belt travel direction for both ends;"
     " for output it is the direction items leave."
@@ -152,6 +155,10 @@ PLACE_DESCRIPTION = (
     " Returns target_ref for the placed entity, the snapped position and actual"
     " fluid_connections with port position,"
     " target_position, direction, flow, fluidbox_index, and connected when present."
+    " Actual fluid_connections reflect the live API: assembling-machine-2 hides its"
+    " fluid boxes until a fluid recipe is set; prototype previews may still show ports."
+    " Pumpjacks must be placed on crude oil: off oil returns detail.reason=no_resource"
+    " with a pumpjack hint and mining_area_resources. Pumpjacks output fluids, not items."
     " Inserters include actual pickup_position and drop_position as absolute map coordinates."
     " When dropping onto a belt, drop_lane is left or right looking in the belt's direction"
     " of travel: the lane farther from the inserter. Omitted for inserters directly ahead"
@@ -201,6 +208,8 @@ TRANSFER_DESCRIPTION = (
     "Choose inventory_role from the structure's inventory_roles in observe_nearby. "
     "Role aliases: stone-furnace and assembling-machine-1 accept input -> source "
     "and output -> result; lab accepts source -> input. Returned roles stay canonical. "
+    "assembling-machine-2, oil-refinery and chemical-plant also accept input -> source "
+    "and output -> result; steel-chest uses main. "
     "missing_materials detail includes item, requested, available (0), and contents "
     "of the source inventory (up to 10 items sorted by name, omitted when empty). "
     "inventory_role is included when taking items from the structure, along with status "
@@ -226,9 +235,12 @@ TRANSFER_DESCRIPTION = (
 
 MACHINE_STATUS_DESCRIPTION = (
     " status uses the same names as observe_nearby and is omitted when the entity has no status."
-    " full_output means the result is full (about one stack per product) and the machine stopped;"
+    " For item outputs, full_output means the result is full (about one stack per product)"
+    " and the machine stopped;"
     " take products out (transfer from result) or add an output inserter."
     " With enough ingredients an assembler keeps crafting until then."
+    " For fluid outputs, full_output means fluid storage is full; inspect fluids and"
+    " downstream pipe/tank capacity."
     " item_ingredient_shortage with missing_ingredients = [{name, count}] means add those"
     " items for one more craft; fluid ingredients are excluded and qualities are combined."
     " When an inserter stops, check drop_target.status: no_recipe means set a recipe,"
@@ -242,6 +254,9 @@ MACHINE_STATUS_DESCRIPTION = (
 INVENTORY_MACHINE_DESCRIPTION = (
     " Owned steam-engine generators, offshore-pump, pipe, pipe-to-ground, storage-tank"
     " and pump also support status-only reads with empty inventories. Boilers retain fuel."
+    " Owned pumpjack also supports status-only reads with fluids and mining_target (crude-oil)."
+    " assembling-machine-2, oil-refinery and chemical-plant have source/result inventories"
+    " and recipe/status/production fields like assembling-machine-1; steel-chest has main."
     " Fluidboxes include fluids = [{index, name, amount, capacity, temperature}], including"
     " empty boxes (amount=0, name and temperature omitted). Generators include power_output_kw:"
     " energy_generated_last_tick * 60 / 1000, the last tick's output in kW; idle/no-steam is 0."
@@ -303,7 +318,8 @@ def _running_walk_guidance(result: dict[str, Any]) -> dict[str, Any]:
 
 
 MACHINE_BUFFER_DESCRIPTION = (
-    " full_output means the result is full (about one stack per product). With enough"
+    " For item outputs, full_output means the result is full (about one stack per product)."
+    " With enough"
     " ingredients an assembler keeps crafting until then. Add items listed in"
     " missing_ingredients when status is item_ingredient_shortage."
     " Inserters fill machine and lab inputs only up to a small buffer"
@@ -338,6 +354,9 @@ RESEARCH_STALLED_HINT = (
 ROLE_ALIASES = {
     "stone-furnace": {"input": "source", "output": "result"},
     "assembling-machine-1": {"input": "source", "output": "result"},
+    "assembling-machine-2": {"input": "source", "output": "result"},
+    "oil-refinery": {"input": "source", "output": "result"},
+    "chemical-plant": {"input": "source", "output": "result"},
     "lab": {"source": "input"},
 }
 
@@ -502,13 +521,20 @@ OPERATION_HINTS = {
     ("mine_entity", "invalid_target"): (
         "Choose a minable, selectable target in observe_nearby; "
         "check detail.reason and avoid structures belonging to another force."
+        " For fluid_resource, use a pumpjack to extract crude oil."
     ),
     ("rotate_entity", "invalid_target"): (
         "Choose an owned rotatable entity in observe_nearby; check detail.reason."
         " For direction_unreachable, the original direction is restored;"
         " choose one of detail.reachable_directions."
     ),
-    ("set_recipe", "invalid_target"): "Choose an owned assembling machine in observe_nearby.",
+    ("set_recipe", "invalid_target"): (
+        "Choose an owned assembling machine, oil-refinery or chemical-plant in observe_nearby."
+    ),
+    ("set_recipe", "recipe_unavailable"): (
+        "Check detail.reason: disabled recipes require research; "
+        "unknown means check the recipe name."
+    ),
     ("set_recipe", "inventory_full"): (
         "Free main inventory space for detail.items ({name, quality, count}); "
         "detail.empty_slots reports available unfiltered slots. Capacity is checked "
@@ -548,6 +574,7 @@ def _normalize_error_detail(detail: dict[str, Any]) -> dict[str, Any]:
         "missing_prerequisites",
         "valid_roles",
         "supported_entities",
+        "supported_categories",
         "contents",
         "mining_area_resources",
         "ground_items",
@@ -573,7 +600,10 @@ def _normalize_batch_result(result: dict[str, Any], operation: str | None = None
         elif entry.get("ok") is False:
             if isinstance(entry.get("detail"), dict):
                 entry["detail"] = _normalize_error_detail(entry["detail"])
-            hint = _hint(operation, entry.get("error"))
+            detail = entry.get("detail")
+            hint = detail.get("hint") if isinstance(detail, dict) else None
+            if not isinstance(hint, str):
+                hint = _hint(operation, entry.get("error"))
             if hint is not None:
                 entry["hint"] = hint
     return result
@@ -761,7 +791,9 @@ def _error_response(
         )
         if public_detail:
             value["detail"] = public_detail
-    hint = _hint(operation, code)
+    hint = detail.get("hint") if isinstance(detail, dict) else None
+    if not isinstance(hint, str):
+        hint = _hint(operation, code)
     if hint is not None:
         value["hint"] = hint
     if waited_for_walk:
@@ -1062,7 +1094,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "reachable at a slightly larger distance than mine_resource. "
             "With include_resources = false, individual resource entities are omitted but the "
             "resources summary still returns per-resource tile count, total amount, "
-            "and bounding area. "
+            "and bounding area for finite resources. Fluid resources such as crude-oil include "
+            "count (resource entities) instead, and yield_percent when normal_resource_amount "
+            "is positive: sum(amount / normal_resource_amount * 100), the combined well yield. "
             + TARGET_REF_DESCRIPTION
             + PLACEMENT_VISIBILITY_DESCRIPTION
             + " Supported structures in your force include sorted inventory_roles. "
@@ -1088,10 +1122,13 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Use check_placement for snapped position and valid_directions before building. "
             "Follow offsets for additional pages."
             " Use compact=true when inspecting many belts or machines: it omits bounding boxes"
-            " and other per-entity details, and target_ref stays usable. Entity entries keep only"
-            " target_ref, name, x, y, direction, status, recipe, belt_items, underground_type,"
-            " neighbour, pickup_position, drop_position, electric_network_id, input_priority,"
-            " output_priority, filter, and inventory_limit when present."
+            " and fluids and other per-entity details, and target_ref stays usable."
+            " Entity entries keep only target_ref, name, x, y, direction, status,"
+            " missing_ingredients, recipe, belt_items, underground_type, neighbour,"
+            " pickup_position, drop_position,"
+            " electric_network_id, input_priority, output_priority, filter,"
+            " inventory_limit, no_drop_target and mining_target when present."
+            " Fluids remain available with compact=false and in get_entity_inventory reads."
             " Counts, paging, resources and blocked_tiles are unchanged; compact defaults to false."
             " Owned inserters and mining drills without a drop target include no_drop_target=true"
             " in compact and full views. Read pickup/drop target refs via get_entity_inventory."
@@ -1135,6 +1172,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "water, trees and rocks. "
             "Partially observed cells record only seen resources. Resource components include "
             "partial = true if any cell is partial; tile and amount totals are only what was seen. "
+            "crude-oil and other fluid resources use count instead of total_amount, with "
+            "yield_percent = sum(amount / normal_resource_amount * 100) when available; "
+            "count and yield include only seen deposits, including in partial cells. "
             "A partial observation replaces a partial record when its summed resource tiles "
             "are at least as many; a full observation replaces it and clears partial. "
             "Partial cells do not count in explored.cells or explored bounds and may appear "
@@ -1185,6 +1225,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Current research includes progress and remaining_units = unit_count * (1 - progress), "
             "using the force technology's current unit count, including count-formula costs. "
             "remaining_units is omitted when nothing is being researched."
+            " Available trigger technologies include trigger={type, item/count or entity}."
+            " oil-processing has trigger={type: mine-entity, entity: crude-oil}; run a pumpjack."
         )
     )
     async def get_research_status() -> CallToolResult:
@@ -1196,6 +1238,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Returns name, researched, available, enabled, prerequisites with researched flags, "
             "unit_count, unit_time in seconds, ingredients as {name, amount}, unlocks_recipes, "
             "and trigger metadata when present (same shape as get_research_status). "
+            "Mining triggers include trigger.entity: oil-processing requires mining crude-oil "
+            "with a pumpjack. "
             "available requires enabled, unresearched, and all prerequisites researched. "
             "Read-only; unknown names return invalid_target with detail.reason=unknown."
         )
@@ -1308,6 +1352,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Set an enabled recipe on an owned assembling machine within reach. "
+            "Supports assembling-machine-1, assembling-machine-2, oil-refinery and chemical-plant. "
+            "Fluid recipes such as basic-oil-processing, plastic-bar, sulfur, sulfuric-acid "
+            "and lubricant are supported when enabled and in the machine's crafting categories. "
+            "An unsupported category returns invalid_input with "
+            "reason=unsupported_recipe_category, "
+            "category and supported_categories; a locked recipe returns recipe_unavailable. "
             "Inputs, outputs, and ingredients of an in-progress craft return to the character's "
             "main inventory as returned_items ({name, quality, count}). "
             "A conservative capacity check may require empty unfiltered slots even when "
@@ -1405,6 +1455,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "crafting products with those names. Non-resource targets succeed only after "
             "removal and gaining count items; resources can succeed while still present. "
             "Non-resource targets with no item products succeed on removal alone. "
+            "Fluid resources such as crude-oil return invalid_target with reason=fluid_resource "
+            "and a hint to use a pumpjack; they cannot be mined by hand. "
             "While mining runs, place_entity, place_entities, place_line and transfer_item(s) "
             "return action_conflict." + WALK_WAIT_DESCRIPTION
         )
@@ -1696,6 +1748,12 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "Item-entity blocking entries include stack={name, quality, count}. "
             "Returns the snapped position and preview fluid_connections with port position, "
             "target_position, direction, flow, and fluidbox_index when present. "
+            "Supports pumpjack, oil-refinery, chemical-plant, storage-tank, pump, "
+            "assembling-machine-2 and steel-chest. "
+            "Prototype previews can show assembling-machine-2 "
+            "ports before a fluid recipe; placed results report only live API fluid_connections. "
+            "Pumpjacks must be placed on crude oil; off oil returns blocked_reason=no_resource "
+            "and a pumpjack hint. "
             "Inserters include preview pickup_position and drop_position as absolute map "
             "coordinates for the snapped position and direction, even when not placeable. "
             "Mining drills include preview drop_position as absolute map coordinates for "
@@ -1750,12 +1808,14 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
 
     @server.tool(
         description=(
-            "Rotate an owned observed entity within reach by 90 degrees (reverse for backwards)."
+            "Rotate an owned observed entity within reach using its native rotation"
+            " (reverse for backwards)."
+            " Usually 90 degrees; a placed pump reverses 180 degrees on its existing axis."
             " With direction=0/4/8/12 (north/east/south/west), rotate forwards up to 3 times"
             " to that absolute direction. direction cannot be combined with reverse=true."
             " Returns rotations: 1 for a plain rotate, 0 if already at the requested direction."
             " If unreachable, returns invalid_target with detail.reason=direction_unreachable,"
-            " detail.direction (restored original direction)"
+            " detail.direction (restored original direction), detail.requested_direction"
             " and sorted detail.reachable_directions."
         )
         + INSERTER_DIRECTION_DESCRIPTION
@@ -1878,6 +1938,8 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "production. Results include produced=true. "
             "Accepts transfer_item role aliases: stone-furnace and assembling-machine-1 "
             "input -> source, output -> result; lab source -> input. Returned roles are canonical. "
+            "assembling-machine-2, oil-refinery and chemical-plant use the same aliases and "
+            "support produced=true for item products. "
             "Unknown roles return invalid_input with detail.valid_roles. "
             "Returns target_ref, item, count, current, reached, status (if present), stalled, "
             "timed_out, waited_seconds, and inventory_role (if given). "
