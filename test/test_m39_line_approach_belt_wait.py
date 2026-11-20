@@ -109,20 +109,30 @@ class LineApproachBeltWaitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload(response)["error"], code)
             self.assertEqual(payload(response)["detail"], {"reason": "fixture"})
 
-    async def test_destination_status_missing_ingredients_and_hint_passthrough(self):
+    async def test_destination_status_missing_ingredients_fluids_and_hint_passthrough(self):
         bridge = Mock()
         server = create_server(bridge)
-        for status in ("no_recipe", "full_output", "item_ingredient_shortage"):
-            drop = {"target_ref": "assembler", "name": "assembling-machine-1", "status": status}
+        for status in (
+            "no_recipe",
+            "full_output",
+            "item_ingredient_shortage",
+            "fluid_ingredient_shortage",
+        ):
+            drop = {"target_ref": "assembler", "name": "assembling-machine-2", "status": status}
             if status == "item_ingredient_shortage":
                 drop["missing_ingredients"] = MISSING
+            if status == "fluid_ingredient_shortage":
+                drop["missing_fluids"] = [{"name": "water", "amount": 10}]
             record = {
                 "name": "inserter",
                 "type": "inserter",
                 "inventories": {},
                 "status": "waiting_for_space_in_destination",
                 "drop_target": drop,
-                "hint": "Check drop_target.status and drop_target.missing_ingredients.",
+                "hint": (
+                    "Check drop_target.status and drop_target.missing_ingredients or "
+                    "drop_target.missing_fluids."
+                ),
             }
             for name, args, value in (
                 ("get_entity_inventory", {"target_ref": "inserter"}, record),
@@ -174,7 +184,13 @@ class LineApproachBeltWaitTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertIn(phrase, tools["wait_for_items"].description)
         for name in ("get_entity_inventory", "get_entity_inventories"):
-            for phrase in ("drop_target.status", "missing_ingredients", "no_recipe", "held item"):
+            for phrase in (
+                "drop_target.status",
+                "missing_ingredients",
+                "drop_target.missing_fluids",
+                "no_recipe",
+                "held item",
+            ):
                 self.assertIn(phrase, tools[name].description)
         for phrase in ("no stand candidate is visible", "128 tiles", "each index only once"):
             self.assertIn(phrase, tools["place_line"].description)

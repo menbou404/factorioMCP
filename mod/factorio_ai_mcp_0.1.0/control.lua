@@ -7,7 +7,7 @@ local COMPACT_ENTITY_FIELDS = {
   "target_ref", "name", "x", "y", "direction", "status", "missing_ingredients", "recipe", "belt_items",
   "underground_type", "neighbour", "pickup_position", "drop_position", "electric_network_id",
   "input_priority", "output_priority", "filter", "inventory_limit", "no_drop_target",
-  "mining_target"
+  "mining_target", "missing_fluids"
 }
 local MAP_CELL_SIZE = 8
 local MAX_EXPLORED_CELLS = 16384
@@ -729,6 +729,8 @@ local function item_target(entity, pickup)
   end
 end
 
+local recipe_fluid_diagnostics
+
 local function add_item_targets(state, entity, result, placement)
   if entity.name == "pumpjack" then return result end -- Fluid output has no item drop target.
   if entity.type ~= "inserter" and entity.type ~= "mining-drill" then return result end
@@ -741,11 +743,13 @@ local function add_item_targets(state, entity, result, placement)
   if not placement and entity.type == "inserter" then
     if result.drop_target then
       result.drop_target.status, result.drop_target.missing_ingredients = reported_entity_status(drop)
+      result.drop_target.missing_fluids = recipe_fluid_diagnostics(drop)
     end
     if result.status == "waiting_for_space_in_destination" then
       result.hint = "Check drop_target.status: no_recipe means set a recipe; full_output means " ..
         "take products out. The machine may already hold enough of the held item and be " ..
-        "waiting for another ingredient listed in drop_target.missing_ingredients."
+        "waiting for another ingredient listed in drop_target.missing_ingredients or " ..
+        "drop_target.missing_fluids."
     end
   end
   if not result.drop_target then
@@ -1270,7 +1274,7 @@ local function string_filter(value)
   return set
 end
 
-local function preview_fluid_connections(prototype, position, direction)
+local function preview_fluid_connections(prototype, position, direction, include_underground)
   local connections = {}
   local vectors = {
     [0] = {x = 0, y = -1}, [4] = {x = 1, y = 0},
@@ -1278,7 +1282,8 @@ local function preview_fluid_connections(prototype, position, direction)
   }
   for index, fluidbox in ipairs(prototype.fluidbox_prototypes or {}) do
     for _, connection in ipairs(fluidbox.pipe_connections) do
-      if connection.connection_type == "normal" then
+      if connection.connection_type == "normal" or
+         (include_underground and connection.connection_type == "underground") then
         -- The API supplies an offset for each cardinal entity direction.
         local offset = connection.positions[direction / 4 + 1]
         local port_direction = (connection.direction + direction) % 16
@@ -1288,7 +1293,11 @@ local function preview_fluid_connections(prototype, position, direction)
           connections[#connections + 1] = {
             position = port,
             target_position = {x = port.x + vector.x, y = port.y + vector.y},
-            direction = port_direction, flow = connection.flow_direction, fluidbox_index = index
+            direction = port_direction, flow = connection.flow_direction, fluidbox_index = index,
+            production_type = fluidbox.production_type,
+            fluid = fluidbox.filter and fluidbox.filter.name,
+            connection_type = include_underground and connection.connection_type or nil,
+            max_underground_distance = include_underground and connection.max_underground_distance or nil
           }
         end
       end
@@ -1297,11 +1306,33 @@ local function preview_fluid_connections(prototype, position, direction)
   if #connections > 0 then return connections end
 end
 
-local function placed_fluid_connections(entity)
-  local connections = {}
+local function fluidbox_details(fluidbox, index)
+  local filter = fluidbox.get_filter(index)
+  local contents = fluidbox[index]
+  local fluid = filter and filter.name or fluidbox.get_locked_fluid(index) or
+    (contents and contents.name)
+  local prototype = fluidbox.get_prototype(index)
+  local production_type
+  if type(prototype) == "table" then
+    -- Recipe-dependent boxes may merge several prototypes. Only report a common type.
+    for _, part in ipairs(prototype) do
+      if production_type and production_type ~= part.production_type then
+        return fluid, nil
+      end
+      production_type = part.production_type
+    end
+  elseif prototype then
+    production_type = prototype.production_type
+  end
+  return fluid, production_type
+end
+
+local function placed_fluid_connections(state, entity)
+  local connections, connected_targets = {}, {}
   local fluidbox = entity.fluidbox
   if not fluidbox then return nil end
   for index = 1, #fluidbox do
+    local fluid, production_type = fluidbox_details(fluidbox, index)
     for _, connection in ipairs(fluidbox.get_pipe_connections(index)) do
       if connection.connection_type == "normal" or connection.connection_type == "underground" then
         local position, target = connection.position, connection.target_position
@@ -1311,16 +1342,132 @@ local function placed_fluid_connections(entity)
         elseif dx < 0 then direction = defines.direction.west
         elseif dy > 0 then direction = defines.direction.south
         else direction = defines.direction.north end
+        local target_box = connection.target
+        local owner = target_box and target_box.valid and target_box.owner
+        local connected_to
+        if owner and owner.valid then
+          connected_to = connected_targets[owner]
+          if not connected_to then
+            connected_to = {target_ref = register_target(state, owner), name = owner.name}
+            connected_targets[owner] = connected_to
+          end
+        end
         connections[#connections + 1] = {
           position = {x = position.x, y = position.y},
           target_position = {x = target.x, y = target.y},
           direction = direction, flow = connection.flow_direction, fluidbox_index = index,
-          connected = connection.target ~= nil, connection_type = connection.connection_type
+          connected = connected_to ~= nil, connection_type = connection.connection_type,
+          fluid = fluid, production_type = production_type, connected_to = connected_to
         }
       end
     end
   end
   if #connections > 0 then return connections end
+end
+
+recipe_fluid_diagnostics = function(entity)
+  if entity.type ~= "assembling-machine" then return nil, nil end
+  local recipe, fluidbox = entity.get_recipe(), entity.fluidbox
+  if not recipe or not fluidbox then return nil, nil end
+  local available, outputs = {}, {}
+  for index = 1, #fluidbox do
+    local name, production_type = fluidbox_details(fluidbox, index)
+    local contents = fluidbox[index]
+    if name and (production_type == "input" or production_type == "input-output") then
+      available[name] = (available[name] or 0) +
+        (contents and contents.name == name and contents.amount or 0)
+    end
+    if contents and (production_type == "output" or production_type == "input-output") then
+      outputs[#outputs + 1] = {name = contents.name, amount = contents.amount,
+        capacity = fluidbox.get_capacity(index)}
+    end
+  end
+  local needed, missing, full, full_names = {}, {}, {}, {}
+  for _, ingredient in pairs(recipe.ingredients) do
+    if ingredient.type == "fluid" then
+      needed[ingredient.name] = (needed[ingredient.name] or 0) + ingredient.amount
+    end
+  end
+  for name, amount in pairs(needed) do
+    local shortage = amount - (available[name] or 0)
+    if shortage > 0 then missing[#missing + 1] = {name = name, amount = shortage} end
+  end
+  -- Check the raw engine status; item-shortage correction must not hide full fluids.
+  if entity.status == defines.entity_status.full_output then
+    for _, output in ipairs(outputs) do
+      local required = 0
+      for _, product in pairs(recipe.products) do
+        if product.type == "fluid" and product.name == output.name then
+          required = required + (product.amount or product.amount_max or 0)
+        end
+      end
+      if output.amount > 0 and (output.amount >= output.capacity - 0.001 or
+         output.amount + required > output.capacity + 0.001) then
+        full_names[output.name] = true
+      end
+    end
+  end
+  for name in pairs(full_names) do full[#full + 1] = name end
+  table.sort(missing, function(a, b) return a.name < b.name end)
+  table.sort(full)
+  return #missing > 0 and missing or nil, #full > 0 and full or nil
+end
+
+local function placement_fluid_mixing(character, prototype, position, direction)
+  local fluids_by_box = {}
+  for _, port in ipairs(preview_fluid_connections(prototype, position, direction, true) or {}) do
+    local names = fluids_by_box[port.fluidbox_index] or {}
+    fluids_by_box[port.fluidbox_index] = names
+    if port.fluid then names[port.fluid] = true end
+    local vx = port.target_position.x - port.position.x
+    local vy = port.target_position.y - port.position.y
+    -- Underground endpoints are searched along the port ray, nearest first, and
+    -- never outside current surroundings. Normal ports have exactly one candidate.
+    for step = 1, port.max_underground_distance or 1 do
+      local candidate = {x = port.position.x + step * vx, y = port.position.y + step * vy}
+      local dx = candidate.x - character.position.x
+      local dy = candidate.y - character.position.y
+      local found = false
+      if dx * dx + dy * dy > OBSERVATION_RADIUS * OBSERVATION_RADIUS then break end
+      for _, neighbour in pairs(character.surface.find_entities_filtered{
+        position = candidate
+      }) do
+        local boxes = neighbour.valid and neighbour.fluidbox
+        for index = 1, boxes and #boxes or 0 do
+          for _, other in ipairs(boxes.get_pipe_connections(index)) do
+            local ox = other.target_position.x - other.position.x
+            local oy = other.target_position.y - other.position.y
+            if other.connection_type == port.connection_type and
+               other.position.x == candidate.x and other.position.y == candidate.y and
+               ((vx ~= 0 and ox * vx < 0 and oy == 0) or
+                (vy ~= 0 and oy * vy < 0 and ox == 0)) and
+               not (port.flow == other.flow_direction and port.flow ~= "input-output") then
+              found = true
+              -- An already paired underground endpoint keeps a closer partner.
+              if not other.target or ox * ox + oy * oy >= step * step then
+                local name = fluidbox_details(boxes, index)
+                if name then names[name] = true end
+              end
+            end
+          end
+        end
+      end
+      if found then break end
+    end
+  end
+  local mixed = {}
+  for _, names in pairs(fluids_by_box) do
+    local count = 0
+    for _ in pairs(names) do count = count + 1 end
+    if count > 1 then for name in pairs(names) do mixed[name] = true end end
+  end
+  local fluids = sorted_keys(mixed)
+  if #fluids > 1 then
+    -- In 2.0.77 the character build check rejects mixing, but the surface collision
+    -- check accepts it and create_entity can discard a fluid. Classify before building.
+    return {reason = "fluid_mixing", fluids = fluids,
+      hint = "Keep different fluids in separate pipe networks; reroute or empty a line first."}
+  end
 end
 
 local function offshore_pump_directions(name, connections)
@@ -1898,6 +2045,7 @@ local function do_observe(state, params)
     end
     if entity.supports_direction then observed.direction = entity.direction end
     observed.status, observed.missing_ingredients = reported_entity_status(entity)
+    observed.missing_fluids, observed.full_fluids = recipe_fluid_diagnostics(entity)
     if entity.type ~= "resource" then
       local box = entity.bounding_box
       observed.bounding_box = {
@@ -1934,10 +2082,10 @@ local function do_observe(state, params)
       if fluid then fluids[#fluids + 1] = {name = fluid.name, amount = fluid.amount} end
     end
     if #fluids > 0 then observed.fluids = fluids end
-    if observed.owned then observed.fluid_connections = placed_fluid_connections(entity) end
+    if observed.owned then observed.fluid_connections = placed_fluid_connections(state, entity) end
     if entity.name == "offshore-pump" then
       observed.water_direction, observed.output_direction = offshore_pump_directions(
-        entity.name, observed.fluid_connections or placed_fluid_connections(entity))
+        entity.name, observed.fluid_connections or placed_fluid_connections(state, entity))
     end
     if entity.type == "electric-pole" or entity.prototype.electric_energy_source_prototype then
       -- Some entity types cannot expose a network ID even with an electric source.
@@ -2774,6 +2922,8 @@ local function validate_placement(state, character, params, require_item, line_p
   if require_item and not has_item then
     return nil, "missing_materials", {item = params.item}
   end
+  local mixing = placement_fluid_mixing(character, prototype, position, direction)
+  if mixing then return nil, "blocked", mixing end
   -- Neither can_place_entity API accepts type in 2.0.77. Use belt travel direction
   -- for both ends (output = direction items leave); the collision box is symmetric.
   -- Base's factoriopedia_underground_belt blueprint uses direction=4 for both ends.
@@ -2856,7 +3006,7 @@ local function do_check_placement(state, params)
           stand_positions = blocked.stand_positions,
           ground_items = placement and placement.ground_items or blocked.ground_items,
           mining_area_resources = mining_area_resources,
-          reason_detail = blocked.reason_detail, hint = blocked.hint}
+          reason_detail = blocked.reason_detail, hint = blocked.hint, fluids = blocked.fluids}
 end
 
 local function electric_network_detail(target)
@@ -2948,7 +3098,7 @@ local function do_place(state, params, line_placement, own_action)
           drop_position = (created.type == "inserter" or
                           (created.type == "mining-drill" and created.name ~= "pumpjack")) and
                           created.drop_position or nil,
-          fluid_connections = placed_fluid_connections(created), collected_items = collected_items,
+          fluid_connections = placed_fluid_connections(state, created), collected_items = collected_items,
           mining_area_resources = placement_mining_area_resources(character, created.prototype,
                                     {x = params.x, y = params.y}, placement.direction)}
   if created.type == "electric-pole" or
@@ -3404,7 +3554,8 @@ local function do_set_recipe(state, params)
   -- Avoid restarting a craft or returning contents when nothing changes.
   if current_recipe and current_recipe.name == params.recipe and
      (not current_quality or current_quality.name == "normal") then
-    return {name = target.name, recipe = params.recipe, position = position_data(target)}
+    return {name = target.name, recipe = params.recipe, position = position_data(target),
+            fluid_connections = placed_fluid_connections(state, target)}
   end
   local counts, items = {}, {}
   local function add_item(name, quality, count)
@@ -3465,6 +3616,7 @@ local function do_set_recipe(state, params)
     end
   end
   return {name = target.name, recipe = params.recipe, position = position_data(target),
+          fluid_connections = placed_fluid_connections(state, target),
           returned_items = #returned > 0 and returned or nil,
           spilled_items = #spilled > 0 and spilled or nil}
 end
@@ -3560,6 +3712,8 @@ local function do_entity_inventory(state, params)
     if inventory and inventory.valid then inventories[role] = inventory.get_contents() end
   end
   local status, recipe, missing = inventory_entity_state(target)
+  local missing_fluids, full_fluids = recipe_fluid_diagnostics(target)
+  local connections = placed_fluid_connections(state, target)
   local fluids = {}
   local fluidbox = target.fluidbox
   for index = 1, fluidbox and #fluidbox or 0 do
@@ -3567,6 +3721,25 @@ local function do_entity_inventory(state, params)
     fluids[#fluids + 1] = {index = index, name = fluid and fluid.name,
       amount = fluid and fluid.amount or 0, capacity = fluidbox.get_capacity(index),
       temperature = fluid and fluid.temperature}
+    if target.type == "pipe" or target.type == "pipe-to-ground" or
+       target.type == "pump" or target.type == "storage-tank" then
+      local connected_to, seen, unconnected = {}, {}, 0
+      for _, port in ipairs(connections or {}) do
+        if port.fluidbox_index == index then
+          if port.connected_to then
+            local ref = port.connected_to.target_ref
+            if not seen[ref] then
+              connected_to[#connected_to + 1] = port.connected_to
+              seen[ref] = true
+            end
+          else
+            unconnected = unconnected + 1
+          end
+        end
+      end
+      fluids[#fluids].connected_to = connected_to
+      fluids[#fluids].unconnected_ports = unconnected
+    end
   end
   -- 2.0.77 LuaEntity.energy_generated_last_tick is joules generated last tick.
   -- Convert at 60 ticks/s to kW. Idle/no-steam generators explicitly report zero.
@@ -3611,6 +3784,7 @@ local function do_entity_inventory(state, params)
   end
   return add_item_targets(state, target, {name = target.name, type = target.type,
           fluids = #fluids > 0 and fluids or nil, power_output_kw = power_output_kw,
+          fluid_connections = connections, missing_fluids = missing_fluids, full_fluids = full_fluids,
           inventories = inventories, status = status, recipe = recipe, missing_ingredients = missing,
           products_finished = products_finished, recipe_products = recipe_products,
           products_since_recipe = products_since_recipe,

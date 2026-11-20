@@ -2998,6 +2998,7 @@ def main():
             "electric_network_id",
             "no_drop_target",
             "missing_ingredients",
+            "missing_fluids",
             "input_priority",
             "output_priority",
             "filter",
@@ -6610,6 +6611,7 @@ def main():
                     "no_recipe",
                     "full_output",
                     "missing_ingredients",
+                    "missing_fluids",
                 )
             ),
             json.dumps(shortage),
@@ -7093,6 +7095,424 @@ def main():
             and removed == {"backup": False, "surface": False}
             and bridge.call("get_inventory")["result"]["items"] == m40_inventory
             and bridge.call("get_agent_status")["result"]["position"] == m40_position,
+        )
+
+    # M41 CV/CW/CX: all world mutation outside tools is disposable fixture setup/cleanup.
+    m41_surface = "m41-fluid-recipes-fixture"
+    m41_server = create_server(bridge)
+    m41_inventory = bridge.call("get_inventory")["result"]["items"]
+    m41_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def m41_fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m41_surface}";local s=game.surfaces[name];'
+            "local b=storage.m41_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=10, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m41:" not in raw:
+            raise RuntimeError("M41 fixture failed: " + raw)
+        return json.loads(raw.split("m41:", 1)[1].strip())
+
+    def m41_tool(name, args):
+        response = asyncio.run(m41_server.call_tool(name, args))
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    def m41_near(x, y):
+        m41_fixture(f"assert(c.teleport({{{x},{y + 5}}},s));rcon.print('m41:{{}}')")
+
+    def m41_place(item, x, y, direction=0):
+        m41_near(x, y)
+        return m41_tool(
+            "place_entity",
+            {"item": item, "surface": m41_surface, "x": x, "y": y, "direction": direction},
+        )
+
+    def m41_read(placed):
+        p = placed["position"]
+        m41_near(p["x"], p["y"])
+        return m41_tool("get_entity_inventory", {"target_ref": placed["target_ref"]})
+
+    def m41_until(placed, predicate):
+        deadline = time.monotonic() + 20
+        while True:
+            value = m41_read(placed)
+            if predicate(value) or time.monotonic() >= deadline:
+                return value
+            time.sleep(0.1)
+
+    def m41_power(placed):
+        p = placed["position"]
+        m41_fixture(
+            f"local x,y={p['x']},{p['y']};"
+            "local g=s.create_entity{name='electric-energy-interface',"
+            "position={x+4,y-2},force=c.force};assert(g);"
+            "g.power_production=1000000/60;g.power_usage=0;"
+            "g.electric_buffer_size=1000000;g.energy=1000000;"
+            "assert(s.create_entity{name='small-electric-pole',"
+            "position={x+2,y-2},force=c.force});rcon.print('m41:{}')"
+        )
+
+    def m41_route(start, end, via_y):
+        # Endpoints come from the returned port targets; run clear of machine footprints.
+        x, y = start["x"], start["y"]
+        points = [(x, y)]
+        for tx, ty in ((x, via_y), (end["x"], via_y), (end["x"], end["y"])):
+            while (x, y) != (tx, ty):
+                if x != tx:
+                    x += 1 if tx > x else -1
+                else:
+                    y += 1 if ty > y else -1
+                points.append((x, y))
+        return [m41_place("pipe", x, y) for x, y in points]
+
+    try:
+        m41_fixture(
+            "assert(not s and not b,'M41 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,selected=c.selected,"
+            "inventory=game.create_inventory(#inv),saved={},recipes={},technologies={},queue={},"
+            "research_enabled=c.force.research_enabled,progress=c.force.research_progress,"
+            "fields={'targets','owned_refs','recipe_baselines','last_observation',"
+            "'recent_observations','explored_map','last_action','completed_actions',"
+            "'completed_order','processed','processed_order','next_target_id','next_action_id',"
+            "'path_request_id','last_heartbeat_tick'}};storage.m41_backup=b;"
+            "for _,t in ipairs(c.force.research_queue or {}) do b.queue[#b.queue+1]=t.name end;"
+            "for n,r in pairs(c.force.recipes) do b.recipes[n]=r.enabled end;"
+            "for n,t in pairs(c.force.technologies) do b.technologies[n]={researched=t.researched,"
+            "enabled=t.enabled,level=t.level,progress=t.saved_progress} end;"
+            "c.force.disable_research();"
+            "for _,key in ipairs(b.fields) do b.saved[key]=state[key] end;"
+            "for _,key in ipairs({'targets','owned_refs','recipe_baselines','recent_observations',"
+            "'explored_map','completed_actions','completed_order','processed','processed_order'}) "
+            "do state[key]={} end;state.last_observation=nil;state.last_action=nil;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=128,height=64});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},3);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-64,63 do for y=-32,31 do "
+            "tiles[#tiles+1]={name=(x>=20 and x<=23 and y>=20 and y<=23) and 'water' or 'grass-1',"
+            "position={x,y}} end end;s.set_tiles(tiles);"
+            "assert(s.create_entity{name='crude-oil',position={-14.5,0.5},amount=300000});"
+            "for _,n in ipairs({'basic-oil-processing','plastic-bar','sulfur','sulfuric-acid',"
+            "'lubricant','iron-gear-wheel','engine-unit','electric-engine-unit'}) do "
+            "assert(c.force.recipes[n]);c.force.recipes[n].enabled=true end;"
+            "for n,count in pairs({['pumpjack']=1,['oil-refinery']=2,['chemical-plant']=1,"
+            "['pipe']=150,['pipe-to-ground']=2,['coal']=20}) do "
+            "assert(inv.insert{name=n,count=count}==count) end;"
+            "assert(c.teleport({-14.5,5.5},s));rcon.print('m41:{}')"
+        )
+        jack = m41_place("pumpjack", -14.5, 0.5, direction=4)
+        m41_power(jack)
+        refinery = m41_place("oil-refinery", -2.5, 0.5)
+        m41_power(refinery)
+        configured = m41_tool(
+            "set_recipe", {"target_ref": refinery["target_ref"], "recipe": "basic-oil-processing"}
+        )
+        ports = configured.get("fluid_connections", [])
+        crude = next(p for p in ports if p.get("fluid") == "crude-oil")
+        gas = next(p for p in ports if p.get("fluid") == "petroleum-gas")
+        repeated = m41_tool(
+            "set_recipe", {"target_ref": refinery["target_ref"], "recipe": "basic-oil-processing"}
+        )
+        record(
+            "M41 CV set_recipe and no-op return recipe fluids and production_type per port",
+            crude.get("production_type") == "input"
+            and gas.get("production_type") == "output"
+            and repeated.get("fluid_connections") == ports,
+            json.dumps(configured),
+        )
+        oil_pipes = m41_route(
+            jack["fluid_connections"][0]["target_position"], crude["target_position"], 8.5
+        )
+        read = m41_until(
+            refinery,
+            lambda v: any(
+                f.get("name") == "petroleum-gas" and f["amount"] > 0 for f in v.get("fluids", [])
+            ),
+        )
+        record(
+            "M41 CV pumpjack through pipes supplies refinery and produces petroleum-gas",
+            any(
+                f.get("name") == "petroleum-gas" and f["amount"] > 0 for f in read.get("fluids", [])
+            ),
+            json.dumps(read),
+        )
+        starved = m41_place("oil-refinery", -2.5, 18.5)
+        m41_power(starved)
+        m41_tool(
+            "set_recipe", {"target_ref": starved["target_ref"], "recipe": "basic-oil-processing"}
+        )
+        shortage = m41_until(starved, lambda v: v.get("status") == "fluid_ingredient_shortage")
+        record(
+            "M41 CW starved refinery reports crude-oil missing for one craft",
+            shortage.get("status") == "fluid_ingredient_shortage"
+            and shortage.get("missing_fluids") == [{"name": "crude-oil", "amount": 100}],
+            json.dumps(shortage),
+        )
+        for compact in (False, True):
+            observed = m41_tool("observe_nearby", {"names": ["oil-refinery"], "compact": compact})
+            entity = next(
+                e for e in observed["entities"] if e["target_ref"] == starved["target_ref"]
+            )
+            record(
+                f"M41 CW observe compact={compact} retains missing_fluids",
+                entity.get("missing_fluids") == shortage.get("missing_fluids"),
+            )
+        # Seed only this isolated diagnostic machine, then clear it before production checks.
+        m41_fixture(
+            "local e=s.find_entity('oil-refinery',{-2.5,18.5});"
+            "e.fluidbox[1]={name='crude-oil',amount=25};rcon.print('m41:{}')"
+        )
+        partial = m41_read(starved)
+        record(
+            "M41 CW missing_fluids subtracts available input from one craft",
+            partial.get("missing_fluids") == [{"name": "crude-oil", "amount": 75}],
+            json.dumps(partial),
+        )
+        m41_fixture(
+            "local e=s.find_entity('oil-refinery',{-2.5,18.5});"
+            "e.fluidbox[1]={name='crude-oil',amount=e.fluidbox.get_capacity(1)};"
+            "e.fluidbox[2]={name='petroleum-gas',amount=e.fluidbox.get_capacity(2)};"
+            "rcon.print('m41:{}')"
+        )
+        full = m41_until(starved, lambda v: v.get("status") == "full_output")
+        observed_full = m41_tool("observe_nearby", {"names": ["oil-refinery"]})
+        record(
+            "M41 CW full fluid output names appear in inventory and observation",
+            full.get("status") == "full_output"
+            and full.get("full_fluids") == ["petroleum-gas"]
+            and "missing_fluids" not in full
+            and any(e.get("full_fluids") == ["petroleum-gas"] for e in observed_full["entities"]),
+            json.dumps(full),
+        )
+        m41_fixture(
+            "local e=s.find_entity('oil-refinery',{-2.5,18.5});"
+            "e.fluidbox[1]=nil;e.fluidbox[2]=nil;rcon.print('m41:{}')"
+        )
+        plant = m41_place("chemical-plant", 12.5, 0.5)
+        m41_power(plant)
+        configured = m41_tool(
+            "set_recipe", {"target_ref": plant["target_ref"], "recipe": "plastic-bar"}
+        )
+        plant_port = next(
+            p for p in configured["fluid_connections"] if p.get("fluid") == "petroleum-gas"
+        )
+        m41_route(gas["target_position"], plant_port["target_position"], -8.5)
+        m41_read(plant)
+        moved = m41_tool(
+            "transfer_item",
+            {
+                "target_ref": plant["target_ref"],
+                "direction": "to_entity",
+                "inventory_role": "source",
+                "item": "coal",
+                "count": 10,
+            },
+        )
+        produced = m41_tool(
+            "wait_for_items",
+            {
+                "target_ref": plant["target_ref"],
+                "inventory_role": "result",
+                "item": "plastic-bar",
+                "count": 2,
+                "timeout_seconds": 20,
+            },
+        )
+        record(
+            "M41 CV connected petroleum and transferred coal produce plastic-bar",
+            moved.get("moved") == 10 and produced.get("reached") is True,
+            json.dumps(produced),
+        )
+        # Snapshot both immediate neighbours, remove a real pipe through mine_entity,
+        # then compare references and open-port counts through single/batch reads.
+        middle = len(oil_pipes) // 2
+        removed_pipe = oil_pipes[middle]
+        neighbours = [oil_pipes[middle - 1], oil_pipes[middle + 1]]
+        before = [m41_read(p) for p in neighbours]
+        m41_read(removed_pipe)
+        started = m41_tool("mine_entity", {"target_ref": removed_pipe["target_ref"]})
+        finished = m41_tool(
+            "wait_for_action", {"action_id": started["action_id"], "timeout_seconds": 10}
+        )
+        assert finished.get("status") == "succeeded", finished
+        after = [m41_read(p) for p in neighbours]
+        batch = m41_tool(
+            "get_entity_inventories", {"target_refs": [p["target_ref"] for p in neighbours]}
+        )["results"]
+        record(
+            "M41 CX mining middle pipe removes connected_to and increases unconnected_ports",
+            all(
+                any(
+                    c["target_ref"] == removed_pipe["target_ref"]
+                    for c in a["fluids"][0]["connected_to"]
+                )
+                and all(
+                    c["target_ref"] != removed_pipe["target_ref"]
+                    for c in b["fluids"][0]["connected_to"]
+                )
+                and b["fluids"][0]["unconnected_ports"] == a["fluids"][0]["unconnected_ports"] + 1
+                and all(
+                    p.get("connected_to", {}).get("target_ref") != removed_pipe["target_ref"]
+                    for p in b["fluid_connections"]
+                )
+                for a, b in zip(before, after, strict=True)
+            )
+            and all(entry["ok"] for entry in batch),
+            json.dumps({"before": before, "after": after}),
+        )
+        # Independent water/crude segments. Only the fixture seeds fluids for this
+        # focused placement probe; the production chain above uses extracted oil.
+        left = m41_place("pipe", 24.5, 12.5)
+        right = m41_place("pipe", 26.5, 12.5)
+        m41_near(25.5, 12.5)
+        native_mixing = m41_fixture(
+            "local a=s.find_entity('pipe',{24.5,12.5});"
+            "local b=s.find_entity('pipe',{26.5,12.5});"
+            "a.fluidbox[1]={name='water',amount=100};"
+            "b.fluidbox[1]={name='crude-oil',amount=100};"
+            "rcon.print('m41:'..helpers.table_to_json({character=c.can_place_entity{"
+            "name='pipe',position={25.5,12.5}},surface=s.can_place_entity{"
+            "name='pipe',position={25.5,12.5},force=c.force}}))"
+        )
+        m41_near(25.5, 12.5)
+        args = {"item": "pipe", "surface": m41_surface, "x": 25.5, "y": 12.5}
+        inventory_before = bridge.call("get_inventory")["result"]["items"]
+        preview = m41_tool("check_placement", args)
+        response = asyncio.run(m41_server.call_tool("place_entity", args))
+        rejected = json.loads(response.content[0].text)
+        record(
+            "M41 CX mixed-fluid placement is rejected before item use or fluid loss",
+            native_mixing == {"character": False, "surface": True}
+            and preview.get("blocked_reason") == "fluid_mixing"
+            and not preview.get("placeable")
+            and preview.get("fluids") == ["crude-oil", "water"]
+            and response.is_error
+            and rejected.get("detail", {}).get("reason") == "fluid_mixing"
+            and rejected.get("detail", {}).get("fluids") == ["crude-oil", "water"]
+            and bool(rejected.get("hint"))
+            and bridge.call("get_inventory")["result"]["items"] == inventory_before
+            and m41_read(left)["fluids"][0]["name"] == "water"
+            and m41_read(right)["fluids"][0]["name"] == "crude-oil",
+            json.dumps({"preview": preview, "rejected": rejected}),
+        )
+        water_end = m41_place("pipe", -40.5, -16.5)
+        oil_end = m41_place("pipe", -33.5, -16.5)
+        underground = m41_place("pipe-to-ground", -34.5, -16.5, direction=4)
+        m41_fixture(
+            "s.find_entity('pipe',{-40.5,-16.5}).fluidbox[1]={name='water',amount=100};"
+            "s.find_entity('pipe',{-33.5,-16.5}).fluidbox[1]={name='crude-oil',amount=100};"
+            "rcon.print('m41:{}')"
+        )
+        m41_near(-39.5, -16.5)
+        underground_args = {
+            "item": "pipe-to-ground",
+            "surface": m41_surface,
+            "x": -39.5,
+            "y": -16.5,
+            "direction": 12,
+        }
+        preview = m41_tool("check_placement", underground_args)
+        record(
+            "M41 CX underground endpoint identifies mixing with a visible distant partner",
+            preview.get("blocked_reason") == "fluid_mixing"
+            and preview.get("fluids") == ["crude-oil", "water"],
+            json.dumps(preview),
+        )
+        m41_fixture("s.find_entity('pipe',{-40.5,-16.5}).fluidbox[1]=nil;rcon.print('m41:{}')")
+        paired = m41_tool("place_entity", underground_args)
+        paired_read = m41_read(paired)
+        other_read = m41_read(underground)
+        record(
+            "M41 CX pipe-to-ground reads include the paired endpoint and open-port counts",
+            any(
+                p.get("connection_type") == "underground"
+                and p.get("connected_to", {}).get("target_ref") == underground["target_ref"]
+                for p in paired_read["fluid_connections"]
+            )
+            and all(v["fluids"][0]["unconnected_ports"] == 0 for v in (paired_read, other_read))
+            and any(
+                c["target_ref"] == oil_end["target_ref"]
+                for c in other_read["fluids"][0]["connected_to"]
+            )
+            and m41_read(water_end)["fluids"][0].get("name") == "crude-oil",
+        )
+        owned_pipe = m41_place("pipe", 24.5, 20.5)
+        m41_place("pipe", 25.5, 20.5)
+        m41_fixture("s.find_entity('pipe',{25.5,20.5}).force='neutral';rcon.print('m41:{}')")
+        unowned = m41_read(owned_pipe)
+        neighbour = next(
+            p["connected_to"] for p in unowned["fluid_connections"] if p.get("connected")
+        )
+        record(
+            "M41 CV connected_to includes only the adjacent entity even for another force",
+            set(neighbour) == {"target_ref", "name"}
+            and neighbour["name"] == "pipe"
+            and bool(neighbour["target_ref"])
+            and unowned["fluids"][0]["connected_to"] == [neighbour],
+        )
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = m41_fixture(
+                f"rcon.print('m41:'..helpers.table_to_json({{id=b and state.{slot} "
+                f"and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        restored = m41_fixture(
+            "if b then assert(c.crafting_queue_size==0);c.force.research_queue={};"
+            "for n,v in pairs(b.technologies) do local t=c.force.technologies[n];"
+            "if t.level~=v.level then t.level=v.level end;"
+            "if t.researched~=v.researched then t.researched=v.researched end;"
+            "t.enabled=v.enabled end;"
+            "for n,enabled in pairs(b.recipes) do c.force.recipes[n].enabled=enabled end;"
+            "c.force.research_queue=b.queue;"
+            "for n,v in pairs(b.technologies) do "
+            "c.force.technologies[n].saved_progress=v.progress end;"
+            "if c.force.current_research then c.force.research_progress=b.progress end;"
+            "if b.research_enabled then c.force.enable_research() "
+            "else c.force.disable_research() end;"
+            "for n,v in pairs(b.technologies) do local t=c.force.technologies[n];"
+            "assert(t.level==v.level and t.researched==v.researched and t.enabled==v.enabled "
+            "and t.saved_progress==v.progress) end;"
+            "for n,enabled in pairs(b.recipes) do assert(c.force.recipes[n].enabled==enabled) end;"
+            "local queue=c.force.research_queue or {};assert(#queue==#b.queue);"
+            "for i,t in ipairs(queue) do assert(t.name==b.queue[i]) end;"
+            "assert(c.force.research_progress==b.progress "
+            "and c.force.research_enabled==b.research_enabled);"
+            "assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();if s then assert(game.delete_surface(s)) end;"
+            "for _,key in ipairs(b.fields) do state[key]=b.saved[key] end;"
+            "for _,key in ipairs(b.fields) do assert(state[key]==b.saved[key]) end;"
+            "storage.m41_backup=nil;assert(c.crafting_queue_size==0);"
+            "assert(c.position.x==b.position.x and c.position.y==b.position.y "
+            "and c.surface==b.surface) end;"
+            "rcon.print('m41:'..helpers.table_to_json({restored=true}))"
+        )
+        # Surface deletion completes at the end of the tick, so verify removal
+        # in a separate RCON request after the restoration command has completed.
+        removed = m41_fixture(
+            "rcon.print('m41:'..helpers.table_to_json({backup=b~=nil,surface=s~=nil}))"
+        )
+        observed_map_cells.pop(m41_surface, None)
+        record(
+            "M41 restores inventory, queue, position, observations and force recipes/technologies",
+            restored.get("restored") is True
+            and removed == {"backup": False, "surface": False}
+            and bridge.call("get_inventory")["result"]["items"] == m41_inventory
+            and bridge.call("get_agent_status")["result"]["position"] == m41_position,
         )
 
     failed = [label for label, passed, _ in results if not passed]
