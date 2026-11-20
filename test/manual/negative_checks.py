@@ -79,6 +79,199 @@ def send_with_id(operation, params, request_id):
     return parse_bridge_response(raw, request_id)
 
 
+def m42_chunk_generation_checks():
+    # Disposable unbounded surface: generation, terrain edits and belts vanish on cleanup.
+    m42_surface = "m42-chunk-generation-fixture"
+    m42_server = create_server(bridge)
+    original_items = bridge.call("get_inventory")["result"]["items"]
+    original_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{m42_surface}";local s=game.surfaces[name];'
+            "local b=storage.m42_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=15, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m42:" not in raw:
+            raise RuntimeError("M42 fixture failed: " + raw)
+        return json.loads(raw.split("m42:", 1)[1].strip())
+
+    def tool(name, args):
+        response = asyncio.run(m42_server.call_tool(name, args))
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    try:
+        edge = fixture(
+            "assert(not s and not b,'M42 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,selected=c.selected,"
+            "inventory=game.create_inventory(#inv),saved={},"
+            "fields={'targets','owned_refs','recipe_baselines','last_observation',"
+            "'recent_observations','explored_map','last_action','completed_actions',"
+            "'completed_order','processed','processed_order','next_target_id','next_action_id',"
+            "'path_request_id','last_heartbeat_tick','last_generated_chunk'}};storage.m42_backup=b;"
+            "for _,key in ipairs(b.fields) do b.saved[key]=state[key] end;"
+            "for _,key in ipairs({'targets','owned_refs','recipe_baselines','recent_observations',"
+            "'explored_map','completed_actions','completed_order','processed','processed_order'}) "
+            "do state[key]={} end;state.last_observation=nil;state.last_action=nil;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{water='none',autoplace_settings={"
+            "entity={treat_missing_as_default=false},decorative={treat_missing_as_default=false}}});"
+            "s.peaceful_mode=true;s.request_to_generate_chunks({0,0},2);"
+            "s.force_generate_chunk_requests();assert(c.teleport({0.5,0.5},s));"
+            "local cx=math.floor(c.position.x/32);local cy=math.floor(c.position.y/32);"
+            "while s.is_chunk_generated({cx,cy}) do cx=cx+1;assert(cx<1024) end;"
+            "b.edge=cx*32;b.cy=cy;"
+            "assert(c.teleport({b.edge-10,cy*32+0.5},s));"
+            "rcon.print('m42:'..helpers.table_to_json({edge=b.edge,cy=cy,"
+            "generated=s.is_chunk_generated({cx,cy}),tick=game.tick}))"
+        )
+        assert edge["generated"] is False, edge
+        deadline = time.monotonic() + 20
+        while True:
+            generated = fixture(
+                "local corridor=true;"
+                "for cx=math.floor((b.edge-16)/32),math.floor((b.edge+63)/32) do "
+                "for cy=-1,0 do corridor=corridor and s.is_chunk_generated({cx,cy}) end end;"
+                "rcon.print('m42:'..helpers.table_to_json({generated="
+                "s.is_chunk_generated({b.edge/32,b.cy}),corridor=corridor,tick=game.tick}))"
+            )
+            if (generated["generated"] and generated["corridor"]) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        record(
+            "M42 DA-1 crossing a chunk requests asynchronous generation beyond the old edge",
+            generated["generated"] is True and generated["tick"] > edge["tick"],
+            json.dumps({"before": edge, "after": generated}),
+        )
+        assert generated["generated"], generated
+        # Only clear tiles after the periodic path has generated the old frontier.
+        fixture(
+            "local tiles={};for x=b.edge-16,b.edge+63 do for y=-6,6 do "
+            "assert(s.is_chunk_generated({math.floor(x/32),math.floor(y/32)}));"
+            "tiles[#tiles+1]={name='grass-1',position={x,y}} end end;s.set_tiles(tiles);"
+            "rcon.print('m42:{}')"
+        )
+        goal = {"surface": m42_surface, "x": edge["edge"] + 30.5, "y": 0.5}
+        moved = tool("move_to", {**goal, "wait_seconds": 20})
+        if moved["status"] == "running":
+            moved = tool(
+                "wait_for_action", {"action_id": moved["action_id"], "timeout_seconds": 20}
+            )
+        position = bridge.call("get_agent_status")["result"]["position"]
+        record(
+            "M42 DA-1 move_to succeeds thirty tiles beyond the old edge",
+            moved["status"] == "succeeded"
+            and math.hypot(position["x"] - goal["x"], position["y"] - goal["y"]) <= 1,
+            json.dumps(moved),
+        )
+        unseen = fixture(
+            "rcon.print('m42:'..helpers.table_to_json({"
+            "unobserved=state.explored_map[name]==nil and state.last_observation==nil}))"
+        )
+        record("M42 DA generation and movement do not reveal an explored map", unseen["unobserved"])
+
+        # An impassable water goal returns the normal diagnostic on real generated terrain.
+        fixture(
+            "s.request_to_generate_chunks({b.edge+100,0},1);s.force_generate_chunk_requests();"
+            "local tiles={};for x=b.edge+62,b.edge+88 do for y=-13,13 do "
+            "tiles[#tiles+1]={name='water',position={x,y}} end end;s.set_tiles(tiles);"
+            "rcon.print('m42:{}')"
+        )
+        try:
+            bridge.call("move_to", {"surface": m42_surface, "x": edge["edge"] + 75.5, "y": 0.5})
+        except BridgeError as error:
+            record(
+                "M42 DA-2 path_not_found includes goal_chunk_generated",
+                error.code == "path_not_found"
+                and (error.detail or {}).get("goal_chunk_generated") is True,
+                json.dumps(error.detail),
+            )
+        else:
+            record(
+                "M42 DA-2 path_not_found includes goal_chunk_generated", False, "unexpected success"
+            )
+
+        fixture(
+            "local tiles={};for x=b.edge-16,b.edge+61 do for y=-6,6 do "
+            "tiles[#tiles+1]={name='grass-1',position={x,y}} end end;s.set_tiles(tiles);"
+            "assert(c.teleport({b.edge+0.5,0.5},s));"
+            "assert(inv.insert{name='transport-belt',count=22}==22);rcon.print('m42:{}')"
+        )
+        line = tool(
+            "place_line",
+            {
+                "item": "transport-belt",
+                "surface": m42_surface,
+                "from_x": edge["edge"] + 0.5,
+                "from_y": 4.5,
+                "to_x": edge["edge"] + 39.5,
+                "to_y": 4.5,
+                "walk": True,
+                "wait_seconds": 20,
+            },
+        )
+        if line["status"] == "running":
+            line = tool("wait_for_action", {"action_id": line["action_id"], "timeout_seconds": 20})
+        polled = tool("get_action_status", {"action_id": line["action_id"]})
+        record(
+            "M42 DB walking line running out of belts retains summary and adds partial hint",
+            all(
+                value.get("status") == "succeeded"
+                and value.get("complete") is False
+                and value.get("partial") is True
+                and value.get("stopped") == "missing_materials"
+                and value.get("placed") == 22
+                and value.get("requested") == 40
+                and value.get("already_present") == 0
+                and value.get("next_position") == {"x": edge["edge"] + 22.5, "y": 4.5}
+                and value.get("last_position") == {"x": edge["edge"] + 21.5, "y": 4.5}
+                and "22 of 40 positions (missing_materials)" in value.get("hint", "")
+                and "Continue from next_position." in value.get("hint", "")
+                for value in (line, polled)
+            ),
+            json.dumps(line),
+        )
+        position = bridge.call("get_agent_status")["result"]["position"]
+        record(
+            "M42 DB line actually walked before exhausting items", position["x"] > edge["edge"] + 10
+        )
+    finally:
+        pending = fixture(
+            "rcon.print('m42:'..helpers.table_to_json({id=b and state.action and state.action.id}))"
+        )
+        if pending.get("id"):
+            bridge.call("cancel_action", {"action_id": pending["id"]})
+        fixture(
+            "if b then assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;"
+            "for i=1,#b.inventory do assert(not b.inventory[i].valid_for_read) end;"
+            "b.inventory.destroy();if s then assert(game.delete_surface(s)) end;"
+            "for _,key in ipairs(b.fields) do state[key]=b.saved[key] end;"
+            "storage.m42_backup=nil;assert(c.position.x==b.position.x and "
+            "c.position.y==b.position.y and c.surface==b.surface) end;rcon.print('m42:{}')"
+        )
+        removed = fixture(
+            "rcon.print('m42:'..helpers.table_to_json({backup=b~=nil,surface=s~=nil}))"
+        )
+        record(
+            "M42 restores position and inventory and removes fixture terrain and entities",
+            removed == {"backup": False, "surface": False}
+            and bridge.call("get_inventory")["result"]["items"] == original_items
+            and bridge.call("get_agent_status")["result"]["position"] == original_position,
+        )
+
+
 def main():
     before = items()
     expect_error(
@@ -7514,6 +7707,8 @@ def main():
             and bridge.call("get_inventory")["result"]["items"] == m41_inventory
             and bridge.call("get_agent_status")["result"]["position"] == m41_position,
         )
+
+    m42_chunk_generation_checks()
 
     failed = [label for label, passed, _ in results if not passed]
     if failed:
