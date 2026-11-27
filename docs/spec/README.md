@@ -61,6 +61,7 @@
 | [48-blue-science-oil.md](48-blue-science-oil.md) | 青サイエンスへ向けた石油設備の対応（M40） |
 | [49-fluid-recipes.md](49-fluid-recipes.md) | 液体レシピの補助（M41） |
 | [50-chunk-generation.md](50-chunk-generation.md) | キャラクター周辺のマップ生成（M42） |
+| [51-blue-science-result.md](51-blue-science-result.md) | 青サイエンス達成の記録と 36 回目の試行で見つかった問題の修正（M43） |
 
 ## 共通の不変条件
 

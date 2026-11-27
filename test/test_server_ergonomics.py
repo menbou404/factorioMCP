@@ -485,6 +485,10 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     await server.call_tool(name, {**params, "underground_type": invalid})
                 self.assertEqual(json.loads(str(caught.exception))["error"], "invalid_input")
+            bridge.call.assert_not_called()
+            bridge.call.side_effect = BridgeError(
+                "invalid_input", "Invalid underground entity type."
+            )
             for item in ("transport-belt", "splitter", "long-handed-inserter", "pipe-to-ground"):
                 for underground_type in ("input", "output"):
                     result = await server.call_tool(
@@ -492,7 +496,7 @@ class ErgonomicsTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertTrue(result.is_error)
                     self.assertEqual(payload(result)["error"], "invalid_input")
-        bridge.call.assert_not_called()
+            bridge.call.reset_mock()
 
     async def test_belt_items_normalize_and_observation_fields_survive(self):
         cargo = [{"name": "iron-plate", "quality": "normal", "count": 3}]
