@@ -60,6 +60,7 @@
 | [47-trial33-fixes.md](47-trial33-fixes.md) | 33 回目の試行で見つかった問題の修正（M39） |
 | [48-blue-science-oil.md](48-blue-science-oil.md) | 青サイエンスへ向けた石油設備の対応（M40） |
 | [49-fluid-recipes.md](49-fluid-recipes.md) | 液体レシピの補助（M41） |
+| [50-chunk-generation.md](50-chunk-generation.md) | キャラクター周辺のマップ生成（M42） |
 
 ## 共通の不変条件
 

@@ -231,6 +231,15 @@ end
 local function line_action_result(action, result)
   for key, value in pairs(action.line_result or {}) do result[key] = value end
   for key, value in pairs(action.walk_batch_result or {}) do result[key] = value end
+  if action.line_result and action.status == "succeeded" and action.line_result.complete == false then
+    result.partial = true
+    result.stopped = action.line_result.stopped
+    result.hint = "The line stopped after " .. (result.placed + result.already_present) ..
+      " of " .. result.requested .. " positions (" .. (result.stopped or "unknown") .. ")."
+    if result.next_position then
+      result.hint = result.hint .. " Continue from next_position."
+    end
+  end
   return result
 end
 
@@ -638,6 +647,18 @@ local function finish_move_within(state)
   return true
 end
 
+local function generate_character_chunks(state)
+  if not valid_character(state) then return end
+  local character = state.character
+  local cx, cy = math.floor(character.position.x / 32), math.floor(character.position.y / 32)
+  local last = state.last_generated_chunk
+  if last and last.x == cx and last.y == cy and last.surface_index == character.surface.index then
+    return
+  end
+  character.surface.request_to_generate_chunks(character.position, 5)
+  state.last_generated_chunk = {x = cx, y = cy, surface_index = character.surface.index}
+end
+
 local function spawn_character()
   local state = ensure_storage()
   if state.spawned_once then return end
@@ -653,6 +674,7 @@ local function spawn_character()
   character.name_tag = "AI " .. AGENT_ID
   state.character = character
   state.spawned_once = true
+  generate_character_chunks(state)
 end
 
 local function inventory_contents(character)
@@ -890,6 +912,14 @@ local function goal_obstacles(character, goal)
   return sorted_keys(tiles), entities
 end
 
+local function ensure_goal_chunk_generated(character, goal)
+  local surface = character.surface
+  if not surface.is_chunk_generated({math.floor(goal.x / 32), math.floor(goal.y / 32)}) then
+    surface.request_to_generate_chunks(goal, 1)
+    surface.force_generate_chunk_requests()
+  end
+end
+
 local function path_not_found_detail(character, goal, action)
   local detail = {goal = {x = goal.x, y = goal.y}}
   if action then
@@ -901,6 +931,12 @@ local function path_not_found_detail(character, goal, action)
   end
   -- A path response can arrive after the character has been removed.
   if not character or not character.valid then return detail end
+  detail.goal_chunk_generated = character.surface.is_chunk_generated(
+    {math.floor(goal.x / 32), math.floor(goal.y / 32)})
+  if not detail.goal_chunk_generated and not detail.reason then
+    detail.reason = "not_generated"
+    detail.hint = "The destination area is not generated yet; walk closer first (the world generates around the character)."
+  end
   detail.distance = math.sqrt(distance_squared(character.position, goal))
   local tiles, entities = goal_obstacles(character, goal)
   if #tiles > 0 then detail.goal_tiles = tiles end
@@ -974,6 +1010,7 @@ end
 local function request_path(state, character, goal, explicit_start)
   local action = state.action
   goal = action.belt_step or goal
+  ensure_goal_chunk_generated(character, goal)
   action.belt_step_pending = nil
   action.path = nil
   action.path_index = 1
@@ -1046,6 +1083,7 @@ local function do_move(state, params)
   if distance_squared(character.position, goal) > 128 * 128 then
     return nil, "out_of_range", range_detail(character, goal, 128)
   end
+  ensure_goal_chunk_generated(character, goal)
   local original_goal, goal_adjusted, belt_goal_adjusted
   if params.within == nil then
     -- Use the path diagnostic's character collision mask, ignoring this character
@@ -4497,6 +4535,7 @@ script.on_event(defines.events.on_tick, function()
   if not state.spawned_once then
     spawn_character()
   end
+  if game.tick % 30 == 0 then generate_character_chunks(state) end
   -- A return or completion in one slot must not skip the other slot.
   tick_action(state, "action")
   tick_action(state, "craft_action")

@@ -666,6 +666,13 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
                 "to the same end with the same end_direction. Use place_entity if only one "
                 "tile remains."
             )
+        if result.get("status") == "succeeded" and result.get("complete") is False:
+            result["partial"] = True
+            completed = result.get("placed", 0) + result.get("already_present", 0)
+            result["hint"] = (
+                f"The line stopped after {completed} of {result['requested']} positions "
+                f"({result['stopped']}). Continue from next_position. " + result["hint"]
+            )
     batch_operations = {
         "transfer_items": "transfer_item",
         "place_entities": "place_entity",
@@ -1605,8 +1612,11 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             " automatic walk wait plus wait_seconds is capped at 50 seconds."
             " Returns action_id, type=place_line, status, waited_seconds and progress (placed,"
             " next_position). If still running, continue with wait_for_action; final results"
-            " from it or get_action_status retain all line summary fields. Cancellation retains"
-            " progress. Walk failures stop out_of_range with the failure in detail."
+            " from it or get_action_status retain all line summary fields."
+            " A succeeded walking line with complete=false also returns partial=true, stopped"
+            " and a hint counting finished positions and pointing to next_position."
+            " Cancellation retains progress. Walk failures stop out_of_range with the failure"
+            " in detail."
             " For walk=false, on out_of_range, stand_position suggests a visible, clear character"
             " standing"
             " position reaching the most remaining tiles among bounded candidates along both"
