@@ -253,7 +253,7 @@ def main():
     place("transport-belt", belt2_position, 4)
     inserter_position = (belt2_position[0] + 1, belt2_position[1])
     inserter = place("burner-inserter", inserter_position, 12)
-    # Preview all inserter prototypes, including ones outside the build allowlist.
+    # Fast inserters are supported by type, but this tile contains the burner inserter.
     fast_preview = call(
         "check_placement",
         {
@@ -264,7 +264,8 @@ def main():
             "direction": 12,
         },
     )
-    assert not fast_preview["placeable"] and fast_preview["reason"] == "invalid_target", (
+    assert not fast_preview["placeable"] and fast_preview["reason"] == "blocked", fast_preview
+    assert any(blocker["name"] == "burner-inserter" for blocker in fast_preview["blocking"]), (
         fast_preview
     )
     # Base fast and burner inserters share the same pickup/drop vectors.

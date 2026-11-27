@@ -79,6 +79,277 @@ def send_with_id(operation, params, request_id):
     return parse_bridge_response(raw, request_id)
 
 
+def m43_types_buildings_stand_checks():
+    """Disposable DC/DD/DE fixtures; restore inventory, force recipes and agent state."""
+    surface_name = "m43-types-buildings-stand-fixture"
+    server = create_server(bridge)
+    original_items = bridge.call("get_inventory")["result"]["items"]
+    original_position = bridge.call("get_agent_status")["result"]["position"]
+
+    def fixture(body):
+        command = (
+            "/c __factorio_ai_mcp__ local state=storage.ai_mcp;local c=state.character;"
+            "assert(c and c.valid);local inv=c.get_main_inventory();"
+            f'local name="{surface_name}";local s=game.surfaces[name];'
+            "local b=storage.m43_backup;" + body
+        )
+        with Client(
+            "127.0.0.1", 27277, passwd=password, timeout=15, frag_threshold=RCON_FRAG_THRESHOLD
+        ) as client:
+            raw = client.run(command)
+        if "m43:" not in raw:
+            raise RuntimeError("M43 fixture failed: " + raw)
+        return json.loads(raw.split("m43:", 1)[1].strip())
+
+    def tool(name, args):
+        response = asyncio.run(server.call_tool(name, args))
+        value = json.loads(response.content[0].text)
+        assert not response.is_error, value
+        return value
+
+    def terminal(value):
+        while value.get("status") == "running":
+            value = tool(
+                "wait_for_action", {"action_id": value["action_id"], "timeout_seconds": 20}
+            )
+        return value
+
+    def place(item, x, y):
+        params = {"item": item, "surface": surface_name, "x": x, "y": y}
+        checked = tool("check_placement", params)
+        assert checked["placeable"], checked
+        return tool("place_entity", params)
+
+    try:
+        fixture(
+            "assert(not s and not b,'M43 fixture already exists');"
+            "assert(not state.action and not state.craft_action and c.crafting_queue_size==0);"
+            "b={position={x=c.position.x,y=c.position.y},surface=c.surface,selected=c.selected,"
+            "inventory=game.create_inventory(#inv),recipes={},saved={},"
+            "fields={'targets','owned_refs','recipe_baselines','last_observation',"
+            "'recent_observations','explored_map','last_action','completed_actions',"
+            "'completed_order','processed','processed_order','next_target_id','next_action_id',"
+            "'path_request_id','last_heartbeat_tick','last_generated_chunk'}};storage.m43_backup=b;"
+            "for _,key in ipairs(b.fields) do b.saved[key]=state[key] end;"
+            "for _,key in ipairs({'targets','owned_refs','recipe_baselines','recent_observations',"
+            "'explored_map','completed_actions','completed_order','processed','processed_order'}) "
+            "do state[key]={} end;state.last_observation=nil;state.last_action=nil;"
+            "for i=1,#inv do if inv[i].valid_for_read then "
+            "assert(b.inventory[i].swap_stack(inv[i])) end end;b.stashed=true;"
+            "s=game.create_surface(name,{width=384,height=64});s.peaceful_mode=true;"
+            "s.request_to_generate_chunks({0,0},3);s.force_generate_chunk_requests();"
+            "for _,e in pairs(s.find_entities()) do e.destroy() end;"
+            "local tiles={};for x=-192,191 do for y=-32,31 do "
+            "tiles[#tiles+1]={name='grass-1',position={x,y}} end end;s.set_tiles(tiles);"
+            "assert(c.teleport({0.5,0.5},s));"
+            "for item,count in pairs({['fast-inserter']=1,['medium-electric-pole']=1,"
+            "['steel-furnace']=1,['electric-furnace']=1,['assembling-machine-1']=1,"
+            "['wooden-chest']=1,['transport-belt']=13,['fast-transport-belt']=3,"
+            "coal=2,['iron-ore']=1}) do "
+            "local recipe=c.force.recipes[item];if recipe then "
+            "b.recipes[item]=recipe.enabled;recipe.enabled=true end;"
+            "assert(inv.insert{name=item,count=count}==count) end;"
+            "for _,p in ipairs({{2.5,-0.5},{2.5,1.5}}) do "
+            "assert(s.create_entity{name='wooden-chest',position=p,force=c.force}) end;"
+            "rcon.print('m43:{}')"
+        )
+        fast = place("fast-inserter", 2.5, 0.5)
+        read = tool("get_entity_inventory", {"target_ref": fast["target_ref"]})
+        record(
+            "M43 DC-1 fast inserter places with pickup/drop targets and status-only inventory",
+            fast.get("pickup_target", {}).get("name") == "wooden-chest"
+            and fast.get("drop_target", {}).get("name") == "wooden-chest"
+            and not read["inventories"]
+            and read["name"] == "fast-inserter",
+            json.dumps(fast),
+        )
+        rotated = tool("rotate_entity", {"target_ref": fast["target_ref"], "direction": 4})
+        filtered = tool(
+            "set_inserter_filter", {"target_ref": fast["target_ref"], "items": ["coal"]}
+        )
+        compact = tool("observe_nearby", {"names": ["fast-inserter"], "compact": True})["entities"][
+            0
+        ]
+        record(
+            "M43 DC fast inserter rotate/filter/compact fields use its type",
+            rotated["direction"] == 4
+            and filtered["filters"] == ["coal"]
+            and "pickup_position" in compact
+            and "drop_position" in compact,
+        )
+        pole = place("medium-electric-pole", -1.5, -2.5)
+        pole_read = tool("get_entity_inventory", {"target_ref": pole["target_ref"]})
+        furnace = place("steel-furnace", -3, 1)
+        furnace_read = tool("get_entity_inventory", {"target_ref": furnace["target_ref"]})
+        transferred = tool(
+            "transfer_item",
+            {
+                "target_ref": furnace["target_ref"],
+                "direction": "to_entity",
+                "inventory_role": "fuel",
+                "item": "coal",
+                "count": 1,
+            },
+        )
+        alias = tool(
+            "transfer_item",
+            {
+                "target_ref": furnace["target_ref"],
+                "direction": "to_entity",
+                "inventory_role": "input",
+                "item": "iron-ore",
+                "count": 1,
+            },
+        )
+        record(
+            "M43 DC-1 medium pole and steel furnace placement and burner roles",
+            not pole_read["inventories"]
+            and set(furnace_read["inventories"]) == {"source", "result", "fuel"}
+            and transferred["moved"] == 1
+            and alias["moved"] == 1,
+        )
+        electric = place("electric-furnace", -4.5, -3.5)
+        electric_read = tool("get_entity_inventory", {"target_ref": electric["target_ref"]})
+        record(
+            "M43 DC electric furnace omits fuel",
+            set(electric_read["inventories"]) == {"source", "result"},
+        )
+        assembler = place("assembling-machine-1", 3.5, 4.5)
+        place("wooden-chest", 6.5, 4.5)
+        tool("observe_nearby", {"names": ["fast-inserter"]})  # Map uses the unfiltered search.
+        mapped = tool("get_explored_map", {"limit": 50})
+        cell = next(cell for cell in mapped["building_cells"] if (cell["cx"], cell["cy"]) == (0, 0))
+        buildings = {entry["name"]: entry for entry in cell["buildings"]}
+        summary = {entry["name"]: entry for entry in mapped["building_summary"]}
+        record(
+            "M43 DD-1 observed cell and summary remember assembler and chest",
+            buildings["assembling-machine-1"]["count"] == 1
+            and buildings["wooden-chest"]["count"] >= 1
+            and summary["assembling-machine-1"]["count"] == 1
+            and summary["assembling-machine-1"]["cells"] == 1
+            and "fast-inserter" not in buildings
+            and "medium-electric-pole" not in summary,
+            json.dumps(mapped["building_summary"]),
+        )
+        map_position = mapped["position"]
+        try:
+            fixture(
+                "s.request_to_generate_chunks({128,0},1);s.force_generate_chunk_requests();"
+                "for x=104.5,144.5,8 do for _,y in ipairs({-8.5,8.5}) do "
+                "assert(s.create_entity{name='wooden-chest',position={x,y},force=c.force}) "
+                "end end;rcon.print('m43:{}')"
+            )
+            for x in (112.5, 144.5, 128.5):
+                fixture(f"assert(c.teleport({{{x},0.5}},s));rcon.print('m43:{{}}')")
+                tool("observe_nearby", {})
+            distant = tool("get_explored_map", {})  # Default limit is ten building cells.
+            distant_summary = {entry["name"]: entry for entry in distant["building_summary"]}
+            remembered = distant_summary.get("assembling-machine-1", {})
+            nearest = {"x": 3.5, "y": 4.5}
+            expected_distance = math.hypot(128.5 - nearest["x"], 0.5 - nearest["y"])
+            record(
+                "M43 DD-1 summary remembers distant buildings beyond the ten nearest cells",
+                len(distant["building_cells"]) == 10
+                and distant["building_cells_total"] > 10
+                and all(cell["buildings"] for cell in distant["building_cells"])
+                and all(cell["cx"] > 10 for cell in distant["building_cells"])
+                and any(cell.get("partial") for cell in distant["building_cells"])
+                and distant_summary["wooden-chest"]["count"] == 15
+                and distant_summary["wooden-chest"]["cells"] == 14
+                and remembered.get("count") == 1
+                and remembered.get("cells") == 1
+                and remembered.get("nearest") == nearest
+                and math.isclose(remembered.get("distance", -1), expected_distance)
+                and list(distant_summary) == sorted(distant_summary),
+                json.dumps(distant["building_summary"]),
+            )
+        finally:
+            fixture(
+                f"assert(c.teleport({{{map_position['x']},{map_position['y']}}},s));"
+                "rcon.print('m43:{}')"
+            )
+        mined = terminal(tool("mine_entity", {"target_ref": assembler["target_ref"], "count": 1}))
+        tool("observe_nearby", {})
+        after = tool("get_explored_map", {"limit": 50})
+        cell = next(cell for cell in after["building_cells"] if (cell["cx"], cell["cy"]) == (0, 0))
+        record(
+            "M43 DD-1 full reobservation removes the mined assembler",
+            mined["status"] == "succeeded"
+            and all(entry["name"] != "assembling-machine-1" for entry in cell["buildings"])
+            and all(entry["name"] != "assembling-machine-1" for entry in after["building_summary"]),
+        )
+        fast_line = tool(
+            "place_line",
+            {
+                "item": "fast-transport-belt",
+                "surface": surface_name,
+                "from_x": 0.5,
+                "from_y": -5.5,
+                "to_x": 2.5,
+                "to_y": -5.5,
+            },
+        )
+        record(
+            "M43 DC fast belt line places by type",
+            fast_line["complete"] and fast_line["placed"] == 3,
+        )
+
+        fixture(
+            "for _,x in ipairs({38.5,42.5}) do for y=1.5,13.5,3 do "
+            "assert(s.create_entity{name='lab',position={x,y},force=c.force}) end end;"
+            "assert(c.teleport({40.5,-0.5},s));rcon.print('m43:{}')"
+        )
+        line = terminal(
+            tool(
+                "place_line",
+                {
+                    "item": "transport-belt",
+                    "surface": surface_name,
+                    "from_x": 40.5,
+                    "from_y": 0.5,
+                    "to_x": 40.5,
+                    "to_y": 12.5,
+                    "walk": True,
+                    "wait_seconds": 20,
+                },
+            )
+        )
+        record(
+            "M43 DE-1 walking belt line completes in a one-tile lab corridor",
+            line.get("complete") is True and line.get("placed") == 13,
+            json.dumps(line),
+        )
+    finally:
+        for slot in ("action", "craft_action"):
+            pending = fixture(
+                "rcon.print('m43:'..helpers.table_to_json("
+                f"{{id=b and state.{slot} and state.{slot}.id}}))"
+            )
+            if pending.get("id"):
+                bridge.call("cancel_action", {"action_id": pending["id"]})
+        fixture(
+            "if b then assert(c.teleport(b.position,b.surface));c.selected=b.selected;"
+            "if b.stashed then inv.clear() end;"
+            "for i=1,#b.inventory do if b.inventory[i].valid_for_read then "
+            "assert(inv[i].swap_stack(b.inventory[i])) end end;b.inventory.destroy();"
+            "for item,enabled in pairs(b.recipes) do c.force.recipes[item].enabled=enabled end;"
+            "if s then assert(game.delete_surface(s)) end;"
+            "for _,key in ipairs(b.fields) do state[key]=b.saved[key] end;"
+            "storage.m43_backup=nil end;"
+            "rcon.print('m43:{}')"
+        )
+        removed = fixture(
+            "rcon.print('m43:'..helpers.table_to_json({backup=b~=nil,surface=s~=nil}))"
+        )
+        observed_map_cells.pop(surface_name, None)
+        record(
+            "M43 restores inventory, position, recipes, observations and disposable surface",
+            removed == {"backup": False, "surface": False}
+            and bridge.call("get_inventory")["result"]["items"] == original_items
+            and bridge.call("get_agent_status")["result"]["position"] == original_position,
+        )
+
+
 def m42_chunk_generation_checks():
     # Disposable unbounded surface: generation, terrain edits and belts vanish on cleanup.
     m42_surface = "m42-chunk-generation-fixture"
@@ -6651,11 +6922,11 @@ def main():
             and measured == {"belts": 13, "remaining": 17, "idle": True},
             json.dumps({"line": line, "measured": measured}),
         )
-        # All geometrically eligible stand candidates are occupied, but the line
-        # itself is empty. A distant approach can reach build range outside the wall.
+        # Cover the M43 lattice as well as perimeter candidates, leaving the line
+        # empty. Chests close the tiny gaps between stone-wall collision boxes.
         m39_fixture(
-            "for x=-3,8 do for y=5,12 do if not(y==8 and x>=0 and x<=4) then "
-            "assert(s.create_entity{name='stone-wall',position={x+0.5,y+0.5},force=c.force}) "
+            "for x=-9,13 do for y=-1,17 do if not(y==8 and x>=0 and x<=4) then "
+            "assert(s.create_entity{name='wooden-chest',position={x+0.75,y+0.5},force=c.force}) "
             "end end end;rcon.print('m39:{}')"
         )
         enclosed_line = {
@@ -6679,10 +6950,19 @@ def main():
             )
             record(
                 f"M39 CQ {label} enclosed start stops without looping or consuming items",
-                enclosed.get("status") == "succeeded"
-                and enclosed.get("complete") is False
+                enclosed.get("complete") is False
                 and enclosed.get("placed") == 0
-                and enclosed.get("detail", {}).get("reason") == "stand_position_not_found"
+                and (
+                    (
+                        enclosed.get("status") == "succeeded"
+                        and enclosed.get("detail", {}).get("reason") == "stand_position_not_found"
+                    )
+                    or (
+                        label == "distant"
+                        and enclosed.get("status") == "failed"
+                        and enclosed.get("error") == "path_not_found"
+                    )
+                )
                 and measured.get("idle") is True
                 and measured.get("remaining") == 17
                 and (label != "near" or (measured["x"], measured["y"]) == (start_x, 8.5)),
@@ -7709,6 +7989,7 @@ def main():
         )
 
     m42_chunk_generation_checks()
+    m43_types_buildings_stand_checks()
 
     failed = [label for label, passed, _ in results if not passed]
     if failed:

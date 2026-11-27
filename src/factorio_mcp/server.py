@@ -136,7 +136,9 @@ ITEM_TARGET_DESCRIPTION = (
 
 PLACE_DESCRIPTION = (
     "Place a supported entity within build reach, consuming one real inventory item."
-    " Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground."
+    " Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground,"
+    " and other entities of these types: containers, furnaces, assembling machines, inserters,"
+    " belts, poles, pipes, pumps, tanks, mining drills, boilers, generators and labs."
     " Also supports pumpjack, oil-refinery, chemical-plant, storage-tank, pump,"
     " assembling-machine-2 and steel-chest. Oil equipment accepts directions 0/4/8/12."
     " underground_type is only valid for underground-belt: input or output"
@@ -260,6 +262,9 @@ MACHINE_STATUS_DESCRIPTION = (
 INVENTORY_MACHINE_DESCRIPTION = (
     " Owned steam-engine generators, offshore-pump, pipe, pipe-to-ground, storage-tank"
     " and pump also support status-only reads with empty inventories. Boilers retain fuel."
+    " These reads also support other entities of these types. Inventory roles follow type:"
+    " containers main; furnaces source/result plus fuel when burner-powered; assembling"
+    " machines source/result; labs input; burner drills and inserters fuel."
     " Owned pumpjack also supports status-only reads with fluids and mining_target (crude-oil)."
     " assembling-machine-2, oil-refinery and chemical-plant have source/result inventories"
     " and recipe/status/production fields like assembling-machine-1; steel-chest has main."
@@ -708,9 +713,16 @@ def _normalize_result(operation: str, result: dict[str, Any]) -> dict[str, Any]:
         "fluid_connections",
         "missing_fluids",
         "full_fluids",
+        "building_summary",
     ):
         if field in result and not isinstance(result[field], list):
             result[field] = []
+    if "building_cells" in result:
+        if not isinstance(result["building_cells"], list):
+            result["building_cells"] = []
+        for cell in result["building_cells"]:
+            if not isinstance(cell.get("buildings"), list):
+                cell["buildings"] = []
     for fluid in result.get("fluids", []):
         if (
             isinstance(fluid, dict)
@@ -1225,6 +1237,14 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
             "and rocks nearest first. Each list contains at most limit components; "
             "resources_total, water_total, trees_total and rocks_total count components "
             "before truncation. Use resource_names to filter resource kinds. "
+            "building_cells lists only remembered cells with buildings, nearest first, up to limit "
+            "(building_cells_total before limiting), with cx, cy, position, observed_tick, "
+            "partial, distance and buildings={name,count,position} "
+            "sorted by name. Buildings are observed own structures, excluding belts, pipes, "
+            "poles and inserters; a full observation replaces them, partial sightings may merge. "
+            "building_summary={name,count,cells,nearest={x,y},distance} sums ALL remembered full "
+            "and partial cells before limiting, sorted by name; cells counts cells containing "
+            "that name, nearest is its closest recorded building position to the character. "
             "frontier lists unexplored cells sharing an edge with an explored cell, "
             "as {x, y, distance} at cell centres, sorted by distance then x then y, "
             "up to limit; frontier_total counts all frontier cells before truncation. "
@@ -1573,18 +1593,14 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     ) -> CallToolResult:
         params = {"item": item, "surface": surface, "x": x, "y": y, "direction": direction}
         if underground_type is not None:
-            if item != "underground-belt":
-                return _error_response(
-                    BridgeError(
-                        "invalid_input", "underground_type is only valid for underground-belt."
-                    )
-                )
+            # The mod validates the place-result type, including upgraded/modded belts.
             params["underground_type"] = underground_type
         return await invoke("place_entity", params)
 
     @server.tool(
         description=(
             "Place a straight line of transport-belt or pipe items, 2-64 tiles inclusive. "
+            "Includes fast/express belts and other entities of these types. "
             "Endpoints are snapped to tile centres and must share a row or column. "
             "Direction follows travel from start to end: east 4, south 8, west 12, north 0. "
             "walk=false (default) uses the same reach, observation and inventory checks as "
@@ -1776,7 +1792,9 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     @server.tool(
         description=(
             "Check placement within build reach without consuming items or building. "
-            "Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground. "
+            "Supports underground-belt, splitter, long-handed-inserter, and pipe-to-ground, "
+            "and other entities of these types, including fast inserters, "
+            "larger poles and furnaces. "
             "underground_type is only valid for underground-belt: input or output "
             "(default input). direction is belt travel direction for both ends; "
             "for output it is the direction items leave."
@@ -1847,12 +1865,7 @@ def create_server(bridge: FactorioBridge | None) -> MCPServer:
     ) -> CallToolResult:
         params = {"item": item, "surface": surface, "x": x, "y": y, "direction": direction}
         if underground_type is not None:
-            if item != "underground-belt":
-                return _error_response(
-                    BridgeError(
-                        "invalid_input", "underground_type is only valid for underground-belt."
-                    )
-                )
+            # The mod validates the place-result type, including upgraded/modded belts.
             params["underground_type"] = underground_type
         return await invoke("check_placement", params)
 

@@ -28,3 +28,11 @@ When a walking `place_line` ends with `status = "succeeded"` but `line_result.co
 
 - The world generates around the character as it walks. Crude oil is usually outside the starting area; walk outward in steps of up to 128 tiles.
 - Do not stop early: keep growing red and green production while the oil chain is missing.
+
+## Trial 35 result (continued from trial 34's save, M42 code)
+
+- About 2.5 hours and 1,967 calls. It ended when the agent's Codex usage limit was reached, not by the AI's choice.
+- With chunks generated around the character, the AI explored far out and found crude oil about 830 tiles from the base (around x=294, y=-824).
+- Researched in this run: engine, fluid handling, oil gathering, oil processing (the crude-oil mining trigger), plastics, advanced circuit and fast inserter. sulfur-processing was in progress at the end.
+- No `not_generated` errors occurred. The remaining move errors were goals on deep water (`goal_tiles: ["deepwater"]`) and goals beyond the 128-tile reach.
+- Other errors were the AI's own: starting research with missing prerequisites (8), reading inventories beyond the 10-tile reach (15) and crafts short of ingredients.

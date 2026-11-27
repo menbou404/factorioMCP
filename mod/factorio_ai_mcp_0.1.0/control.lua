@@ -116,6 +116,42 @@ local ROLE_ALIASES = {
   ["chemical-plant"] = {input = "source", output = "result"},
   ["lab"] = {source = "input"}
 }
+local PLACEABLE_TYPES = {
+  container = true, furnace = true, ["assembling-machine"] = true, inserter = true,
+  ["transport-belt"] = true, ["underground-belt"] = true, splitter = true,
+  ["electric-pole"] = true, pipe = true, ["pipe-to-ground"] = true, pump = true,
+  ["storage-tank"] = true, ["mining-drill"] = true, boiler = true, generator = true,
+  ["offshore-pump"] = true, lab = true
+}
+local STATUS_ONLY_TYPES = {
+  inserter = true, ["transport-belt"] = true, ["underground-belt"] = true, splitter = true,
+  ["electric-pole"] = true, pipe = true, ["pipe-to-ground"] = true, pump = true,
+  ["storage-tank"] = true, generator = true, ["offshore-pump"] = true,
+  ["mining-drill"] = true
+}
+
+local function entity_inventory_roles(entity)
+  if INVENTORY_ROLES[entity.name] then return INVENTORY_ROLES[entity.name] end
+  local kind = entity.type
+  if kind == "container" then return {main = defines.inventory.chest} end
+  if kind == "furnace" or kind == "assembling-machine" then
+    local roles = {source = defines.inventory.crafter_input, result = defines.inventory.crafter_output}
+    if kind == "furnace" and entity.burner then roles.fuel = defines.inventory.fuel end
+    return roles
+  end
+  if kind == "lab" then return {input = defines.inventory.lab_input} end
+  if kind == "boiler" or ((kind == "mining-drill" or kind == "inserter") and entity.burner) then
+    return {fuel = defines.inventory.fuel}
+  end
+end
+
+local function entity_role_aliases(entity)
+  if ROLE_ALIASES[entity.name] then return ROLE_ALIASES[entity.name] end
+  if entity.type == "furnace" or entity.type == "assembling-machine" then
+    return {input = "source", output = "result"}
+  end
+  if entity.type == "lab" then return {source = "input"} end
+end
 
 local function ensure_storage()
   storage.ai_mcp = storage.ai_mcp or {
@@ -1597,7 +1633,7 @@ local function record_explored_map(state, character, radius, entities)
          distance_squared(position, {x = right, y = top}) <= radius * radius and
          distance_squared(position, {x = left, y = bottom}) <= radius * radius and
          distance_squared(position, {x = right, y = bottom}) <= radius * radius then
-        local cell = {cx = cx, cy = cy, tick = game.tick, resources = {},
+        local cell = {cx = cx, cy = cy, tick = game.tick, resources = {}, buildings = {},
                       water = 0, trees = 0, rocks = 0}
         local centre = map_cell_centre(cell)
         local water = surface.find_tiles_filtered{
@@ -1644,8 +1680,15 @@ local function record_explored_map(state, character, radius, entities)
       local cell = fresh[key]
       local seen_resource = entity.type == "resource" and
                             distance_squared(character.position, position) <= radius * radius
-      if not cell and seen_resource then
-        cell = {cx = cx, cy = cy, tick = game.tick, resources = {}, partial = true}
+      local seen_building = entity.force == character.force and
+                            entity.prototype.items_to_place_this and
+                            entity.type ~= "inserter" and entity.type ~= "transport-belt" and
+                            entity.type ~= "underground-belt" and entity.type ~= "splitter" and
+                            entity.type ~= "pipe" and entity.type ~= "pipe-to-ground" and
+                            entity.type ~= "electric-pole" and
+                            distance_squared(character.position, position) <= radius * radius
+      if not cell and (seen_resource or seen_building) then
+        cell = {cx = cx, cy = cy, tick = game.tick, resources = {}, buildings = {}, partial = true}
         fresh[key] = cell
       end
       if cell then
@@ -1664,11 +1707,39 @@ local function record_explored_map(state, character, radius, entities)
           cell.rocks = cell.rocks + 1
           cell.rock_sample = nearest_sample(cell.rock_sample, position, centre)
         end
+        if seen_building then
+          local building = cell.buildings[entity.name] or {name = entity.name, count = 0}
+          building.count = building.count + 1
+          building.position = nearest_sample(building.position, position, centre)
+          cell.buildings[entity.name] = building
+        end
       end
     end
   end
   for key, cell in pairs(fresh) do
+    local buildings = {}
+    for _, name in ipairs(sorted_keys(cell.buildings)) do
+      buildings[#buildings + 1] = cell.buildings[name]
+    end
+    cell.buildings = buildings
     if cell.partial then
+      local previous = map.cells[key] or map.partial_cells[key]
+      -- Partial sightings cannot remove unseen buildings or double-count repeat sightings.
+      if previous then
+        local merged, centre = {}, map_cell_centre(cell)
+        for _, building in ipairs(previous.buildings or {}) do merged[building.name] = building end
+        for _, building in ipairs(cell.buildings) do
+          local old = merged[building.name]
+          merged[building.name] = {name = building.name,
+            count = math.max(building.count, old and old.count or 0),
+            position = nearest_sample(old and old.position, building.position, centre)}
+        end
+        cell.buildings = {}
+        for _, name in ipairs(sorted_keys(merged)) do
+          cell.buildings[#cell.buildings + 1] = merged[name]
+        end
+        previous.buildings = cell.buildings
+      end
       if not map.cells[key] then
         local previous = map.partial_cells[key]
         local tiles, previous_tiles = 0, 0
@@ -1676,7 +1747,7 @@ local function record_explored_map(state, character, radius, entities)
         for _, resource in pairs(previous and previous.resources or {}) do
           previous_tiles = previous_tiles + resource.tiles
         end
-        if tiles > 0 and tiles >= previous_tiles then
+        if (tiles > 0 and tiles >= previous_tiles) or (not previous and #cell.buildings > 0) then
           if not previous then map.partial_count = map.partial_count + 1 end
           map.partial_cells[key] = cell
         end
@@ -1853,6 +1924,36 @@ local function do_get_explored_map(state, params)
     end)
     for index = #groups, limit + 1, -1 do groups[index] = nil end
   end
+  result.building_cells, result.building_summary = {}, {}
+  local summary = {}
+  for _, cell in pairs(resource_cells) do
+    local buildings = cell.buildings or {}
+    for _, building in ipairs(buildings) do
+      local entry = summary[building.name] or {name = building.name, count = 0, cells = 0}
+      entry.count, entry.cells = entry.count + building.count, entry.cells + 1
+      entry.nearest = nearest_sample(entry.nearest, building.position, character.position)
+      summary[building.name] = entry
+    end
+    if #buildings > 0 then
+      result.building_cells[#result.building_cells + 1] = {
+        cx = cell.cx, cy = cell.cy, position = map_cell_centre(cell), observed_tick = cell.tick,
+        partial = cell.partial, buildings = buildings,
+        distance = math.sqrt(distance_squared(character.position, map_cell_centre(cell)))
+      }
+    end
+  end
+  for _, name in ipairs(sorted_keys(summary)) do
+    local entry = summary[name]
+    entry.distance = math.sqrt(distance_squared(character.position, entry.nearest))
+    result.building_summary[#result.building_summary + 1] = entry
+  end
+  table.sort(result.building_cells, function(a, b)
+    if a.distance ~= b.distance then return a.distance < b.distance end
+    if a.cx ~= b.cx then return a.cx < b.cx end
+    return a.cy < b.cy
+  end)
+  result.building_cells_total = #result.building_cells
+  for index = #result.building_cells, limit + 1, -1 do result.building_cells[index] = nil end
   return result
 end
 
@@ -2060,7 +2161,7 @@ local function do_observe(state, params)
       owned = entity.force == character.force
     }
     observed.inventory_limit = inventory_limit(entity)
-    local roles = INVENTORY_ROLES[entity.name]
+    local roles = entity_inventory_roles(entity)
     if observed.owned and roles then
       local inventory_roles = sorted_keys(roles)
       if #inventory_roles > 0 then observed.inventory_roles = inventory_roles end
@@ -2736,6 +2837,45 @@ local function line_stand_position(state, character, line, next_index)
     consider({x = line.first.x, y = top})
     consider({x = line.first.x, y = bottom})
   end
+  if not best then
+    -- Narrow corridors can hide every perimeter candidate. Search a half-tile
+    -- lattice, nearest to the character first, within a conservative build reach.
+    local fallback_reach = math.min(reach, character.build_distance - 1)
+    local candidates = {}
+    for x = math.ceil((next_position.x - fallback_reach) * 2) / 2,
+            next_position.x + fallback_reach, 0.5 do
+      for y = math.ceil((next_position.y - fallback_reach) * 2) / 2,
+              next_position.y + fallback_reach, 0.5 do
+        local candidate = {x = x, y = y}
+        if distance_squared(candidate, next_position) <= fallback_reach ^ 2 then
+          -- Preserve arrival clearance from all remaining line tiles.
+          local remaining = false
+          for index = next_index, line.requested - 1 do
+            local tx, ty = line.first.x + index * line.step_x, line.first.y + index * line.step_y
+            if x > tx - 0.5 - box.right_bottom.x - clearance and
+               x < tx + 0.5 - box.left_top.x + clearance and
+               y > ty - 0.5 - box.right_bottom.y - clearance and
+               y < ty + 0.5 - box.left_top.y + clearance then
+              remaining = true
+              break
+            end
+          end
+          if not remaining then candidates[#candidates + 1] = candidate end
+        end
+      end
+    end
+    table.sort(candidates, function(a, b)
+      local da, db = distance_squared(a, character.position), distance_squared(b, character.position)
+      if da ~= db then return da < db end
+      if a.x ~= b.x then return a.x < b.x end
+      return a.y < b.y
+    end)
+    for _, candidate in ipairs(candidates) do
+      -- Reuse the normal character collision and belt-standing rules.
+      consider(candidate)
+      if best then break end
+    end
+  end
   return best, candidate_visible and "blocked" or "not_visible"
 end
 
@@ -2920,7 +3060,9 @@ end
 
 local function valid_underground_type(params)
   return params.underground_type == nil or
-         (params.item == "underground-belt" and
+         (type(params.item) == "string" and prototypes.item[params.item] and
+          prototypes.item[params.item].place_result and
+          prototypes.item[params.item].place_result.type == "underground-belt" and
           (params.underground_type == "input" or params.underground_type == "output"))
 end
 
@@ -2928,9 +3070,8 @@ local function validate_placement(state, character, params, require_item, line_p
   if not valid_underground_type(params) then return nil, "invalid_input" end
   local item_proto = type(params.item) == "string" and prototypes.item[params.item] or nil
   local prototype = item_proto and item_proto.place_result
-  local line_placeable = prototype and
-                         (prototype.type == "transport-belt" or prototype.type == "pipe")
-  if not item_proto or not (PLACEABLE_ITEMS[params.item] or (line_placement and line_placeable)) then
+  if not item_proto or not (PLACEABLE_ITEMS[params.item] or
+                           (prototype and PLACEABLE_TYPES[prototype.type])) then
     return nil, "invalid_target"
   end
   local direction = params.direction or defines.direction.north
@@ -2990,7 +3131,7 @@ local function validate_placement(state, character, params, require_item, line_p
     ground_entities = entities
   end
   return {name = entity_name, position = position, direction = direction,
-          underground_type = params.item == "underground-belt" and
+          underground_type = prototype.type == "underground-belt" and
                              (params.underground_type or "input") or nil,
           inventory = inventory, ground_entities = ground_entities, ground_items = ground_items}
 end
@@ -3008,8 +3149,7 @@ local function do_check_placement(state, params)
     inventory.get_item_count({name = params.item, quality = "normal"}) >= 1
   local direction = params.direction or defines.direction.north
   local position, box, fluid_connections, electric_coverage, pickup_position, drop_position
-  if prototype and (PLACEABLE_ITEMS[params.item] or prototype.type == "inserter" or
-                    prototype.type == "mining-drill") and
+  if prototype and (PLACEABLE_ITEMS[params.item] or PLACEABLE_TYPES[prototype.type]) and
      params.surface == character.surface.name and
      (direction == 0 or direction == 4 or direction == 8 or direction == 12) and
      type(params.x) == "number" and type(params.y) == "number" and
@@ -3665,13 +3805,11 @@ local function get_entity_inventory(character, params, allow_status_only)
   if target.force ~= character.force then
     return nil, nil, "invalid_target", {entity = target.name, reason = "other_force"}
   end
-  local roles = INVENTORY_ROLES[target.name]
+  local roles = entity_inventory_roles(target)
   -- Only inventory reads accept machines without inventories. Transfers retain
   -- the existing unsupported_entity error, including its supported-entity list.
   if not roles and allow_status_only and
-     (target.type == "inserter" or target.type == "mining-drill" or
-      target.type == "electric-pole" or target.type == "generator" or
-      STATUS_ONLY_ENTITIES[target.name] or is_belt(target)) then roles = {} end
+     (STATUS_ONLY_ENTITIES[target.name] or STATUS_ONLY_TYPES[target.type]) then roles = {} end
   if not roles then
     local supported = {}
     for name in pairs(INVENTORY_ROLES) do supported[name] = true end
@@ -3919,7 +4057,7 @@ local function do_transfer(state, params, own_action)
   end
   local target, roles, target_error, detail = get_entity_inventory(character, params)
   if not target then return nil, target_error, detail end
-  local aliases = ROLE_ALIASES[target.name]
+  local aliases = entity_role_aliases(target)
   local role = (aliases and aliases[params.inventory_role]) or params.inventory_role
   local inventory_id = roles[role]
   if not inventory_id then
